@@ -237,8 +237,13 @@ class Driver(BaseDriver):
                 ams_slots.append({
                     "slot_index": slot_index,
                     "slot_name": f"AMS {ams_id + 1} - Slot {tray_id + 1}",
+                    "tray_info_idx": tray.get("tray_info_idx", ""),
                     "tray_type": tray_type,
                     "tray_color": tray_color,
+                    "nozzle_temp_min": tray.get("nozzle_temp_min"),
+                    "nozzle_temp_max": tray.get("nozzle_temp_max"),
+                    "setting_id": tray.get("setting_id", ""),
+                    "cali_idx": tray.get("cali_idx"),
                     "remain": tray.get("remain", 0),
                     "present": bool(tray_type),
                 })
@@ -252,8 +257,13 @@ class Driver(BaseDriver):
             ext_slots.append({
                 "slot_index": f"255-{vt_id}",
                 "slot_name":  "External Tray",
+                "tray_info_idx": vt.get("tray_info_idx", ""),
                 "tray_type":  vt_type,
                 "tray_color": vt_color,
+                "nozzle_temp_min": vt.get("nozzle_temp_min"),
+                "nozzle_temp_max": vt.get("nozzle_temp_max"),
+                "setting_id": vt.get("setting_id", ""),
+                "cali_idx":   vt.get("cali_idx"),
                 "remain":     vt.get("remain", 0),
                 "present":    bool(vt_type),
             })
