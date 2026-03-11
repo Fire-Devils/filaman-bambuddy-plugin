@@ -1,0 +1,62 @@
+name: Release Plugins
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and release plugins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          for PLUGIN_JSON in $(find . -maxdepth 2 -name "plugin.json" -not -path "./.git/*"); do
+            PLUGIN_DIR=$(dirname "$PLUGIN_JSON")
+            FOLDER_NAME=$(basename "$PLUGIN_DIR")
+            VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$PLUGIN_JSON" | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+            if [ -z "$VERSION" ]; then
+              echo "⚠️  Keine Version in $PLUGIN_JSON, überspringe."
+              continue
+            fi
+
+            TAG="${FOLDER_NAME}-v${VERSION}"
+            ZIP_NAME="${FOLDER_NAME}-${VERSION}.zip"
+
+            # Prüfen ob Release bereits existiert
+            if gh release view "$TAG" > /dev/null 2>&1; then
+              echo "⚠️  Release $TAG existiert bereits. Überspringe."
+              continue
+            fi
+
+            echo "📦 Erstelle $ZIP_NAME ..."
+            zip -r "$ZIP_NAME" "$FOLDER_NAME" -x "$FOLDER_NAME/__pycache__/*" "$FOLDER_NAME/*.pyc"
+
+            # Release-Notes zusammenbauen
+            DESCRIPTION=$(grep -o '"description"[[:space:]]*:[[:space:]]*"[^"]*"' "$PLUGIN_JSON" | head -1 | sed 's/.*"description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            NOTES="**Plugin:** ${FOLDER_NAME}"
+            NOTES="${NOTES}%0A**Version:** ${VERSION}"
+            NOTES="${NOTES}%0A**Description:** ${DESCRIPTION}"
+
+            echo "📤 Erstelle GitHub Release $TAG ..."
+            printf '%s' "$NOTES" | sed 's/%0A/\n/g' > /tmp/release_notes.md
+            gh release create "$TAG" "$ZIP_NAME" \
+              --title "$FOLDER_NAME $VERSION" \
+              --notes-file /tmp/release_notes.md \
+              --latest=false
+
+            echo "✅ Release $TAG mit $ZIP_NAME erstellt."
+          done
+
+          echo "🎉 Fertig!"
