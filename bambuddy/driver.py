@@ -135,7 +135,6 @@ class Driver(BaseDriver):
             try:
                 async with websockets.connect(
                     ws_url,
-                    additional_headers={"X-API-Key": f"{self._api_key}"},
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
