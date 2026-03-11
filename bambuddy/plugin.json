@@ -41,5 +41,28 @@
     "has_slots": true,
     "has_ams": true,
     "supports_auto_match": true
+  },
+  "printer_params": {
+    "target_types": ["filament_printer_param", "spool_printer_param"],
+    "fields": [
+      {"key": "bambu_idx", "label": "Bambu Material Index", "field_type": "dropdown", "options_file": "bambu_filaments.json"},
+      {"key": "bambu_tray_idx", "label": "Tray Info Index", "field_type": "text"},
+      {"key": "bambu_setting_id", "label": "Setting ID", "field_type": "text"},
+      {"key": "bambu_cali_idx", "label": "Calibration Index", "field_type": "text"},
+      {"key": "bambu_k_value", "label": "K Value", "field_type": "number"},
+      {"key": "bambu_flow_ratio", "label": "Flow Ratio", "field_type": "number"},
+      {"key": "bambu_bed_temp", "label": "Bed Temperature", "field_type": "number"},
+      {"key": "bambu_nozzle_temp_min", "label": "Nozzle Temp Min", "field_type": "number"},
+      {"key": "bambu_nozzle_temp_max", "label": "Nozzle Temp Max", "field_type": "number"},
+      {"key": "bambu_max_volumetric_speed", "label": "Max Volumetric Speed", "field_type": "number"}
+    ],
+    "migration": {
+      "legacy_renames": {
+        "bambu_cali_id": "bambu_cali_idx",
+        "bambu_k": "bambu_k_value",
+        "bambu_max_volspeed": "bambu_max_volumetric_speed",
+        "bambu_nozzle_temp": "bambu_nozzle_temp_min"
+      }
+    }
   }
 }

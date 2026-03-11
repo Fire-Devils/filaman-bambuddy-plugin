@@ -16,6 +16,37 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 60
 DEFAULT_RECONNECT_INTERVAL = 30
 
+# Generische Bambu-Slicer-IDs für gängige Materialien (Fallback wenn kein bambu_idx gesetzt)
+_GENERIC_SLICER_IDS: dict[str, str] = {
+    "PLA":   "GFL99",
+    "PETG":  "GFG99",
+    "ABS":   "GFB99",
+    "ASA":   "GFB98",
+    "TPU":   "GFU99",
+    "NYLON": "GFN99",
+    "PA":    "GFN99",
+    "PVA":   "GFS99",
+    "HIPS":  "GFS98",
+    "PC":    "GFC99",
+    "PP":    "GFP97",
+}
+
+
+def _int_or_none(v: Any) -> int | None:
+    """Konvertiert einen Wert zu int, gibt None zurück bei leerem/ungültigem Wert."""
+    try:
+        return int(v) if v not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _float_or_none(v: Any) -> float | None:
+    """Konvertiert einen Wert zu float, gibt None zurück bei leerem/ungültigem Wert."""
+    try:
+        return float(v) if v not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
+
 
 class PendingSpool:
     def __init__(self, spool_id: int, filament_data: dict, slot_index: str | None = None):
@@ -294,27 +325,56 @@ class Driver(BaseDriver):
     async def _send_assignment(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
         """Erstellt Spule in Bambuddy und weist sie einem AMS-Slot zu.
         Bambuddy übernimmt die MQTT-Kommunikation zum Drucker.
+
+        Bambu-spezifische Felder (aus printer_params via enrich_filament_data):
+        - bambu_idx → slicer_filament (tray_info_idx im Bambu-MQTT)
+        - bambu_tray_idx → Fallback für slicer_filament
+        - bambu_nozzle_temp_min/max → nozzle_temp_min/max
+        - material_subgroup → subtype
+        - bambu_k_value → K-Profil (separater API-Call)
+        - bambu_cali_idx, bambu_setting_id → K-Profil
         """
         if not self._client:
             logger.error("Cannot send assignment: HTTP client not initialized")
             return
 
-        # Farbe normalisieren: FilaMan liefert 8-stelliges RGBA, Bambuddy erwartet RRGGBBAA
+        # -- Farbe normalisieren: FilaMan liefert 8-stelliges RGBA, Bambuddy erwartet RRGGBBAA --
         color = filament_data.get("color", "FFFFFFFF")
         if len(color) == 6:
-            color = color + "FF"  # Alpha anhängen
+            color = color + "FF"
         elif len(color) != 8:
             color = "FFFFFFFF"
 
+        # -- Bambu Material Index (slicer_filament = tray_info_idx) --
+        # Priorität: bambu_idx (aus printer_params) → bambu_tray_idx → generischer Fallback
+        material = filament_data.get("material_type", "PLA")
+        slicer_filament = (
+            filament_data.get("bambu_idx")
+            or filament_data.get("bambu_tray_idx")
+            or _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
+        )
+
+        # -- Temperaturen: Bambu-spezifisch hat Priorität über generische FilaMan-Felder --
+        nozzle_temp_min = (
+            _int_or_none(filament_data.get("bambu_nozzle_temp_min"))
+            or _int_or_none(filament_data.get("nozzle_temp_min"))
+        )
+        nozzle_temp_max = (
+            _int_or_none(filament_data.get("bambu_nozzle_temp_max"))
+            or _int_or_none(filament_data.get("nozzle_temp_max"))
+        )
+
         spool_payload = {
-            "material":     filament_data.get("material_type", "PLA"),
-            "color_name":   filament_data.get("color_name", ""),
-            "rgba":         color,
-            "brand":        filament_data.get("brand", ""),
-            "label_weight": int(filament_data.get("label_weight", 1000)),
-            "weight_used":  int(filament_data.get("weight_used", 0)),
-            "nozzle_temp_min": filament_data.get("nozzle_temp_min"),
-            "nozzle_temp_max": filament_data.get("nozzle_temp_max"),
+            "material":       material,
+            "subtype":        filament_data.get("material_subgroup") or None,
+            "color_name":     filament_data.get("color_name", ""),
+            "rgba":           color,
+            "brand":          filament_data.get("brand", ""),
+            "label_weight":   int(filament_data.get("label_weight", 1000)),
+            "weight_used":    int(filament_data.get("weight_used", 0)),
+            "slicer_filament": slicer_filament,
+            "nozzle_temp_min": nozzle_temp_min,
+            "nozzle_temp_max": nozzle_temp_max,
             # Rückreferenz zu FilaMan für spätere Verbrauchsmeldungen
             "note": f"filaman:{filament_data.get('spool_id', '')}",
         }
@@ -327,12 +387,37 @@ class Driver(BaseDriver):
             )
             r.raise_for_status()
             bambuddy_spool_id = r.json()["id"]
-            self.log_debug("out", f"POST /api/v1/inventory/spools", {
+            self.log_debug("out", "POST /api/v1/inventory/spools", {
                 "bambuddy_spool_id": bambuddy_spool_id,
                 "filaman_spool_id": filament_data.get("spool_id"),
+                "slicer_filament": slicer_filament,
             })
 
-            # 2. Slot in Bambuddy zuweisen → Bambuddy konfiguriert AMS via MQTT
+            # 2. K-Profil anlegen (optional — nur wenn bambu_k_value gesetzt)
+            k_value = _float_or_none(filament_data.get("bambu_k_value"))
+            if k_value is not None:
+                k_payload = {
+                    "printer_id":      self._bambuddy_printer_id,
+                    "k_value":         k_value,
+                    "cali_idx":        _int_or_none(filament_data.get("bambu_cali_idx")),
+                    "setting_id":      filament_data.get("bambu_setting_id") or None,
+                    "nozzle_diameter": "0.4",
+                }
+                try:
+                    rk = await self._client.post(
+                        f"{self._bambuddy_url}/api/v1/inventory/spools/{bambuddy_spool_id}/k-profiles",
+                        json=k_payload,
+                    )
+                    rk.raise_for_status()
+                    self.log_debug("out", f"POST /api/v1/inventory/spools/{bambuddy_spool_id}/k-profiles", k_payload)
+                except httpx.HTTPStatusError as e:
+                    # K-Profil-Fehler nicht fatal — Assignment trotzdem durchführen
+                    logger.warning(
+                        f"Could not create K-profile for Bambuddy spool {bambuddy_spool_id}: "
+                        f"{e.response.status_code} {e.response.text}"
+                    )
+
+            # 3. Slot in Bambuddy zuweisen → Bambuddy konfiguriert AMS via MQTT
             assignment_payload = {
                 "spool_id":   bambuddy_spool_id,
                 "printer_id": self._bambuddy_printer_id,
@@ -344,9 +429,10 @@ class Driver(BaseDriver):
                 json=assignment_payload,
             )
             r2.raise_for_status()
-            self.log_debug("out", f"POST /api/v1/inventory/assignments", assignment_payload)
+            self.log_debug("out", "POST /api/v1/inventory/assignments", assignment_payload)
             logger.info(
-                f"Assigned FilaMan spool {filament_data.get('spool_id')} to "
+                f"Assigned FilaMan spool {filament_data.get('spool_id')} "
+                f"(slicer_filament={slicer_filament}) to "
                 f"Bambuddy printer {self._bambuddy_printer_id} slot {ams_id}-{tray_id}"
             )
         except httpx.HTTPStatusError as e:
