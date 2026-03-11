@@ -402,10 +402,13 @@ class Driver(BaseDriver):
             logger.error("Cannot send assignment: HTTP client not initialized")
             return
 
-        # -- Farbe normalisieren: Bambuddy erwartet 6-stelliges RRGGBB --
-        color = filament_data.get("color", "FFFFFF")[:6].upper()
-        if len(color) < 6:
-            color = "FFFFFF"
+        # -- Farbe normalisieren: Bambuddy erwartet 8-stelliges RRGGBBAA --
+        color = filament_data.get("color", "FFFFFFFF")
+        if len(color) == 6:
+            color = color + "FF"
+        elif len(color) != 8:
+            color = "FFFFFFFF"
+        color = color.upper()
 
         # -- Bambu Material Index (slicer_filament = tray_info_idx) --
         # Priorität: bambu_idx (aus printer_params) → bambu_tray_idx → generischer Fallback
@@ -416,6 +419,10 @@ class Driver(BaseDriver):
             or _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
         )
 
+        # tray_sub_brands: sub-brand/profile-name (z.B. "PLA Basic", "PETG HF")
+        # REQUIRED für configure-Endpoint — Fallback auf material type
+        tray_sub_brands = filament_data.get("material_subgroup") or material
+
         # -- Temperaturen: Bambu-spezifisch hat Priorität über generische FilaMan-Felder --
         nozzle_temp_min = (
             _int_or_none(filament_data.get("bambu_nozzle_temp_min"))
@@ -425,6 +432,9 @@ class Driver(BaseDriver):
             _int_or_none(filament_data.get("bambu_nozzle_temp_max"))
             or _int_or_none(filament_data.get("nozzle_temp_max"))
         )
+
+        # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
+        k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
 
         spool_payload = {
             "material":       material,
@@ -455,31 +465,7 @@ class Driver(BaseDriver):
                 "slicer_filament": slicer_filament,
             })
 
-            # 2. K-Profil anlegen (optional — nur wenn bambu_k_value gesetzt)
-            k_value = _float_or_none(filament_data.get("bambu_k_value"))
-            if k_value is not None:
-                k_payload = {
-                    "printer_id":      self._bambuddy_printer_id,
-                    "k_value":         k_value,
-                    "cali_idx":        _int_or_none(filament_data.get("bambu_cali_idx")),
-                    "setting_id":      filament_data.get("bambu_setting_id") or None,
-                    "nozzle_diameter": "0.4",
-                }
-                try:
-                    rk = await self._client.post(
-                        f"{self._bambuddy_url}/api/v1/inventory/spools/{bambuddy_spool_id}/k-profiles",
-                        json=k_payload,
-                    )
-                    rk.raise_for_status()
-                    self.log_debug("out", f"POST /api/v1/inventory/spools/{bambuddy_spool_id}/k-profiles", k_payload)
-                except httpx.HTTPStatusError as e:
-                    # K-Profil-Fehler nicht fatal — Assignment trotzdem durchführen
-                    logger.warning(
-                        f"Could not create K-profile for Bambuddy spool {bambuddy_spool_id}: "
-                        f"{e.response.status_code} {e.response.text}"
-                    )
-
-            # 3. Slot in Bambuddy zuweisen → Bambuddy konfiguriert AMS via MQTT
+            # 2. Slot in Bambuddy zuweisen → Bambuddy erstellt Inventar-Zuordnung + Basis-MQTT
             assignment_payload = {
                 "spool_id":   bambuddy_spool_id,
                 "printer_id": self._bambuddy_printer_id,
@@ -492,6 +478,44 @@ class Driver(BaseDriver):
             )
             r2.raise_for_status()
             self.log_debug("out", "POST /api/v1/inventory/assignments", assignment_payload)
+
+            # 3. Drucker direkt konfigurieren — sendet ams_filament_setting + extrusion_cali_sel via MQTT
+            # Alle Parameter als Query-Params (kein Body)
+            configure_params: dict[str, Any] = {
+                "tray_info_idx":        slicer_filament,
+                "tray_type":            material,
+                "tray_sub_brands":      tray_sub_brands,
+                "tray_color":           color,                   # 8-stellig RRGGBBAA
+                "nozzle_temp_min":      nozzle_temp_min or 190,  # REQUIRED — Fallback 190°C
+                "nozzle_temp_max":      nozzle_temp_max or 230,  # REQUIRED — Fallback 230°C
+                "cali_idx":             (
+                    _int_or_none(filament_data.get("bambu_cali_idx"))
+                    if filament_data.get("bambu_cali_idx") is not None
+                    else -1                                       # -1 = default 0.020
+                ),
+                "nozzle_diameter":      "0.4",
+                "setting_id":           filament_data.get("bambu_setting_id") or "",
+                "kprofile_filament_id": slicer_filament,         # verknüpft K-Profil mit Filament-ID
+                "k_value":              k_value,                 # 0.0 = skip
+            }
+            try:
+                r3 = await self._client.post(
+                    f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}"
+                    f"/slots/{ams_id}/{tray_id}/configure",
+                    params=configure_params,
+                )
+                r3.raise_for_status()
+                self.log_debug(
+                    "out",
+                    f"POST /api/v1/printers/{self._bambuddy_printer_id}/slots/{ams_id}/{tray_id}/configure",
+                    configure_params,
+                )
+            except httpx.HTTPStatusError as e:
+                # configure-Fehler nicht fatal — MQTT via Assignment läuft trotzdem
+                logger.warning(
+                    f"Could not configure Bambuddy slot {ams_id}-{tray_id}: "
+                    f"{e.response.status_code} {e.response.text}"
+                )
 
             # Slot→Spool Mapping für Verbrauchsrückmeldung nach print_complete aktualisieren
             filaman_spool_id = filament_data.get("spool_id")
