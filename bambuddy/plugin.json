@@ -1,0 +1,45 @@
+{
+  "plugin_key": "bambuddy",
+  "name": "Bambuddy",
+  "driver_key": "bambuddy",
+  "plugin_type": "driver",
+  "version": "1.0.0",
+  "description": "Connects to printers managed by Bambuddy. Receives real-time AMS slot data via WebSocket and supports manual and automatic spool assignment.",
+  "author": "FilaMan",
+  "homepage": "https://www.filaman.app",
+  "dependencies": ["websockets>=12.0", "httpx>=0.27.0"],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "bambuddy_url": {
+        "type": "string",
+        "title": "Bambuddy URL",
+        "description": "Base URL of your Bambuddy instance, e.g. http://192.168.1.50:8080"
+      },
+      "api_key": {
+        "type": "string",
+        "title": "API Key",
+        "description": "Bambuddy API key (create in Bambuddy under Settings \u2192 API Keys)"
+      },
+      "printer_id": {
+        "type": "integer",
+        "title": "Bambuddy Printer ID",
+        "description": "Internal ID of the printer in Bambuddy"
+      },
+      "reconnect_interval_seconds": {
+        "type": "integer",
+        "title": "WebSocket Reconnect Interval (Seconds)",
+        "description": "How long to wait before reconnecting after a WebSocket disconnect",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 300
+      }
+    },
+    "required": ["bambuddy_url", "api_key", "printer_id"]
+  },
+  "capabilities": {
+    "has_slots": true,
+    "has_ams": true,
+    "supports_auto_match": true
+  }
+}
