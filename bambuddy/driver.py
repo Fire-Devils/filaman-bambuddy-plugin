@@ -48,6 +48,17 @@ def _float_or_none(v: Any) -> float | None:
         return None
 
 
+def _extract_bambu_idx(preset_id: str) -> str:
+    """Extrahiert bambu_idx aus Bambuddy preset_id.
+
+    Bambuddy liefert z.B. 'builtin_GFA01' → extrahiert 'GFA01' (Teil nach erstem '_').
+    Enthält preset_id kein Unterstriche, wird der gesamte Wert zurückgegeben.
+    """
+    if not preset_id:
+        return ""
+    return preset_id.split("_", 1)[1] if "_" in preset_id else preset_id
+
+
 class PendingSpool:
     def __init__(self, spool_id: int, filament_data: dict, slot_index: str | None = None):
         self.spool_id = spool_id
@@ -80,7 +91,8 @@ class Driver(BaseDriver):
         self._timeout_seconds = DEFAULT_TIMEOUT
         self._current_slots: list[dict[str, Any]] = []
         self._current_ams_units: list[dict[str, Any]] = []
-        self._slot_to_spool: dict[str, int] = {}  # "ams_id-tray_id" → filaman spool_id
+        self._slot_to_spool: dict[str, int] = {}      # "ams_id-tray_id" → filaman spool_id
+        self._slot_params_cache: dict[str, dict] = {}  # "ams_id-tray_id" → Bambu-Params aus Assignment
         self._connected = False
 
     # -- Lifecycle ------------------------------------------------------------
@@ -233,18 +245,38 @@ class Driver(BaseDriver):
                 slot_index = f"{ams_id}-{tray_id}"
                 tray_type  = tray.get("tray_type", "")
                 tray_color = tray.get("tray_color", "")
+                cached     = self._slot_params_cache.get(slot_index, {})
+
+                # tray_info_idx: primär aus preset_id (Bambuddy-Feld), Fallback aus Cache
+                preset_id     = tray.get("preset_id", "")
+                tray_info_idx = _extract_bambu_idx(preset_id) or tray.get("tray_info_idx", "")
+
+                if not tray_type:
+                    self._slot_params_cache.pop(slot_index, None)
 
                 ams_slots.append({
-                    "slot_index": slot_index,
-                    "slot_name": f"AMS {ams_id + 1} - Slot {tray_id + 1}",
-                    "tray_info_idx": tray.get("tray_info_idx", ""),
-                    "tray_type": tray_type,
-                    "tray_color": tray_color,
-                    "nozzle_temp_min": tray.get("nozzle_temp_min"),
-                    "nozzle_temp_max": tray.get("nozzle_temp_max"),
-                    "setting_id": tray.get("setting_id", ""),
-                    "cali_idx": tray.get("cali_idx"),
-                    "remain": tray.get("remain", 0),
+                    "slot_index":    slot_index,
+                    "slot_name":     f"AMS {ams_id + 1} - Slot {tray_id + 1}",
+                    "tray_info_idx": tray_info_idx,
+                    "tray_type":     tray_type,
+                    "tray_color":    tray_color,
+                    # Temperaturen: von Bambuddy wenn geliefert, sonst aus Cache (Assignment)
+                    "nozzle_temp_min": (tray.get("nozzle_temp_min")
+                                        if tray.get("nozzle_temp_min") is not None
+                                        else cached.get("nozzle_temp_min")),
+                    "nozzle_temp_max": (tray.get("nozzle_temp_max")
+                                        if tray.get("nozzle_temp_max") is not None
+                                        else cached.get("nozzle_temp_max")),
+                    "setting_id": tray.get("setting_id") or cached.get("bambu_setting_id", ""),
+                    "cali_idx":   (tray.get("cali_idx")
+                                   if tray.get("cali_idx") is not None
+                                   else cached.get("bambu_cali_idx")),
+                    # Nur aus Cache — kommen nicht von Bambuddy printer_status
+                    "bambu_k_value":              cached.get("bambu_k_value"),
+                    "bambu_bed_temp":             cached.get("bambu_bed_temp"),
+                    "bambu_flow_ratio":           cached.get("bambu_flow_ratio"),
+                    "bambu_max_volumetric_speed": cached.get("bambu_max_volumetric_speed"),
+                    "remain":  tray.get("remain", 0),
                     "present": bool(tray_type),
                 })
 
@@ -254,18 +286,37 @@ class Driver(BaseDriver):
             vt_id      = int(vt.get("id", 254))
             vt_type    = vt.get("tray_type", "")
             vt_color   = vt.get("tray_color", "")
+            vt_idx     = f"255-{vt_id}"
+            vt_cached  = self._slot_params_cache.get(vt_idx, {})
+
+            vt_preset_id     = vt.get("preset_id", "")
+            vt_tray_info_idx = _extract_bambu_idx(vt_preset_id) or vt.get("tray_info_idx", "")
+
+            if not vt_type:
+                self._slot_params_cache.pop(vt_idx, None)
+
             ext_slots.append({
-                "slot_index": f"255-{vt_id}",
-                "slot_name":  "External Tray",
-                "tray_info_idx": vt.get("tray_info_idx", ""),
-                "tray_type":  vt_type,
-                "tray_color": vt_color,
-                "nozzle_temp_min": vt.get("nozzle_temp_min"),
-                "nozzle_temp_max": vt.get("nozzle_temp_max"),
-                "setting_id": vt.get("setting_id", ""),
-                "cali_idx":   vt.get("cali_idx"),
-                "remain":     vt.get("remain", 0),
-                "present":    bool(vt_type),
+                "slot_index":    vt_idx,
+                "slot_name":     "External Tray",
+                "tray_info_idx": vt_tray_info_idx,
+                "tray_type":     vt_type,
+                "tray_color":    vt_color,
+                "nozzle_temp_min": (vt.get("nozzle_temp_min")
+                                    if vt.get("nozzle_temp_min") is not None
+                                    else vt_cached.get("nozzle_temp_min")),
+                "nozzle_temp_max": (vt.get("nozzle_temp_max")
+                                    if vt.get("nozzle_temp_max") is not None
+                                    else vt_cached.get("nozzle_temp_max")),
+                "setting_id": vt.get("setting_id") or vt_cached.get("bambu_setting_id", ""),
+                "cali_idx":   (vt.get("cali_idx")
+                               if vt.get("cali_idx") is not None
+                               else vt_cached.get("bambu_cali_idx")),
+                "bambu_k_value":              vt_cached.get("bambu_k_value"),
+                "bambu_bed_temp":             vt_cached.get("bambu_bed_temp"),
+                "bambu_flow_ratio":           vt_cached.get("bambu_flow_ratio"),
+                "bambu_max_volumetric_speed": vt_cached.get("bambu_max_volumetric_speed"),
+                "remain":  vt.get("remain", 0),
+                "present": bool(vt_type),
             })
 
         self._current_ams_units = ams_units
@@ -448,6 +499,18 @@ class Driver(BaseDriver):
             filaman_spool_id = filament_data.get("spool_id")
             if filaman_spool_id:
                 self._slot_to_spool[f"{ams_id}-{tray_id}"] = int(filaman_spool_id)
+
+            # Bambu-Params cachen für "Tray-Daten übernehmen" (Bambuddy liefert sie nicht via printer_status)
+            self._slot_params_cache[f"{ams_id}-{tray_id}"] = {
+                "nozzle_temp_min":            nozzle_temp_min,
+                "nozzle_temp_max":            nozzle_temp_max,
+                "bambu_setting_id":           filament_data.get("bambu_setting_id", ""),
+                "bambu_cali_idx":             filament_data.get("bambu_cali_idx"),
+                "bambu_k_value":              filament_data.get("bambu_k_value"),
+                "bambu_bed_temp":             filament_data.get("bambu_bed_temp"),
+                "bambu_flow_ratio":           filament_data.get("bambu_flow_ratio"),
+                "bambu_max_volumetric_speed": filament_data.get("bambu_max_volumetric_speed"),
+            }
 
             logger.info(
                 f"Assigned FilaMan spool {filament_data.get('spool_id')} "
