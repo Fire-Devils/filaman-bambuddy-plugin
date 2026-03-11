@@ -80,6 +80,7 @@ class Driver(BaseDriver):
         self._timeout_seconds = DEFAULT_TIMEOUT
         self._current_slots: list[dict[str, Any]] = []
         self._current_ams_units: list[dict[str, Any]] = []
+        self._slot_to_spool: dict[str, int] = {}  # "ams_id-tray_id" → filaman spool_id
         self._connected = False
 
     # -- Lifecycle ------------------------------------------------------------
@@ -118,6 +119,7 @@ class Driver(BaseDriver):
             with suppress(asyncio.CancelledError):
                 await self._ws_task
         self._current_slots = []  # Force full re-sync on reconnect
+        self._slot_to_spool = {}  # Mapping verliert Gültigkeit nach Reconnect
         self._connected = False
         self._ws_task = asyncio.create_task(self._ws_listener())
 
@@ -157,6 +159,8 @@ class Driver(BaseDriver):
 
                         if event_type == "printer_status":
                             self._process_slots(event.get("data", {}))
+                        elif event_type == "print_complete":
+                            self._handle_print_complete(event.get("data", {}))
 
             except (
                 websockets.exceptions.ConnectionClosed,
@@ -430,6 +434,12 @@ class Driver(BaseDriver):
             )
             r2.raise_for_status()
             self.log_debug("out", "POST /api/v1/inventory/assignments", assignment_payload)
+
+            # Slot→Spool Mapping für Verbrauchsrückmeldung nach print_complete aktualisieren
+            filaman_spool_id = filament_data.get("spool_id")
+            if filaman_spool_id:
+                self._slot_to_spool[f"{ams_id}-{tray_id}"] = int(filaman_spool_id)
+
             logger.info(
                 f"Assigned FilaMan spool {filament_data.get('spool_id')} "
                 f"(slicer_filament={slicer_filament}) to "
@@ -473,6 +483,47 @@ class Driver(BaseDriver):
         if self._pending:
             logger.info(f"Pending spool {self._pending.spool_id} timed out after {timeout}s")
             self._pending = None
+
+    # -- Verbrauchsrückmeldung nach Druckjob ---------------------------------
+
+    def _handle_print_complete(self, data: dict) -> None:
+        """Verbrauchsdaten aus Bambuddy print_complete Event an FilaMan melden.
+
+        Bambuddy liefert pro Slot: ams_id, tray_id, material, weight_used.
+        Das lokale _slot_to_spool-Mapping mappt ams_id-tray_id → FilaMan spool_id.
+        Das Ergebnis wird als consumption_update Event emittiert und vom
+        PluginManager via SpoolService.record_consumption() verarbeitet.
+        """
+        usage_results = data.get("usage_results", [])
+        entries: list[dict] = []
+
+        if usage_results:
+            for u in usage_results:
+                slot_key = f"{u.get('ams_id', 0)}-{u.get('tray_id', 0)}"
+                spool_id = self._slot_to_spool.get(slot_key)
+                weight = u.get("weight_used")
+                if spool_id and weight:
+                    entries.append({"spool_id": spool_id, "delta_weight_g": float(weight)})
+        else:
+            # Fallback: Gesamtverbrauch wenn kein Per-Slot-Breakdown vorhanden
+            # (nur wenn genau eine Spule im Mapping steht, um Fehlzuweisungen zu vermeiden)
+            total = _float_or_none(data.get("filament_grams"))
+            if total and len(self._slot_to_spool) == 1:
+                spool_id = next(iter(self._slot_to_spool.values()))
+                entries.append({"spool_id": spool_id, "delta_weight_g": total})
+
+        if entries:
+            logger.info(
+                f"print_complete: reporting consumption for {len(entries)} spool(s) "
+                f"(printer {self.printer_id})"
+            )
+            self.log_debug("event", "print_complete", {"entries": entries})
+            self.emit({"event_type": "consumption_update", "entries": entries})
+        else:
+            logger.debug(
+                f"print_complete received but no matching spool found in slot mapping "
+                f"(printer {self.printer_id}). usage_results={usage_results}"
+            )
 
     # -- Health ---------------------------------------------------------------
 
