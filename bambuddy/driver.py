@@ -172,12 +172,14 @@ class Driver(BaseDriver):
 
         Merge-Strategie: Wie im BambuLab-Plugin werden nur vorhandene Daten aktualisiert.
         Auto-Set: Erkennt Slot-Änderungen via Feldvergleich (tray_type, tray_color).
+        Bambuddy liefert den externen Slot als separates `vt_tray`-Array (wie BambuLab).
         """
         ams_list = printer_status.get("ams", [])
-        if not ams_list:
+        vt_tray_list = printer_status.get("vt_tray", [])
+        if not ams_list and not vt_tray_list:
             return
 
-        # -- AMS-Einheiten Metadaten --
+        # -- AMS-Einheiten Metadaten + AMS-Slots --
         ams_units: list[dict[str, Any]] = []
         ams_slots: list[dict[str, Any]] = []
 
@@ -195,10 +197,8 @@ class Driver(BaseDriver):
             for tray in trays:
                 tray_id = int(tray.get("id", 0))
                 slot_index = f"{ams_id}-{tray_id}"
-                # Bambuddy nutzt "material" statt "tray_type"
-                tray_type = tray.get("material", tray.get("tray_type", ""))
-                # Bambuddy nutzt "color" statt "tray_color"
-                tray_color = tray.get("color", tray.get("tray_color", ""))
+                tray_type  = tray.get("tray_type", "")
+                tray_color = tray.get("tray_color", "")
 
                 ams_slots.append({
                     "slot_index": slot_index,
@@ -209,8 +209,24 @@ class Driver(BaseDriver):
                     "present": bool(tray_type),
                 })
 
+        # -- Externer Slot (vt_tray) — analog BambuLab-Plugin (slot_index "255-{id}") --
+        ext_slots: list[dict[str, Any]] = []
+        for vt in vt_tray_list:
+            vt_id      = int(vt.get("id", 254))
+            vt_type    = vt.get("tray_type", "")
+            vt_color   = vt.get("tray_color", "")
+            ext_slots.append({
+                "slot_index": f"255-{vt_id}",
+                "slot_name":  "External Tray",
+                "tray_type":  vt_type,
+                "tray_color": vt_color,
+                "remain":     vt.get("remain", 0),
+                "present":    bool(vt_type),
+            })
+
         self._current_ams_units = ams_units
-        slots = ams_slots
+        has_external = len(ext_slots) > 0
+        slots = ams_slots + ext_slots
 
         # -- Auto-Set: Slot-Änderung erkennen (analog BambuLab-Plugin) --
         # Vergleicht tray_type und tray_color gegen vorherige Slot-Daten.
@@ -260,11 +276,13 @@ class Driver(BaseDriver):
         self._current_slots = slots
 
         total_slots = sum(u.get("tray_count", 0) for u in ams_units)
+        if has_external:
+            total_slots += len(ext_slots)
         ams_info = {
             "ams_count": len(ams_units),
             "ams_type": "AMS",
             "slot_count": total_slots,
-            "external_spool": False,
+            "external_spool": has_external,
             "ams_units": ams_units,
         }
 
