@@ -402,12 +402,10 @@ class Driver(BaseDriver):
             logger.error("Cannot send assignment: HTTP client not initialized")
             return
 
-        # -- Farbe normalisieren: FilaMan liefert 8-stelliges RGBA, Bambuddy erwartet RRGGBBAA --
-        color = filament_data.get("color", "FFFFFFFF")
-        if len(color) == 6:
-            color = color + "FF"
-        elif len(color) != 8:
-            color = "FFFFFFFF"
+        # -- Farbe normalisieren: Bambuddy erwartet 6-stelliges RRGGBB --
+        color = filament_data.get("color", "FFFFFF")[:6].upper()
+        if len(color) < 6:
+            color = "FFFFFF"
 
         # -- Bambu Material Index (slicer_filament = tray_info_idx) --
         # Priorität: bambu_idx (aus printer_params) → bambu_tray_idx → generischer Fallback
