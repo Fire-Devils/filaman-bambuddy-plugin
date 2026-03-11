@@ -72,7 +72,7 @@ class Driver(BaseDriver):
         self._bambuddy_printer_id = config.get("printer_id")
         self._reconnect_interval = config.get("reconnect_interval_seconds", DEFAULT_RECONNECT_INTERVAL)
 
-        self._headers = {"Authorization": f"ApiKey {self._api_key}"}
+        self._headers = {"X-API-Key": f"ApiKey {self._api_key}"}
         self._client: httpx.AsyncClient | None = None
         self._ws_task: asyncio.Task | None = None
 
@@ -135,7 +135,7 @@ class Driver(BaseDriver):
             try:
                 async with websockets.connect(
                     ws_url,
-                    additional_headers={"Authorization": f"ApiKey {self._api_key}"},
+                    additional_headers={"X-API-Key": f"ApiKey {self._api_key}"},
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
