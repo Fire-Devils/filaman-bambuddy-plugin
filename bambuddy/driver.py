@@ -22,8 +22,7 @@ from typing import Any, Callable
 
 import httpx
 from sqlalchemy import delete, event, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import async_session_maker
 from app.models.filament import Filament, FilamentColor
@@ -152,7 +151,7 @@ class Driver(BaseDriver):
         self._sync_task = asyncio.create_task(self._sync_inventory_loop())
 
         # DB-Event-Listener für sofortigen Push registrieren
-        event.listen(AsyncSession, "after_commit", self._on_session_commit)
+        event.listen(Session, "after_commit", self._on_session_commit)
 
         logger.info(
             f"Bambuddy driver started for FilaMan printer {self.printer_id} "
@@ -162,7 +161,7 @@ class Driver(BaseDriver):
     async def stop(self) -> None:
         # DB-Event-Listener entfernen
         try:
-            event.remove(AsyncSession, "after_commit", self._on_session_commit)
+            event.remove(Session, "after_commit", self._on_session_commit)
         except Exception:
             pass
         self._running = False
@@ -182,7 +181,7 @@ class Driver(BaseDriver):
 
     # -- Sofortiger Push (SQLAlchemy Event-Listener) -------------------------
 
-    def _on_session_commit(self, session: AsyncSession) -> None:
+    def _on_session_commit(self, session: Session) -> None:
         """Reagiert auf jeden DB-Commit im Prozess (synchron, im Event-Loop-Thread).
 
         Ignoriert eigene Commits während eines laufenden Syncs (_syncing-Guard).
@@ -387,6 +386,7 @@ class Driver(BaseDriver):
                 s["note"]: s
                 for s in bb_spools
                 if (s.get("note") or "").startswith("filaman:")
+                and s["note"].removeprefix("filaman:").isdigit()
             }
 
             synced_fm_ids: set[int] = set()
