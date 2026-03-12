@@ -134,6 +134,9 @@ class Driver(BaseDriver):
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
 
+        # Lock verhindert parallele Sync-Operationen (Race Condition bei full_resync)
+        self._sync_lock: asyncio.Lock = asyncio.Lock()
+
     # -- Lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
@@ -366,6 +369,21 @@ class Driver(BaseDriver):
     async def _sync_all_spools(self) -> None:
         """Synchronisiert alle aktiven FilaMan-Spulen ins Bambuddy-Inventory.
 
+        Acquiert _sync_lock und überspringt den Sync wenn bereits ein Sync/Resync läuft.
+        """
+        if not self._client:
+            return
+        if self._sync_lock.locked():
+            logger.debug(
+                f"Sync skipped: resync/sync already in progress for printer {self.printer_id}"
+            )
+            return
+        async with self._sync_lock:
+            await self._do_sync_inner()
+
+    async def _do_sync_inner(self) -> None:
+        """Innere Sync-Logik ohne Lock — muss unter _sync_lock aufgerufen werden.
+
         Ablauf:
         1. Alle FilaMan-Spulen holen (GET /api/v1/spools)
         2. Alle Bambuddy-Spulen mit note="filaman:*" indexieren
@@ -460,27 +478,32 @@ class Driver(BaseDriver):
         await self._sync_all_spools()
 
     async def full_resync(self) -> None:
-        """Löscht ALLE Bambuddy-Inventarspulen und synchronisiert neu aus FilaMan."""
+        """Löscht ALLE Bambuddy-Inventarspulen und synchronisiert neu aus FilaMan.
+
+        Hält _sync_lock für die gesamte Dauer (Löschen + Neu-Sync), damit kein
+        paralleler Debounce-Sync oder periodischer Sync Duplikate erzeugen kann.
+        """
         if not self._client:
             raise RuntimeError("Driver not connected")
-        logger.info(f"Full resync started for printer {self.printer_id}")
-        # 1. ALLE Bambuddy-Inventarspulen löschen (keine Filterung nach filaman:)
-        bb_spools = await self._bb_get("/api/v1/inventory/spools")
-        for spool in bb_spools:
-            await self._bb_delete(f"/api/v1/inventory/spools/{spool['id']}")
-        logger.info(f"Deleted {len(bb_spools)} Bambuddy spools")
-        # 2. bambuddy_spool_id-Params aus FilaMan-DB löschen
-        async with async_session_maker() as db:
-            await db.execute(
-                delete(SpoolPrinterParam).where(
-                    SpoolPrinterParam.printer_id == self.printer_id,
-                    SpoolPrinterParam.param_key == "bambuddy_spool_id",
+        async with self._sync_lock:
+            logger.info(f"Full resync started for printer {self.printer_id}")
+            # 1. ALLE Bambuddy-Inventarspulen löschen (keine Filterung nach filaman:)
+            bb_spools = await self._bb_get("/api/v1/inventory/spools")
+            for spool in bb_spools:
+                await self._bb_delete(f"/api/v1/inventory/spools/{spool['id']}")
+            logger.info(f"Deleted {len(bb_spools)} Bambuddy spools")
+            # 2. bambuddy_spool_id-Params aus FilaMan-DB löschen
+            async with async_session_maker() as db:
+                await db.execute(
+                    delete(SpoolPrinterParam).where(
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                    )
                 )
-            )
-            await db.commit()
-        # 3. Neu synchronisieren
-        await self._sync_all_spools()
-        logger.info(f"Full resync complete for printer {self.printer_id}")
+                await db.commit()
+            # 3. Neu synchronisieren (Lock bereits gehalten, direkt _do_sync_inner aufrufen)
+            await self._do_sync_inner()
+            logger.info(f"Full resync complete for printer {self.printer_id}")
 
     # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
 
