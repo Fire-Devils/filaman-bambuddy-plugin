@@ -116,6 +116,9 @@ class Driver(BaseDriver):
         self._ws_task: asyncio.Task | None = None
         self._sync_task: asyncio.Task | None = None
 
+        # -- Verbindungs-Status --
+        self._connected: bool = False
+
         # -- Status-Cache --
         self._current_slots: list[dict[str, Any]] = []
         self._current_ams_units: list[dict[str, Any]] = []
@@ -158,6 +161,7 @@ class Driver(BaseDriver):
                 except asyncio.CancelledError:
                     pass
         self._ws_task = self._sync_task = None
+        self._connected = False
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -424,17 +428,18 @@ class Driver(BaseDriver):
 
         while self._running:
             uri = (
-                self._bambuddy_url
+                self._bambuddy_url.rstrip("/")
                 .replace("https://", "wss://")
                 .replace("http://", "ws://")
-            ) + "/ws"
+            ) + "/api/v1/ws"
             try:
                 async with websockets.connect(
                     uri,
-                    extra_headers={"X-API-Key": self._api_key},
+                    additional_headers={"X-API-Key": self._api_key},
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
+                    self._connected = True
                     logger.info(f"WebSocket connected: {uri}")
                     async for message in ws:
                         if not self._running:
@@ -445,6 +450,7 @@ class Driver(BaseDriver):
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
             except Exception as e:
+                self._connected = False
                 if self._running:
                     logger.warning(
                         f"WebSocket disconnected ({e}). "
@@ -692,6 +698,7 @@ class Driver(BaseDriver):
                 f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
             )
             if r.status_code == 200:
+                self._connected = True
                 self._process_slots(r.json())
                 logger.info(
                     f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id}"
@@ -844,6 +851,7 @@ class Driver(BaseDriver):
             "driver_key":          self.driver_key,
             "printer_id":          self.printer_id,
             "running":             self._running,
+            "connected":           self._connected,
             "bambuddy_printer_id": self._bambuddy_printer_id,
             "ams_count":           len(self._current_ams_units),
             "slot_count":          total_slots,
