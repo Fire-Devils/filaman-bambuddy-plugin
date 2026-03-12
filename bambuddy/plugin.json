@@ -41,9 +41,9 @@
         "type": "integer",
         "title": "Sync-Intervall (Sekunden)",
         "description": "Wie oft FilaMan-Spulen mit Bambuddy abgeglichen werden",
-        "default": 300,
+        "default": 3600,
         "minimum": 60,
-        "maximum": 3600
+        "maximum": 86400
       }
     }
   },

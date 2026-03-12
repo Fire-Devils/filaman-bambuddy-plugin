@@ -21,7 +21,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, event, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import async_session_maker
@@ -130,6 +131,10 @@ class Driver(BaseDriver):
         self._last_sync_count: int = 0
         self._last_sync_error: str | None = None
 
+        # Sofortiger Push: Guard gegen Endlosschleife + Debounce-Task
+        self._syncing: bool = False
+        self._debounce_task: asyncio.Task | None = None
+
     # -- Lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
@@ -146,12 +151,20 @@ class Driver(BaseDriver):
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._sync_task = asyncio.create_task(self._sync_inventory_loop())
 
+        # DB-Event-Listener für sofortigen Push registrieren
+        event.listen(AsyncSession, "after_commit", self._on_session_commit)
+
         logger.info(
             f"Bambuddy driver started for FilaMan printer {self.printer_id} "
             f"(Bambuddy printer_id={self._bambuddy_printer_id})"
         )
 
     async def stop(self) -> None:
+        # DB-Event-Listener entfernen
+        try:
+            event.remove(AsyncSession, "after_commit", self._on_session_commit)
+        except Exception:
+            pass
         self._running = False
         for task in (self._ws_task, self._sync_task):
             if task and not task.done():
@@ -166,6 +179,27 @@ class Driver(BaseDriver):
             await self._client.aclose()
             self._client = None
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
+
+    # -- Sofortiger Push (SQLAlchemy Event-Listener) -------------------------
+
+    def _on_session_commit(self, session: AsyncSession) -> None:
+        """Reagiert auf jeden DB-Commit im Prozess (synchron, im Event-Loop-Thread).
+
+        Ignoriert eigene Commits während eines laufenden Syncs (_syncing-Guard).
+        Debounct mehrfache Commits innerhalb von 3 Sekunden zu einem einzelnen Sync.
+        """
+        if not self._running or not self._connected or self._syncing:
+            return
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._debounce_task = asyncio.create_task(self._debounced_sync())
+
+    async def _debounced_sync(self) -> None:
+        """Wartet 3 Sekunden auf weitere Commits, dann Inventory-Sync."""
+        await asyncio.sleep(3)
+        if self._running and self._connected and not self._syncing:
+            logger.debug(f"Data change detected, triggering inventory sync for printer {self.printer_id}")
+            await self._sync_all_spools()
 
     # -- Bambuddy HTTP-Helfer ------------------------------------------------
 
@@ -342,6 +376,7 @@ class Driver(BaseDriver):
         """
         if not self._client:
             return
+        self._syncing = True
         try:
             # 1. FilaMan-Spulen direkt aus DB holen
             fm_spools: list[Spool] = await self._fetch_fm_spools()
@@ -409,6 +444,8 @@ class Driver(BaseDriver):
         except Exception as e:
             self._last_sync_error = str(e)
             logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
+        finally:
+            self._syncing = False
 
 
     async def _sync_inventory_loop(self) -> None:
@@ -417,6 +454,33 @@ class Driver(BaseDriver):
             await asyncio.sleep(self._sync_interval)
             if self._running:
                 await self._sync_all_spools()
+
+    async def trigger_sync(self) -> None:
+        """Manueller sofortiger Inventory-Sync (Drucker-Action)."""
+        await self._sync_all_spools()
+
+    async def full_resync(self) -> None:
+        """Löscht ALLE Bambuddy-Inventarspulen und synchronisiert neu aus FilaMan."""
+        if not self._client:
+            raise RuntimeError("Driver not connected")
+        logger.info(f"Full resync started for printer {self.printer_id}")
+        # 1. ALLE Bambuddy-Inventarspulen löschen (keine Filterung nach filaman:)
+        bb_spools = await self._bb_get("/api/v1/inventory/spools")
+        for spool in bb_spools:
+            await self._bb_delete(f"/api/v1/inventory/spools/{spool['id']}")
+        logger.info(f"Deleted {len(bb_spools)} Bambuddy spools")
+        # 2. bambuddy_spool_id-Params aus FilaMan-DB löschen
+        async with async_session_maker() as db:
+            await db.execute(
+                delete(SpoolPrinterParam).where(
+                    SpoolPrinterParam.printer_id == self.printer_id,
+                    SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                )
+            )
+            await db.commit()
+        # 3. Neu synchronisieren
+        await self._sync_all_spools()
+        logger.info(f"Full resync complete for printer {self.printer_id}")
 
     # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
 
@@ -863,4 +927,18 @@ class Driver(BaseDriver):
             "last_sync_count":     self._last_sync_count,
             "last_sync_error":     self._last_sync_error,
             "active_slot_mappings": len(self._slot_to_filaman_spool),
+            "sync_actions": [
+                {
+                    "action":   "trigger_sync",
+                    "label":    "Sync Now",
+                    "label_de": "Jetzt synchronisieren",
+                    "variant":  "secondary",
+                },
+                {
+                    "action":   "full_resync",
+                    "label":    "Full Resync",
+                    "label_de": "Vollständiger Resync",
+                    "variant":  "danger",
+                },
+            ],
         }
