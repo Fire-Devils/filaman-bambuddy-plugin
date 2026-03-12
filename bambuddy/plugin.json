@@ -35,7 +35,28 @@
         "maximum": 300
       }
     },
-    "required": ["bambuddy_url", "api_key", "printer_id"]
+    "required": ["bambuddy_url", "api_key", "printer_id"],
+    "advanced": {
+      "filaman_url": {
+        "type": "string",
+        "title": "FilaMan URL (intern)",
+        "description": "URL der FilaMan-Instanz für interne API-Aufrufe (Standard: http://localhost:8000)",
+        "default": "http://localhost:8000"
+      },
+      "filaman_api_key": {
+        "type": "string",
+        "title": "FilaMan API Key",
+        "description": "API-Key für FilaMan (für Inventory-Sync und Verbrauchsmeldungen)"
+      },
+      "sync_interval_seconds": {
+        "type": "integer",
+        "title": "Sync-Intervall (Sekunden)",
+        "description": "Wie oft FilaMan-Spulen mit Bambuddy abgeglichen werden",
+        "default": 300,
+        "minimum": 60,
+        "maximum": 3600
+      }
+    }
   },
   "capabilities": {
     "has_slots": true,
@@ -54,7 +75,8 @@
       {"key": "bambu_bed_temp", "label": "Bed Temperature", "field_type": "number"},
       {"key": "bambu_nozzle_temp_min", "label": "Nozzle Temp Min", "field_type": "number"},
       {"key": "bambu_nozzle_temp_max", "label": "Nozzle Temp Max", "field_type": "number"},
-      {"key": "bambu_max_volumetric_speed", "label": "Max Volumetric Speed", "field_type": "number"}
+      {"key": "bambu_max_volumetric_speed", "label": "Max Volumetric Speed", "field_type": "number"},
+      {"key": "bambuddy_spool_id", "label": "Bambuddy Spool ID", "field_type": "text", "system": true, "target_type": "spool_printer_param"}
     ],
     "migration": {
       "legacy_renames": {

@@ -1,8 +1,31 @@
+"""Bambuddy driver: bidirektionale FilaMan↔Bambuddy Synchronisation.
+
+Flows:
+1. Inventory Sync (FilaMan → Bambuddy):
+   - Auf Start + periodisch: FilaMan-Spulen → Bambuddy-Inventory (create/update/delete)
+   - Nach CREATE: Bambuddy-Spool-ID als SpoolPrinterParam in FilaMan speichern
+     (param_key="bambuddy_spool_id")
+
+2. Tray-Konfiguration (FilaMan → Bambuddy):
+   - Primär: POST /api/v1/inventory/assignments (wenn bambuddy_spool_id bekannt)
+   - Fallback: POST /slots/{a}/{t}/configure (bei erstem Start vor Sync)
+
+3. Verbrauchsmeldung (Bambuddy → FilaMan):
+   - WebSocket-Verbindung zu Bambuddy
+   - print_complete-Event → POST /api/v1/spools/{id}/consumptions in FilaMan
+"""
 import asyncio
+import json
 import logging
 from typing import Any, Callable
 
 import httpx
+
+try:
+    import websockets
+    import websockets.exceptions
+except ImportError:  # pragma: no cover
+    websockets = None  # type: ignore[assignment]
 
 from app.plugins.base import BaseDriver
 
@@ -52,12 +75,11 @@ def _extract_bambu_idx(preset_id: str) -> str:
 
 
 class Driver(BaseDriver):
-    """Vereinfachter Bambuddy-Driver: FilaMan → Bambuddy Push via HTTP.
+    """Bambuddy-Driver mit bidirektionaler FilaMan↔Bambuddy Synchronisation.
 
-    Sendet AMS-Konfiguration direkt über Bambuddys /configure-Endpunkt,
-    ohne Spool-Anlegen, Assignment oder WebSocket-Verbindung.
-    Die bidirektionale Synchronisierung (Bambuddy ↔ FilaMan) erfolgt
-    über die native FilaMan-Integration in Bambuddy (PR).
+    FilaMan ist die Quelle der Wahrheit für Spulen und Filamente.
+    Der Driver synchronisiert Spulen automatisch in das Bambuddy-Inventory
+    und empfängt Verbrauchsdaten nach Druckabschluss via WebSocket.
     """
 
     driver_key = "bambuddy"
@@ -69,177 +91,471 @@ class Driver(BaseDriver):
         emitter: Callable[[dict[str, Any]], None],
     ):
         super().__init__(printer_id, config, emitter)
+
+        # -- Bambuddy-Verbindung --
         self._bambuddy_url = config.get("bambuddy_url", "").rstrip("/")
         self._api_key = config.get("api_key", "")
         self._bambuddy_printer_id = config.get("printer_id")
-
-        self._headers = {"X-API-Key": f"{self._api_key}"}
+        self._headers = {"X-API-Key": self._api_key}
         self._client: httpx.AsyncClient | None = None
 
+        # -- FilaMan-Verbindung (für Inventory-Sync & Verbrauchsmeldungen) --
+        self._filaman_url = config.get("filaman_url", "http://localhost:8000").rstrip("/")
+        self._filaman_api_key = config.get("filaman_api_key", "")
+        self._filaman_headers = (
+            {"X-API-Key": self._filaman_api_key} if self._filaman_api_key else {}
+        )
+        self._filaman_client: httpx.AsyncClient | None = None
+
+        # -- Sync/Reconnect-Einstellungen --
+        self._sync_interval: int = int(config.get("sync_interval_seconds", 300))
+        self._reconnect_interval: int = int(config.get("reconnect_interval_seconds", 30))
+
+        # -- Background Tasks --
+        self._ws_task: asyncio.Task | None = None
+        self._sync_task: asyncio.Task | None = None
+
+        # -- Status-Cache --
         self._current_slots: list[dict[str, Any]] = []
         self._current_ams_units: list[dict[str, Any]] = []
         # Cache für Bambu-Parameter (nozzle temps, k_value etc.) pro Slot
         self._slot_params_cache: dict[str, dict] = {}
+        # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
+        self._slot_to_filaman_spool: dict[str, int] = {}
+        # Letzte Sync-Statistik
+        self._last_sync_count: int = 0
+        self._last_sync_error: str | None = None
 
     # -- Lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
         self._running = True
-        self._client = httpx.AsyncClient(headers=self._headers, timeout=10.0)
+        self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
+        self._filaman_client = httpx.AsyncClient(
+            headers=self._filaman_headers, timeout=15.0
+        )
 
-        # Initialen Status einmalig via REST laden
+        # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
 
+        # Inventory-Sync: FilaMan → Bambuddy
+        await self._sync_all_spools()
+
+        # Background-Tasks starten
+        self._ws_task = asyncio.create_task(self._ws_loop())
+        self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+
         logger.info(
-            f"Bambuddy driver started for printer {self.printer_id} "
+            f"Bambuddy driver started for FilaMan printer {self.printer_id} "
             f"(Bambuddy printer_id={self._bambuddy_printer_id})"
         )
 
     async def stop(self) -> None:
         self._running = False
+        for task in (self._ws_task, self._sync_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._ws_task = self._sync_task = None
         if self._client:
             await self._client.aclose()
             self._client = None
+        if self._filaman_client:
+            await self._filaman_client.aclose()
+            self._filaman_client = None
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
 
-    # -- Initialer Status-Fetch -----------------------------------------------
+    # -- Bambuddy HTTP-Helfer ------------------------------------------------
 
-    async def _fetch_and_emit_status(self) -> None:
-        """Initialen Drucker-Status von Bambuddy REST-API laden und als slots_update emittieren."""
-        if not self._client or not self._bambuddy_printer_id:
-            return
-        try:
-            r = await self._client.get(
-                f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
-            )
-            if r.status_code == 200:
-                self._process_slots(r.json())
-                logger.info(f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id}")
-        except Exception as e:
-            logger.warning(f"Could not fetch initial Bambuddy status: {e}")
+    async def _bb_get(self, path: str, **kwargs: Any) -> Any:
+        assert self._client
+        r = await self._client.get(f"{self._bambuddy_url}{path}", **kwargs)
+        r.raise_for_status()
+        return r.json()
 
-    # -- Slot-Verarbeitung ----------------------------------------------------
+    async def _bb_post(self, path: str, json_body: dict) -> Any:
+        assert self._client
+        r = await self._client.post(f"{self._bambuddy_url}{path}", json=json_body)
+        r.raise_for_status()
+        return r.json()
 
-    def _process_slots(self, printer_status: dict) -> None:
-        """AMS-Daten aus Bambuddy printer_status verarbeiten und slots_update emittieren."""
-        ams_list = printer_status.get("ams", [])
-        vt_tray_list = printer_status.get("vt_tray", [])
-        if not ams_list and not vt_tray_list:
-            return
+    async def _bb_patch(self, path: str, json_body: dict) -> Any:
+        assert self._client
+        r = await self._client.patch(f"{self._bambuddy_url}{path}", json=json_body)
+        r.raise_for_status()
+        return r.json()
 
-        ams_units: list[dict[str, Any]] = []
-        ams_slots: list[dict[str, Any]] = []
+    async def _bb_delete(self, path: str) -> None:
+        assert self._client
+        r = await self._client.delete(f"{self._bambuddy_url}{path}")
+        r.raise_for_status()
 
-        for ams_unit in ams_list:
-            ams_id = int(ams_unit.get("id", 0))
-            trays = ams_unit.get("tray", ams_unit.get("trays", []))
-            ams_units.append({
-                "ams_id": ams_id,
-                "humidity": ams_unit.get("humidity"),
-                "temp": ams_unit.get("temp", ams_unit.get("temperature")),
-                "tray_count": len(trays),
-                "is_ams_ht": ams_unit.get("is_ams_ht", False),
-            })
+    # -- FilaMan HTTP-Helfer -------------------------------------------------
 
-            for tray in trays:
-                tray_id = int(tray.get("id", 0))
-                slot_index = f"{ams_id}-{tray_id}"
-                tray_type  = tray.get("tray_type", "")
-                tray_color = tray.get("tray_color", "")
-                cached     = self._slot_params_cache.get(slot_index, {})
+    async def _fm_get(self, path: str, **kwargs: Any) -> Any:
+        assert self._filaman_client
+        r = await self._filaman_client.get(f"{self._filaman_url}{path}", **kwargs)
+        r.raise_for_status()
+        return r.json()
 
-                preset_id     = tray.get("preset_id", "")
-                tray_info_idx = _extract_bambu_idx(preset_id) or tray.get("tray_info_idx", "")
+    async def _fm_post(self, path: str, json_body: dict) -> Any:
+        assert self._filaman_client
+        r = await self._filaman_client.post(f"{self._filaman_url}{path}", json=json_body)
+        r.raise_for_status()
+        return r.json()
 
-                if not tray_type:
-                    self._slot_params_cache.pop(slot_index, None)
+    async def _fm_put(self, path: str, json_body: Any) -> Any:
+        assert self._filaman_client
+        r = await self._filaman_client.put(f"{self._filaman_url}{path}", json=json_body)
+        r.raise_for_status()
+        return r.json()
 
-                ams_slots.append({
-                    "slot_index":    slot_index,
-                    "slot_name":     f"AMS {ams_id + 1} - Slot {tray_id + 1}",
-                    "tray_info_idx": tray_info_idx,
-                    "tray_type":     tray_type,
-                    "tray_color":    tray_color,
-                    "nozzle_temp_min": (tray.get("nozzle_temp_min")
-                                        if tray.get("nozzle_temp_min") is not None
-                                        else cached.get("nozzle_temp_min")),
-                    "nozzle_temp_max": (tray.get("nozzle_temp_max")
-                                        if tray.get("nozzle_temp_max") is not None
-                                        else cached.get("nozzle_temp_max")),
-                    "setting_id": tray.get("setting_id") or cached.get("bambu_setting_id", ""),
-                    "cali_idx":   (tray.get("cali_idx")
-                                   if tray.get("cali_idx") is not None
-                                   else cached.get("bambu_cali_idx")),
-                    "bambu_k_value":              cached.get("bambu_k_value"),
-                    "bambu_bed_temp":             cached.get("bambu_bed_temp"),
-                    "bambu_flow_ratio":           cached.get("bambu_flow_ratio"),
-                    "bambu_max_volumetric_speed": cached.get("bambu_max_volumetric_speed"),
-                    "remain":  tray.get("remain", 0),
-                    "present": bool(tray_type),
-                })
+    # -- Inventory Sync (FilaMan → Bambuddy) ---------------------------------
 
-        ext_slots: list[dict[str, Any]] = []
-        for vt in vt_tray_list:
-            vt_id      = int(vt.get("id", 254))
-            vt_type    = vt.get("tray_type", "")
-            vt_color   = vt.get("tray_color", "")
-            vt_idx     = f"255-{vt_id}"
-            vt_cached  = self._slot_params_cache.get(vt_idx, {})
+    def _map_spool(self, spool: dict) -> dict:
+        """FilaMan SpoolResponse → Bambuddy SpoolCreate/Update-Payload.
 
-            vt_preset_id     = vt.get("preset_id", "")
-            vt_tray_info_idx = _extract_bambu_idx(vt_preset_id) or vt.get("tray_info_idx", "")
+        Mapping:
+          filament.material_type           → material
+          filament.manufacturer.name       → brand
+          filament.colors[0].hex_code+FF   → rgba (8-stellig RRGGBBAA)
+          initial_total_weight_g           → label_weight
+          initial - remaining              → weight_used
+          rfid_uid                         → tag_uid
+          "filaman:{id}"                   → note (Reverse-Lookup-Schlüssel)
+          printer_params.bambu_idx         → slicer_filament
+          printer_params.bambu_nozzle_*    → nozzle_temp_min/max
+        """
+        filament = spool.get("filament") or {}
+        manufacturer = (filament.get("manufacturer") or {})
+        colors = filament.get("colors") or []
 
-            if not vt_type:
-                self._slot_params_cache.pop(vt_idx, None)
+        # Farbe: FilaMan 6-stellig hex → 8-stellig RRGGBBAA
+        raw_color = (
+            (colors[0].get("hex_code") or "FFFFFF") if colors else "FFFFFF"
+        ).lstrip("#")
+        if len(raw_color) == 6:
+            rgba = (raw_color + "FF").upper()
+        elif len(raw_color) == 8:
+            rgba = raw_color.upper()
+        else:
+            rgba = "FFFFFFFF"
 
-            ext_slots.append({
-                "slot_index":    vt_idx,
-                "slot_name":     "External Tray",
-                "tray_info_idx": vt_tray_info_idx,
-                "tray_type":     vt_type,
-                "tray_color":    vt_color,
-                "nozzle_temp_min": (vt.get("nozzle_temp_min")
-                                    if vt.get("nozzle_temp_min") is not None
-                                    else vt_cached.get("nozzle_temp_min")),
-                "nozzle_temp_max": (vt.get("nozzle_temp_max")
-                                    if vt.get("nozzle_temp_max") is not None
-                                    else vt_cached.get("nozzle_temp_max")),
-                "setting_id": vt.get("setting_id") or vt_cached.get("bambu_setting_id", ""),
-                "cali_idx":   (vt.get("cali_idx")
-                               if vt.get("cali_idx") is not None
-                               else vt_cached.get("bambu_cali_idx")),
-                "bambu_k_value":              vt_cached.get("bambu_k_value"),
-                "bambu_bed_temp":             vt_cached.get("bambu_bed_temp"),
-                "bambu_flow_ratio":           vt_cached.get("bambu_flow_ratio"),
-                "bambu_max_volumetric_speed": vt_cached.get("bambu_max_volumetric_speed"),
-                "remain":  vt.get("remain", 0),
-                "present": bool(vt_type),
-            })
+        initial_weight = float(spool.get("initial_total_weight_g") or 1000.0)
+        remaining_weight = spool.get("remaining_weight_g")
+        weight_used = max(0.0, initial_weight - float(remaining_weight)) if remaining_weight is not None else 0.0
 
-        self._current_ams_units = ams_units
-        has_external = len(ext_slots) > 0
-        slots = ams_slots + ext_slots
+        # printer_params (falls via enrich_filament_data angereichert)
+        pp = spool.get("printer_params") or {}
 
-        if slots == self._current_slots:
-            return
-
-        self._current_slots = slots
-
-        total_slots = sum(u.get("tray_count", 0) for u in ams_units)
-        if has_external:
-            total_slots += len(ext_slots)
-        ams_info = {
-            "ams_count": len(ams_units),
-            "ams_type": "AMS",
-            "slot_count": total_slots,
-            "external_spool": has_external,
-            "ams_units": ams_units,
+        payload: dict[str, Any] = {
+            "material":      filament.get("material_type") or "PLA",
+            "brand":         manufacturer.get("name") or None,
+            "rgba":          rgba,
+            "label_weight":  int(initial_weight),
+            "weight_used":   round(weight_used, 2),
+            "weight_locked": False,
+            "note":          f"filaman:{spool['id']}",
         }
 
-        logger.info(f"Slot data changed for printer {self.printer_id}, emitting slots_update")
-        self.emit({"event_type": "slots_update", "slots": slots, "ams_info": ams_info})
+        if rfid_uid := spool.get("rfid_uid"):
+            payload["tag_uid"] = rfid_uid
 
-    # -- Spule in Bambuddy konfigurieren (FilaMan → Bambuddy Push) ------------
+        if slicer := pp.get("bambu_idx") or pp.get("bambu_tray_idx"):
+            payload["slicer_filament"] = slicer
+
+        if (nozzle_min := _int_or_none(pp.get("bambu_nozzle_temp_min"))) is not None:
+            payload["nozzle_temp_min"] = nozzle_min
+
+        if (nozzle_max := _int_or_none(pp.get("bambu_nozzle_temp_max"))) is not None:
+            payload["nozzle_temp_max"] = nozzle_max
+
+        return payload
+
+    async def _sync_all_spools(self) -> None:
+        """Synchronisiert alle aktiven FilaMan-Spulen ins Bambuddy-Inventory.
+
+        Ablauf:
+        1. Alle FilaMan-Spulen holen (GET /api/v1/spools)
+        2. Alle Bambuddy-Spulen mit note="filaman:*" indexieren
+        3. CREATE oder UPDATE je nach ob note-Eintrag bereits existiert
+        4. Bei CREATE: Bambuddy-Spool-ID als printer_param in FilaMan speichern
+        5. Bambuddy-Spulen löschen, die in FilaMan nicht mehr existieren
+        """
+        if not self._client or not self._filaman_client:
+            return
+        try:
+            # 1. FilaMan-Spulen
+            fm_resp = await self._fm_get(
+                "/api/v1/spools",
+                params={"include_archived": False, "page_size": 500},
+            )
+            fm_spools: list[dict] = (
+                fm_resp.get("items", []) if isinstance(fm_resp, dict) else fm_resp
+            )
+
+            # 2. Bambuddy note-Index: {"filaman:42": {id: ..., ...}}
+            bb_spools: list[dict] = await self._bb_get("/api/v1/inventory/spools")
+            note_index: dict[str, dict] = {
+                s["note"]: s
+                for s in bb_spools
+                if (s.get("note") or "").startswith("filaman:")
+            }
+
+            synced_fm_ids: set[int] = set()
+
+            for fm_spool in fm_spools:
+                fm_id = fm_spool["id"]
+                note_key = f"filaman:{fm_id}"
+                payload = self._map_spool(fm_spool)
+
+                try:
+                    if note_key in note_index:
+                        bb_id = note_index[note_key]["id"]
+                        await self._bb_patch(
+                            f"/api/v1/inventory/spools/{bb_id}", payload
+                        )
+                    else:
+                        response = await self._bb_post(
+                            "/api/v1/inventory/spools", payload
+                        )
+                        bb_id = response["id"]
+                        # Bambuddy-ID in FilaMan als SpoolPrinterParam speichern
+                        await self._store_bambuddy_id(fm_id, bb_id)
+                        logger.info(
+                            f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
+                        )
+                    synced_fm_ids.add(fm_id)
+                except Exception as e:
+                    logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
+
+            # 4. Veraltete Bambuddy-Spulen entfernen
+            for note_key, bb_spool in note_index.items():
+                try:
+                    fm_id = int(note_key.removeprefix("filaman:"))
+                    if fm_id not in synced_fm_ids:
+                        await self._bb_delete(
+                            f"/api/v1/inventory/spools/{bb_spool['id']}"
+                        )
+                        logger.info(
+                            f"Deleted Bambuddy spool {bb_spool['id']} "
+                            f"(FilaMan spool {fm_id} no longer active)"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to delete orphaned Bambuddy spool: {e}")
+
+            self._last_sync_count = len(synced_fm_ids)
+            self._last_sync_error = None
+            logger.info(
+                f"Inventory sync complete: {len(synced_fm_ids)} spools synced "
+                f"to Bambuddy printer {self._bambuddy_printer_id}"
+            )
+
+        except Exception as e:
+            self._last_sync_error = str(e)
+            logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
+
+    async def _store_bambuddy_id(
+        self, filaman_spool_id: int, bambuddy_spool_id: int
+    ) -> None:
+        """Speichert Bambuddy-Spool-ID als SpoolPrinterParam in FilaMan.
+
+        Danach liefert enrich_filament_data() automatisch bambuddy_spool_id
+        in filament_data["printer_params"], sodass send_filament_to_tray()
+        nur die ID an die Bambuddy-Assignment-API schicken muss.
+        """
+        try:
+            await self._fm_put(
+                f"/api/v1/spools/{filaman_spool_id}/printer-params/{self.printer_id}",
+                {"params": [
+                    {"param_key": "bambuddy_spool_id", "param_value": str(bambuddy_spool_id)}
+                ]},
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not store bambuddy_spool_id in FilaMan "
+                f"(spool {filaman_spool_id}): {e}"
+            )
+
+    async def _sync_inventory_loop(self) -> None:
+        """Periodischer Inventory-Sync alle sync_interval_seconds."""
+        while self._running:
+            await asyncio.sleep(self._sync_interval)
+            if self._running:
+                await self._sync_all_spools()
+
+    # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
+
+    async def _ws_loop(self) -> None:
+        """WebSocket-Verbindung zu Bambuddy mit automatischem Reconnect."""
+        if websockets is None:
+            logger.warning(
+                "websockets package not installed — WebSocket disabled. "
+                "Install with: pip install websockets>=12.0"
+            )
+            return
+
+        while self._running:
+            uri = (
+                self._bambuddy_url
+                .replace("https://", "wss://")
+                .replace("http://", "ws://")
+            ) + "/ws"
+            try:
+                async with websockets.connect(
+                    uri,
+                    extra_headers={"X-API-Key": self._api_key},
+                    ping_interval=30,
+                    ping_timeout=10,
+                ) as ws:
+                    logger.info(f"WebSocket connected: {uri}")
+                    async for message in ws:
+                        if not self._running:
+                            break
+                        try:
+                            event = json.loads(message)
+                            await self._handle_ws_event(event)
+                        except Exception as e:
+                            logger.warning(f"WS message handling error: {e}")
+            except Exception as e:
+                if self._running:
+                    logger.warning(
+                        f"WebSocket disconnected ({e}). "
+                        f"Reconnecting in {self._reconnect_interval}s…"
+                    )
+                    await asyncio.sleep(self._reconnect_interval)
+
+    async def _handle_ws_event(self, event: dict) -> None:
+        """Verarbeitet eingehende Bambuddy WebSocket-Events."""
+        event_type = event.get("type")
+
+        if event_type == "printer_status":
+            data = event.get("data", {})
+            if event.get("printer_id") == self._bambuddy_printer_id:
+                self._process_slots(data)
+
+        elif event_type == "print_complete":
+            data = event.get("data", {})
+            if data.get("printer_id") == self._bambuddy_printer_id:
+                await self._handle_print_complete(data)
+
+    async def _handle_print_complete(self, data: dict) -> None:
+        """Meldet Filament-Verbrauch nach Druckende an FilaMan.
+
+        Das `weight_used`-Feld des Events kann sein:
+        - float  → Gesamtgewicht aller Filamente
+        - dict   → {"ams_id-tray_id": weight_g, ...} per Slot
+
+        Für die Zuordnung Slot → FilaMan-Spool-ID wird der in-memory Cache
+        `_slot_to_filaman_spool` genutzt, der bei jeder Tray-Zuweisung
+        (`send_filament_to_tray`) aktualisiert wird.
+        """
+        weight_used = data.get("weight_used")
+        if not weight_used:
+            return
+
+        if isinstance(weight_used, dict):
+            # Per-Slot: {"0-0": 12.5, "0-1": 8.3, ...}
+            for slot_key, weight_g in weight_used.items():
+                filaman_spool_id = self._slot_to_filaman_spool.get(str(slot_key))
+                if filaman_spool_id and float(weight_g) > 0:
+                    await self._report_consumption(filaman_spool_id, float(weight_g))
+
+        elif isinstance(weight_used, (int, float)) and float(weight_used) > 0:
+            # Gesamtgewicht: nur melden wenn genau ein Slot aktiv
+            active_slots = list(self._slot_to_filaman_spool.items())
+            if len(active_slots) == 1:
+                _, filaman_spool_id = active_slots[0]
+                await self._report_consumption(filaman_spool_id, float(weight_used))
+            elif len(active_slots) > 1:
+                logger.debug(
+                    f"print_complete: total weight {weight_used}g but {len(active_slots)} "
+                    f"active slots — cannot split accurately, skipping consumption report"
+                )
+
+    async def _report_consumption(self, filaman_spool_id: int, delta_g: float) -> None:
+        """Meldet delta_g Verbrauch für eine FilaMan-Spule."""
+        try:
+            await self._fm_post(
+                f"/api/v1/spools/{filaman_spool_id}/consumptions",
+                {"delta_weight_g": delta_g, "source": "bambuddy"},
+            )
+            logger.info(
+                f"Reported {delta_g:.1f}g consumption for FilaMan spool {filaman_spool_id}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to report consumption for FilaMan spool {filaman_spool_id}: {e}"
+            )
+
+    # -- Tray-Konfiguration (FilaMan → Bambuddy) ------------------------------
+
+    def send_filament_to_tray(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
+        """Weist FilaMan-Spule einem Bambuddy-AMS-Slot zu."""
+        asyncio.create_task(self._assign_or_configure(ams_id, tray_id, filament_data))
+
+    async def _assign_or_configure(
+        self, ams_id: int, tray_id: int, filament_data: dict
+    ) -> None:
+        """Primär: Assignment-API (wenn bambuddy_spool_id gesetzt). Fallback: configure-Call.
+
+        Beim ersten Start (vor dem Inventory-Sync) kennt FilaMan die bambuddy_spool_id
+        noch nicht → Fallback auf den configure-Endpoint (alle Felder einzeln).
+        Nach dem Sync ist bambuddy_spool_id via enrich_filament_data() verfügbar
+        → einfacher Assignment-Call genügt (Bambuddy konfiguriert AMS automatisch).
+        """
+        bambuddy_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
+        filaman_spool_id  = _int_or_none(filament_data.get("id"))
+        slot_key = f"{ams_id}-{tray_id}"
+
+        if bambuddy_spool_id and self._client:
+            try:
+                response = await self._bb_post(
+                    "/api/v1/inventory/assignments",
+                    {
+                        "spool_id":   bambuddy_spool_id,
+                        "printer_id": self._bambuddy_printer_id,
+                        "ams_id":     ams_id,
+                        "tray_id":    tray_id,
+                    },
+                )
+                self.log_debug(
+                    "out",
+                    f"POST /api/v1/inventory/assignments",
+                    {
+                        "spool_id":   bambuddy_spool_id,
+                        "printer_id": self._bambuddy_printer_id,
+                        "ams_id":     ams_id,
+                        "tray_id":    tray_id,
+                        "configured": response.get("configured"),
+                    },
+                )
+                logger.info(
+                    f"Assigned Bambuddy spool {bambuddy_spool_id} to "
+                    f"printer {self._bambuddy_printer_id} AMS {ams_id}/{tray_id} "
+                    f"(auto-configured={response.get('configured', False)})"
+                )
+                # Slot-Spool-Cache für Verbrauchsmeldung nach Druckende aktualisieren
+                if filaman_spool_id:
+                    self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Assignment API failed (slot {ams_id}/{tray_id}), "
+                    f"falling back to configure-call: {e}"
+                )
+
+        # Fallback: Direkter configure-Call mit allen Feldern
+        await self._send_assignment(ams_id, tray_id, filament_data)
+
+        # Slot-Spool-Cache auch beim Fallback aktualisieren
+        if filaman_spool_id:
+            self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+
+    # -- Direkter configure-Call (Fallback) ----------------------------------
 
     async def _send_assignment(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
         """Konfiguriert einen AMS-Slot direkt über Bambuddys configure-Endpunkt.
@@ -347,23 +663,175 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.error(f"Failed to configure Bambuddy slot {ams_id}-{tray_id}: {e}")
 
-    # -- Öffentliche API (aufgerufen vom PluginManager) -----------------------
+    # -- Initialer Status-Fetch -----------------------------------------------
 
-    def send_filament_to_tray(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
-        """Direkte manuelle Zuweisung: konfiguriert AMS-Slot über Bambuddy configure-Endpoint."""
-        asyncio.create_task(self._send_assignment(ams_id, tray_id, filament_data))
+    async def _fetch_and_emit_status(self) -> None:
+        """Initialen Drucker-Status von Bambuddy REST-API laden und als slots_update emittieren."""
+        if not self._client or not self._bambuddy_printer_id:
+            return
+        try:
+            r = await self._client.get(
+                f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
+            )
+            if r.status_code == 200:
+                self._process_slots(r.json())
+                logger.info(
+                    f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not fetch initial Bambuddy status: {e}")
+
+    # -- Slot-Verarbeitung (AMS-Status → FilaMan Slots) ----------------------
+
+    def _process_slots(self, printer_status: dict) -> None:
+        """AMS-Daten aus Bambuddy printer_status verarbeiten und slots_update emittieren."""
+        ams_list = printer_status.get("ams", [])
+        vt_tray_list = printer_status.get("vt_tray", [])
+        if not ams_list and not vt_tray_list:
+            return
+
+        ams_units: list[dict[str, Any]] = []
+        ams_slots: list[dict[str, Any]] = []
+
+        for ams_unit in ams_list:
+            ams_id = int(ams_unit.get("id", 0))
+            trays = ams_unit.get("tray", ams_unit.get("trays", []))
+            ams_units.append({
+                "ams_id":     ams_id,
+                "humidity":   ams_unit.get("humidity"),
+                "temp":       ams_unit.get("temp", ams_unit.get("temperature")),
+                "tray_count": len(trays),
+                "is_ams_ht":  ams_unit.get("is_ams_ht", False),
+            })
+
+            for tray in trays:
+                tray_id    = int(tray.get("id", 0))
+                slot_index = f"{ams_id}-{tray_id}"
+                tray_type  = tray.get("tray_type", "")
+                tray_color = tray.get("tray_color", "")
+                cached     = self._slot_params_cache.get(slot_index, {})
+
+                preset_id     = tray.get("preset_id", "")
+                tray_info_idx = _extract_bambu_idx(preset_id) or tray.get("tray_info_idx", "")
+
+                if not tray_type:
+                    self._slot_params_cache.pop(slot_index, None)
+                    self._slot_to_filaman_spool.pop(slot_index, None)
+
+                ams_slots.append({
+                    "slot_index":    slot_index,
+                    "slot_name":     f"AMS {ams_id + 1} - Slot {tray_id + 1}",
+                    "tray_info_idx": tray_info_idx,
+                    "tray_type":     tray_type,
+                    "tray_color":    tray_color,
+                    "nozzle_temp_min": (
+                        tray.get("nozzle_temp_min")
+                        if tray.get("nozzle_temp_min") is not None
+                        else cached.get("nozzle_temp_min")
+                    ),
+                    "nozzle_temp_max": (
+                        tray.get("nozzle_temp_max")
+                        if tray.get("nozzle_temp_max") is not None
+                        else cached.get("nozzle_temp_max")
+                    ),
+                    "setting_id": tray.get("setting_id") or cached.get("bambu_setting_id", ""),
+                    "cali_idx":   (
+                        tray.get("cali_idx")
+                        if tray.get("cali_idx") is not None
+                        else cached.get("bambu_cali_idx")
+                    ),
+                    "bambu_k_value":              cached.get("bambu_k_value"),
+                    "bambu_bed_temp":             cached.get("bambu_bed_temp"),
+                    "bambu_flow_ratio":           cached.get("bambu_flow_ratio"),
+                    "bambu_max_volumetric_speed": cached.get("bambu_max_volumetric_speed"),
+                    "remain":  tray.get("remain", 0),
+                    "present": bool(tray_type),
+                })
+
+        ext_slots: list[dict[str, Any]] = []
+        for vt in vt_tray_list:
+            vt_id     = int(vt.get("id", 254))
+            vt_type   = vt.get("tray_type", "")
+            vt_color  = vt.get("tray_color", "")
+            vt_idx    = f"255-{vt_id}"
+            vt_cached = self._slot_params_cache.get(vt_idx, {})
+
+            vt_preset_id     = vt.get("preset_id", "")
+            vt_tray_info_idx = _extract_bambu_idx(vt_preset_id) or vt.get("tray_info_idx", "")
+
+            if not vt_type:
+                self._slot_params_cache.pop(vt_idx, None)
+                self._slot_to_filaman_spool.pop(vt_idx, None)
+
+            ext_slots.append({
+                "slot_index":    vt_idx,
+                "slot_name":     "External Tray",
+                "tray_info_idx": vt_tray_info_idx,
+                "tray_type":     vt_type,
+                "tray_color":    vt_color,
+                "nozzle_temp_min": (
+                    vt.get("nozzle_temp_min")
+                    if vt.get("nozzle_temp_min") is not None
+                    else vt_cached.get("nozzle_temp_min")
+                ),
+                "nozzle_temp_max": (
+                    vt.get("nozzle_temp_max")
+                    if vt.get("nozzle_temp_max") is not None
+                    else vt_cached.get("nozzle_temp_max")
+                ),
+                "setting_id": vt.get("setting_id") or vt_cached.get("bambu_setting_id", ""),
+                "cali_idx":   (
+                    vt.get("cali_idx")
+                    if vt.get("cali_idx") is not None
+                    else vt_cached.get("bambu_cali_idx")
+                ),
+                "bambu_k_value":              vt_cached.get("bambu_k_value"),
+                "bambu_bed_temp":             vt_cached.get("bambu_bed_temp"),
+                "bambu_flow_ratio":           vt_cached.get("bambu_flow_ratio"),
+                "bambu_max_volumetric_speed": vt_cached.get("bambu_max_volumetric_speed"),
+                "remain":  vt.get("remain", 0),
+                "present": bool(vt_type),
+            })
+
+        self._current_ams_units = ams_units
+        has_external = len(ext_slots) > 0
+        slots = ams_slots + ext_slots
+
+        if slots == self._current_slots:
+            return
+
+        self._current_slots = slots
+
+        total_slots = sum(u.get("tray_count", 0) for u in ams_units)
+        if has_external:
+            total_slots += len(ext_slots)
+        ams_info = {
+            "ams_count":     len(ams_units),
+            "ams_type":      "AMS",
+            "slot_count":    total_slots,
+            "external_spool": has_external,
+            "ams_units":     ams_units,
+        }
+
+        logger.info(
+            f"Slot data changed for printer {self.printer_id}, emitting slots_update"
+        )
+        self.emit({"event_type": "slots_update", "slots": slots, "ams_info": ams_info})
 
     # -- Health ---------------------------------------------------------------
 
     def health(self) -> dict[str, Any]:
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
         return {
-            "driver_key": self.driver_key,
-            "printer_id": self.printer_id,
-            "running": self._running,
+            "driver_key":          self.driver_key,
+            "printer_id":          self.printer_id,
+            "running":             self._running,
             "bambuddy_printer_id": self._bambuddy_printer_id,
-            "ams_count": len(self._current_ams_units),
-            "slot_count": total_slots,
-            "ams_units": self._current_ams_units,
-            "slots": self._current_slots,
+            "ams_count":           len(self._current_ams_units),
+            "slot_count":          total_slots,
+            "ams_units":           self._current_ams_units,
+            "slots":               self._current_slots,
+            "last_sync_count":     self._last_sync_count,
+            "last_sync_error":     self._last_sync_error,
+            "active_slot_mappings": len(self._slot_to_filaman_spool),
         }
