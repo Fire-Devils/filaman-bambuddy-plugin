@@ -367,6 +367,9 @@ class Driver(BaseDriver):
                         await self._bb_patch(
                             f"/api/v1/inventory/spools/{bb_id}", payload
                         )
+                        # Sicherstellen, dass bambuddy_spool_id auch bei bestehenden
+                        # Spulen in der FilaMan-DB vorhanden ist (idempotentes UPSERT).
+                        await self._store_bambuddy_id_db(fm_id, bb_id)
                     else:
                         response = await self._bb_post(
                             "/api/v1/inventory/spools", payload
