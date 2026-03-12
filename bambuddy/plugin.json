@@ -37,17 +37,6 @@
     },
     "required": ["bambuddy_url", "api_key", "printer_id"],
     "advanced": {
-      "filaman_url": {
-        "type": "string",
-        "title": "FilaMan URL (intern)",
-        "description": "URL der FilaMan-Instanz für interne API-Aufrufe (Standard: http://localhost:8000)",
-        "default": "http://localhost:8000"
-      },
-      "filaman_api_key": {
-        "type": "string",
-        "title": "FilaMan API Key",
-        "description": "API-Key für FilaMan (für Inventory-Sync und Verbrauchsmeldungen)"
-      },
       "sync_interval_seconds": {
         "type": "integer",
         "title": "Sync-Intervall (Sekunden)",

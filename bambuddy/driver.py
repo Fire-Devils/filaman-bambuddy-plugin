@@ -3,8 +3,8 @@
 Flows:
 1. Inventory Sync (FilaMan → Bambuddy):
    - Auf Start + periodisch: FilaMan-Spulen → Bambuddy-Inventory (create/update/delete)
-   - Nach CREATE: Bambuddy-Spool-ID als SpoolPrinterParam in FilaMan speichern
-     (param_key="bambuddy_spool_id")
+   - Nach CREATE: Bambuddy-Spool-ID direkt als SpoolPrinterParam in FilaMan-DB speichern
+     (param_key="bambuddy_spool_id") — kein HTTP-Umweg, da Plugin intern läuft
 
 2. Tray-Konfiguration (FilaMan → Bambuddy):
    - Primär: POST /api/v1/inventory/assignments (wenn bambuddy_spool_id bekannt)
@@ -12,14 +12,23 @@ Flows:
 
 3. Verbrauchsmeldung (Bambuddy → FilaMan):
    - WebSocket-Verbindung zu Bambuddy
-   - print_complete-Event → POST /api/v1/spools/{id}/consumptions in FilaMan
+   - print_complete-Event → SpoolService.record_consumption() direkt in FilaMan-DB
 """
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from app.core.database import async_session_maker
+from app.models.filament import Filament, FilamentColor
+from app.models.printer_params import SpoolPrinterParam
+from app.models.spool import Spool, SpoolStatus
+from app.services.spool_service import SpoolService
 
 try:
     import websockets
@@ -99,14 +108,6 @@ class Driver(BaseDriver):
         self._headers = {"X-API-Key": self._api_key}
         self._client: httpx.AsyncClient | None = None
 
-        # -- FilaMan-Verbindung (für Inventory-Sync & Verbrauchsmeldungen) --
-        self._filaman_url = config.get("filaman_url", "http://localhost:8000").rstrip("/")
-        self._filaman_api_key = config.get("filaman_api_key", "")
-        self._filaman_headers = (
-            {"X-API-Key": self._filaman_api_key} if self._filaman_api_key else {}
-        )
-        self._filaman_client: httpx.AsyncClient | None = None
-
         # -- Sync/Reconnect-Einstellungen --
         self._sync_interval: int = int(config.get("sync_interval_seconds", 300))
         self._reconnect_interval: int = int(config.get("reconnect_interval_seconds", 30))
@@ -131,9 +132,6 @@ class Driver(BaseDriver):
     async def start(self) -> None:
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
-        self._filaman_client = httpx.AsyncClient(
-            headers=self._filaman_headers, timeout=15.0
-        )
 
         # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
@@ -163,9 +161,6 @@ class Driver(BaseDriver):
         if self._client:
             await self._client.aclose()
             self._client = None
-        if self._filaman_client:
-            await self._filaman_client.aclose()
-            self._filaman_client = None
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
 
     # -- Bambuddy HTTP-Helfer ------------------------------------------------
@@ -193,50 +188,102 @@ class Driver(BaseDriver):
         r = await self._client.delete(f"{self._bambuddy_url}{path}")
         r.raise_for_status()
 
-    # -- FilaMan HTTP-Helfer -------------------------------------------------
+    # -- FilaMan DB-Helfer (direkte SQLAlchemy-Zugriffe, kein HTTP) ----------
 
-    async def _fm_get(self, path: str, **kwargs: Any) -> Any:
-        assert self._filaman_client
-        r = await self._filaman_client.get(f"{self._filaman_url}{path}", **kwargs)
-        r.raise_for_status()
-        return r.json()
+    async def _fetch_fm_spools(self) -> list[Spool]:
+        """Holt alle nicht-archivierten FilaMan-Spulen aus der DB."""
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(Spool)
+                .join(SpoolStatus)
+                .where(SpoolStatus.key != "archived")
+                .options(
+                    selectinload(Spool.filament).selectinload(Filament.manufacturer),
+                    selectinload(Spool.filament).selectinload(
+                        Filament.filament_colors
+                    ).selectinload(FilamentColor.color),
+                    selectinload(Spool.printer_params),
+                )
+            )
+            return list(result.scalars().all())
 
-    async def _fm_post(self, path: str, json_body: dict) -> Any:
-        assert self._filaman_client
-        r = await self._filaman_client.post(f"{self._filaman_url}{path}", json=json_body)
-        r.raise_for_status()
-        return r.json()
+    async def _store_bambuddy_id_db(
+        self, filaman_spool_id: int, bambuddy_spool_id: int
+    ) -> None:
+        """Speichert Bambuddy-Spool-ID als SpoolPrinterParam direkt in FilaMan-DB.
 
-    async def _fm_put(self, path: str, json_body: Any) -> Any:
-        assert self._filaman_client
-        r = await self._filaman_client.put(f"{self._filaman_url}{path}", json=json_body)
-        r.raise_for_status()
-        return r.json()
+        Danach liefert enrich_filament_data() automatisch bambuddy_spool_id
+        in filament_data["printer_params"], sodass send_filament_to_tray()
+        nur die ID an die Bambuddy-Assignment-API schicken muss.
+        """
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(SpoolPrinterParam).where(
+                    SpoolPrinterParam.spool_id == filaman_spool_id,
+                    SpoolPrinterParam.printer_id == self.printer_id,
+                    SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                existing.param_value = str(bambuddy_spool_id)
+            else:
+                db.add(SpoolPrinterParam(
+                    spool_id=filaman_spool_id,
+                    printer_id=self.printer_id,
+                    param_key="bambuddy_spool_id",
+                    param_value=str(bambuddy_spool_id),
+                ))
+            await db.commit()
+
+    async def _report_consumption_db(
+        self, filaman_spool_id: int, delta_g: float
+    ) -> None:
+        """Meldet Verbrauch direkt über SpoolService in FilaMan-DB."""
+        async with async_session_maker() as db:
+            spool = await db.get(Spool, filaman_spool_id)
+            if not spool:
+                logger.warning(
+                    f"FilaMan spool {filaman_spool_id} not found for consumption report"
+                )
+                return
+            service = SpoolService(db)
+            _, remaining = await service.record_consumption(
+                spool=spool,
+                delta_weight_g=delta_g,
+                event_at=datetime.now(timezone.utc),
+                principal=None,
+                source="bambuddy",
+            )
+            logger.info(
+                f"Recorded {delta_g:.1f}g consumption for FilaMan spool {filaman_spool_id} "
+                f"(remaining: {remaining}g)"
+            )
 
     # -- Inventory Sync (FilaMan → Bambuddy) ---------------------------------
 
-    def _map_spool(self, spool: dict) -> dict:
-        """FilaMan SpoolResponse → Bambuddy SpoolCreate/Update-Payload.
+    def _map_spool(self, spool: Spool) -> dict:
+        """FilaMan Spool (ORM) → Bambuddy SpoolCreate/Update-Payload.
 
         Mapping:
-          filament.material_type           → material
-          filament.manufacturer.name       → brand
-          filament.colors[0].hex_code+FF   → rgba (8-stellig RRGGBBAA)
-          initial_total_weight_g           → label_weight
-          initial - remaining              → weight_used
-          rfid_uid                         → tag_uid
-          "filaman:{id}"                   → note (Reverse-Lookup-Schlüssel)
-          printer_params.bambu_idx         → slicer_filament
-          printer_params.bambu_nozzle_*    → nozzle_temp_min/max
+          filament.material_type                    → material
+          filament.manufacturer.name                → brand
+          filament.filament_colors[0].color.hex_code→ rgba (8-stellig RRGGBBAA)
+          initial_total_weight_g                    → label_weight
+          initial - remaining                       → weight_used
+          rfid_uid                                  → tag_uid
+          "filaman:{id}"                            → note (Reverse-Lookup-Schlüssel)
+          printer_params bambu_idx                  → slicer_filament
+          printer_params bambu_nozzle_*             → nozzle_temp_min/max
         """
-        filament = spool.get("filament") or {}
-        manufacturer = (filament.get("manufacturer") or {})
-        colors = filament.get("colors") or []
+        fil = spool.filament
+        manufacturer_name = (fil.manufacturer.name if fil and fil.manufacturer else None)
+        colors = (fil.filament_colors if fil else [])
 
         # Farbe: FilaMan 6-stellig hex → 8-stellig RRGGBBAA
-        raw_color = (
-            (colors[0].get("hex_code") or "FFFFFF") if colors else "FFFFFF"
-        ).lstrip("#")
+        raw_color = "FFFFFF"
+        if colors:
+            raw_color = (colors[0].color.hex_code or "FFFFFF").lstrip("#")
         if len(raw_color) == 6:
             rgba = (raw_color + "FF").upper()
         elif len(raw_color) == 8:
@@ -244,25 +291,29 @@ class Driver(BaseDriver):
         else:
             rgba = "FFFFFFFF"
 
-        initial_weight = float(spool.get("initial_total_weight_g") or 1000.0)
-        remaining_weight = spool.get("remaining_weight_g")
-        weight_used = max(0.0, initial_weight - float(remaining_weight)) if remaining_weight is not None else 0.0
+        initial_weight = float(spool.initial_total_weight_g or 1000.0)
+        remaining = spool.remaining_weight_g
+        weight_used = max(0.0, initial_weight - float(remaining)) if remaining is not None else 0.0
 
-        # printer_params (falls via enrich_filament_data angereichert)
-        pp = spool.get("printer_params") or {}
+        # printer_params als {key: value} dict aus der Relationship
+        pp: dict[str, str | None] = {
+            p.param_key: p.param_value
+            for p in (spool.printer_params or [])
+            if p.printer_id == self.printer_id
+        }
 
         payload: dict[str, Any] = {
-            "material":      filament.get("material_type") or "PLA",
-            "brand":         manufacturer.get("name") or None,
+            "material":      (fil.material_type if fil else "PLA") or "PLA",
+            "brand":         manufacturer_name,
             "rgba":          rgba,
             "label_weight":  int(initial_weight),
             "weight_used":   round(weight_used, 2),
             "weight_locked": False,
-            "note":          f"filaman:{spool['id']}",
+            "note":          f"filaman:{spool.id}",
         }
 
-        if rfid_uid := spool.get("rfid_uid"):
-            payload["tag_uid"] = rfid_uid
+        if spool.rfid_uid:
+            payload["tag_uid"] = spool.rfid_uid
 
         if slicer := pp.get("bambu_idx") or pp.get("bambu_tray_idx"):
             payload["slicer_filament"] = slicer
@@ -285,17 +336,11 @@ class Driver(BaseDriver):
         4. Bei CREATE: Bambuddy-Spool-ID als printer_param in FilaMan speichern
         5. Bambuddy-Spulen löschen, die in FilaMan nicht mehr existieren
         """
-        if not self._client or not self._filaman_client:
+        if not self._client:
             return
         try:
-            # 1. FilaMan-Spulen
-            fm_resp = await self._fm_get(
-                "/api/v1/spools",
-                params={"include_archived": False, "page_size": 500},
-            )
-            fm_spools: list[dict] = (
-                fm_resp.get("items", []) if isinstance(fm_resp, dict) else fm_resp
-            )
+            # 1. FilaMan-Spulen direkt aus DB holen
+            fm_spools: list[Spool] = await self._fetch_fm_spools()
 
             # 2. Bambuddy note-Index: {"filaman:42": {id: ..., ...}}
             bb_spools: list[dict] = await self._bb_get("/api/v1/inventory/spools")
@@ -308,7 +353,7 @@ class Driver(BaseDriver):
             synced_fm_ids: set[int] = set()
 
             for fm_spool in fm_spools:
-                fm_id = fm_spool["id"]
+                fm_id = fm_spool.id
                 note_key = f"filaman:{fm_id}"
                 payload = self._map_spool(fm_spool)
 
@@ -323,8 +368,8 @@ class Driver(BaseDriver):
                             "/api/v1/inventory/spools", payload
                         )
                         bb_id = response["id"]
-                        # Bambuddy-ID in FilaMan als SpoolPrinterParam speichern
-                        await self._store_bambuddy_id(fm_id, bb_id)
+                        # Bambuddy-Spool-ID direkt in FilaMan-DB speichern
+                        await self._store_bambuddy_id_db(fm_id, bb_id)
                         logger.info(
                             f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
                         )
@@ -358,27 +403,6 @@ class Driver(BaseDriver):
             self._last_sync_error = str(e)
             logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
 
-    async def _store_bambuddy_id(
-        self, filaman_spool_id: int, bambuddy_spool_id: int
-    ) -> None:
-        """Speichert Bambuddy-Spool-ID als SpoolPrinterParam in FilaMan.
-
-        Danach liefert enrich_filament_data() automatisch bambuddy_spool_id
-        in filament_data["printer_params"], sodass send_filament_to_tray()
-        nur die ID an die Bambuddy-Assignment-API schicken muss.
-        """
-        try:
-            await self._fm_put(
-                f"/api/v1/spools/{filaman_spool_id}/printer-params/{self.printer_id}",
-                {"params": [
-                    {"param_key": "bambuddy_spool_id", "param_value": str(bambuddy_spool_id)}
-                ]},
-            )
-        except Exception as e:
-            logger.warning(
-                f"Could not store bambuddy_spool_id in FilaMan "
-                f"(spool {filaman_spool_id}): {e}"
-            )
 
     async def _sync_inventory_loop(self) -> None:
         """Periodischer Inventory-Sync alle sync_interval_seconds."""
@@ -477,15 +501,9 @@ class Driver(BaseDriver):
                 )
 
     async def _report_consumption(self, filaman_spool_id: int, delta_g: float) -> None:
-        """Meldet delta_g Verbrauch für eine FilaMan-Spule."""
+        """Meldet delta_g Verbrauch direkt über SpoolService in FilaMan-DB."""
         try:
-            await self._fm_post(
-                f"/api/v1/spools/{filaman_spool_id}/consumptions",
-                {"delta_weight_g": delta_g, "source": "bambuddy"},
-            )
-            logger.info(
-                f"Reported {delta_g:.1f}g consumption for FilaMan spool {filaman_spool_id}"
-            )
+            await self._report_consumption_db(filaman_spool_id, delta_g)
         except Exception as e:
             logger.warning(
                 f"Failed to report consumption for FilaMan spool {filaman_spool_id}: {e}"
