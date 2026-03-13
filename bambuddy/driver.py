@@ -17,8 +17,9 @@ Flows:
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 import httpx
 from sqlalchemy import delete, event, select
@@ -93,6 +94,14 @@ class Driver(BaseDriver):
 
     driver_key = "bambuddy"
 
+    # -- URL-basierte Sync-Koordination (Klassenlevel) -------------------------
+    # Verhindert mehrfache Syncs wenn mehrere Drucker dieselbe Bambuddy-Instanz nutzen.
+    # Pro eindeutige bambuddy_url läuft maximal ein Sync gleichzeitig.
+    _url_sync_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _url_instances: ClassVar[dict[str, list["Driver"]]] = {}
+    _url_last_sync: ClassVar[dict[str, float]] = {}
+    _SYNC_COOLDOWN: ClassVar[float] = 5.0  # Sekunden
+
     def __init__(
         self,
         printer_id: int,
@@ -135,8 +144,50 @@ class Driver(BaseDriver):
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
 
-        # Lock verhindert parallele Sync-Operationen (Race Condition bei full_resync)
-        self._sync_lock: asyncio.Lock = asyncio.Lock()
+    # -- URL-basierte Sync-Koordination ----------------------------------------
+
+    def _register(self) -> None:
+        """Registriert diese Instanz für URL-basierte Sync-Koordination."""
+        url = self._bambuddy_url
+        if url not in self._url_instances:
+            self._url_instances[url] = []
+        if self not in self._url_instances[url]:
+            self._url_instances[url].append(self)
+            logger.debug(
+                f"Driver {self.printer_id} registered for URL {url} "
+                f"({len(self._url_instances[url])} driver(s) total)"
+            )
+
+    def _unregister(self) -> None:
+        """Entfernt diese Instanz aus der URL-Koordination."""
+        url = self._bambuddy_url
+        instances = self._url_instances.get(url, [])
+        if self in instances:
+            instances.remove(self)
+        if not instances:
+            self._url_instances.pop(url, None)
+            self._url_sync_locks.pop(url, None)
+            self._url_last_sync.pop(url, None)
+
+    def _get_url_lock(self) -> asyncio.Lock:
+        """Liefert den gemeinsamen Sync-Lock für diese Bambuddy-URL."""
+        url = self._bambuddy_url
+        if url not in self._url_sync_locks:
+            self._url_sync_locks[url] = asyncio.Lock()
+        return self._url_sync_locks[url]
+
+    def _peer_printer_ids(self) -> list[int]:
+        """Alle printer_ids die dieselbe Bambuddy-URL nutzen (inkl. eigene)."""
+        return [d.printer_id for d in self._url_instances.get(self._bambuddy_url, [self])]
+
+    def _is_sync_coordinator(self) -> bool:
+        """True wenn dieser Driver der Sync-Koordinator für seine URL ist.
+
+        Der erste registrierte Driver pro URL übernimmt die Koordination:
+        periodischer Sync-Loop und Debounce-Trigger bei DB-Commits.
+        """
+        instances = self._url_instances.get(self._bambuddy_url, [])
+        return bool(instances) and instances[0] is self
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -144,15 +195,24 @@ class Driver(BaseDriver):
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
 
+        # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
+        self._register()
+
         # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
 
-        # Inventory-Sync: FilaMan → Bambuddy
+        # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
         await self._sync_all_spools()
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
-        self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+
+        # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
+        if self._is_sync_coordinator():
+            self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+            logger.debug(
+                f"Printer {self.printer_id} is sync coordinator for {self._bambuddy_url}"
+            )
 
         # DB-Event-Listener für sofortigen Push registrieren
         event.listen(Session, "after_commit", self._on_session_commit)
@@ -163,6 +223,8 @@ class Driver(BaseDriver):
         )
 
     async def stop(self) -> None:
+        was_coordinator = self._is_sync_coordinator()
+
         # DB-Event-Listener entfernen
         try:
             event.remove(Session, "after_commit", self._on_session_commit)
@@ -182,6 +244,24 @@ class Driver(BaseDriver):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+        # Instanz abmelden und ggf. Koordinator-Rolle delegieren
+        self._unregister()
+        if was_coordinator:
+            peers = self._url_instances.get(self._bambuddy_url, [])
+            if peers:
+                new_coord = peers[0]
+                if new_coord._running and (
+                    not new_coord._sync_task or new_coord._sync_task.done()
+                ):
+                    new_coord._sync_task = asyncio.create_task(
+                        new_coord._sync_inventory_loop()
+                    )
+                    logger.info(
+                        f"Sync coordinator delegated to printer {new_coord.printer_id} "
+                        f"for {self._bambuddy_url}"
+                    )
+
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
 
     # -- Sofortiger Push (SQLAlchemy Event-Listener) -------------------------
@@ -189,10 +269,13 @@ class Driver(BaseDriver):
     def _on_session_commit(self, session: Session) -> None:
         """Reagiert auf jeden DB-Commit im Prozess (synchron, im Event-Loop-Thread).
 
+        Nur der Sync-Koordinator für diese URL triggert den Debounce-Sync,
+        damit nicht mehrere Drucker an derselben Bambuddy-Instanz gleichzeitig syncen.
         Ignoriert eigene Commits während eines laufenden Syncs (_syncing-Guard).
-        Debounct mehrfache Commits innerhalb von 3 Sekunden zu einem einzelnen Sync.
         """
         if not self._running or not self._ws_connected or self._syncing:
+            return
+        if not self._is_sync_coordinator():
             return
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -252,30 +335,33 @@ class Driver(BaseDriver):
     async def _store_bambuddy_id_db(
         self, filaman_spool_id: int, bambuddy_spool_id: int
     ) -> None:
-        """Speichert Bambuddy-Spool-ID als SpoolPrinterParam direkt in FilaMan-DB.
+        """Speichert Bambuddy-Spool-ID als SpoolPrinterParam für ALLE Drucker an dieser URL.
 
+        Da das Bambuddy-Inventar pro Instanz (URL) global ist, wird die Spool-ID
+        für jeden Drucker gespeichert, der dieselbe Bambuddy-URL nutzt.
         Danach liefert enrich_filament_data() automatisch bambuddy_spool_id
-        in filament_data["printer_params"], sodass send_filament_to_tray()
-        nur die ID an die Bambuddy-Assignment-API schicken muss.
+        in filament_data["printer_params"] für jeden dieser Drucker.
         """
+        printer_ids = self._peer_printer_ids()
         async with async_session_maker() as db:
-            result = await db.execute(
-                select(SpoolPrinterParam).where(
-                    SpoolPrinterParam.spool_id == filaman_spool_id,
-                    SpoolPrinterParam.printer_id == self.printer_id,
-                    SpoolPrinterParam.param_key == "bambuddy_spool_id",
+            for pid in printer_ids:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.spool_id == filaman_spool_id,
+                        SpoolPrinterParam.printer_id == pid,
+                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                    )
                 )
-            )
-            existing = result.scalar_one_or_none()
-            if existing:
-                existing.param_value = str(bambuddy_spool_id)
-            else:
-                db.add(SpoolPrinterParam(
-                    spool_id=filaman_spool_id,
-                    printer_id=self.printer_id,
-                    param_key="bambuddy_spool_id",
-                    param_value=str(bambuddy_spool_id),
-                ))
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.param_value = str(bambuddy_spool_id)
+                else:
+                    db.add(SpoolPrinterParam(
+                        spool_id=filaman_spool_id,
+                        printer_id=pid,
+                        param_key="bambuddy_spool_id",
+                        param_value=str(bambuddy_spool_id),
+                    ))
             await db.commit()
 
     async def _report_consumption_db(
@@ -371,20 +457,32 @@ class Driver(BaseDriver):
     async def _sync_all_spools(self) -> None:
         """Synchronisiert alle aktiven FilaMan-Spulen ins Bambuddy-Inventory.
 
-        Acquiert _sync_lock und überspringt den Sync wenn bereits ein Sync/Resync läuft.
+        Nutzt URL-basiertes Lock: pro Bambuddy-URL läuft maximal ein Sync,
+        auch wenn mehrere Drucker dieselbe Instanz nutzen.
+        Cooldown verhindert redundante Syncs durch DB-Commit-Kaskaden.
         """
         if not self._client:
             return
-        if self._sync_lock.locked():
+        url_lock = self._get_url_lock()
+        if url_lock.locked():
             logger.debug(
-                f"Sync skipped: resync/sync already in progress for printer {self.printer_id}"
+                f"Sync skipped: already in progress for URL {self._bambuddy_url}"
             )
             return
-        async with self._sync_lock:
+        # Cooldown: Sync überspringen wenn kürzlich abgeschlossen (verhindert Kaskaden
+        # durch DB-Commits die _on_session_commit in Peer-Drivern auslösen)
+        last = self._url_last_sync.get(self._bambuddy_url, 0.0)
+        if (time.monotonic() - last) < self._SYNC_COOLDOWN:
+            logger.debug(
+                f"Sync skipped: recently completed for URL {self._bambuddy_url}"
+            )
+            return
+        async with url_lock:
             await self._do_sync_inner()
+            self._url_last_sync[self._bambuddy_url] = time.monotonic()
 
     async def _do_sync_inner(self) -> None:
-        """Innere Sync-Logik ohne Lock — muss unter _sync_lock aufgerufen werden.
+        """Innere Sync-Logik ohne Lock — muss unter URL-Lock aufgerufen werden.
 
         Ablauf:
         1. Alle FilaMan-Spulen holen (GET /api/v1/spools)
@@ -482,30 +580,37 @@ class Driver(BaseDriver):
     async def full_resync(self) -> None:
         """Löscht ALLE Bambuddy-Inventarspulen und synchronisiert neu aus FilaMan.
 
-        Hält _sync_lock für die gesamte Dauer (Löschen + Neu-Sync), damit kein
+        Nutzt URL-basiertes Lock für die gesamte Dauer (Löschen + Neu-Sync), damit kein
         paralleler Debounce-Sync oder periodischer Sync Duplikate erzeugen kann.
+        Löscht bambuddy_spool_id-Params für ALLE Drucker an dieser URL.
         """
         if not self._client:
             raise RuntimeError("Driver not connected")
-        async with self._sync_lock:
-            logger.info(f"Full resync started for printer {self.printer_id}")
+        url_lock = self._get_url_lock()
+        async with url_lock:
+            logger.info(
+                f"Full resync started for URL {self._bambuddy_url} "
+                f"(triggered by printer {self.printer_id})"
+            )
             # 1. ALLE Bambuddy-Inventarspulen löschen (keine Filterung nach filaman:)
             bb_spools = await self._bb_get("/api/v1/inventory/spools")
             for spool in bb_spools:
                 await self._bb_delete(f"/api/v1/inventory/spools/{spool['id']}")
             logger.info(f"Deleted {len(bb_spools)} Bambuddy spools")
-            # 2. bambuddy_spool_id-Params aus FilaMan-DB löschen
+            # 2. bambuddy_spool_id-Params für ALLE Drucker an dieser URL löschen
+            peer_ids = self._peer_printer_ids()
             async with async_session_maker() as db:
                 await db.execute(
                     delete(SpoolPrinterParam).where(
-                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.printer_id.in_(peer_ids),
                         SpoolPrinterParam.param_key == "bambuddy_spool_id",
                     )
                 )
                 await db.commit()
             # 3. Neu synchronisieren (Lock bereits gehalten, direkt _do_sync_inner aufrufen)
             await self._do_sync_inner()
-            logger.info(f"Full resync complete for printer {self.printer_id}")
+            self._url_last_sync[self._bambuddy_url] = time.monotonic()
+            logger.info(f"Full resync complete for URL {self._bambuddy_url}")
 
     # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
 
