@@ -117,7 +117,8 @@ class Driver(BaseDriver):
         self._sync_task: asyncio.Task | None = None
 
         # -- Verbindungs-Status --
-        self._connected: bool = False
+        self._ws_connected: bool = False      # WebSocket-Verbindung zu Bambuddy-Server
+        self._printer_connected: bool = False  # Bambu-Drucker↔Bambuddy Verbindung
 
         # -- Status-Cache --
         self._current_slots: list[dict[str, Any]] = []
@@ -176,7 +177,8 @@ class Driver(BaseDriver):
                 except asyncio.CancelledError:
                     pass
         self._ws_task = self._sync_task = None
-        self._connected = False
+        self._ws_connected = False
+        self._printer_connected = False
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -190,7 +192,7 @@ class Driver(BaseDriver):
         Ignoriert eigene Commits während eines laufenden Syncs (_syncing-Guard).
         Debounct mehrfache Commits innerhalb von 3 Sekunden zu einem einzelnen Sync.
         """
-        if not self._running or not self._connected or self._syncing:
+        if not self._running or not self._ws_connected or self._syncing:
             return
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -199,7 +201,7 @@ class Driver(BaseDriver):
     async def _debounced_sync(self) -> None:
         """Wartet 3 Sekunden auf weitere Commits, dann Inventory-Sync."""
         await asyncio.sleep(3)
-        if self._running and self._connected and not self._syncing:
+        if self._running and self._ws_connected and not self._syncing:
             logger.debug(f"Data change detected, triggering inventory sync for printer {self.printer_id}")
             await self._sync_all_spools()
 
@@ -529,7 +531,7 @@ class Driver(BaseDriver):
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
-                    self._connected = True
+                    self._ws_connected = True
                     logger.info(f"WebSocket connected: {uri}")
                     async for message in ws:
                         if not self._running:
@@ -540,7 +542,7 @@ class Driver(BaseDriver):
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
             except Exception as e:
-                self._connected = False
+                self._ws_connected = False
                 if self._running:
                     logger.warning(
                         f"WebSocket disconnected ({e}). "
@@ -555,6 +557,7 @@ class Driver(BaseDriver):
         if event_type == "printer_status":
             data = event.get("data", {})
             if event.get("printer_id") == self._bambuddy_printer_id:
+                self._printer_connected = data.get("connected", self._printer_connected)
                 self._process_slots(data)
 
         elif event_type == "print_complete":
@@ -788,10 +791,12 @@ class Driver(BaseDriver):
                 f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
             )
             if r.status_code == 200:
-                self._connected = True
-                self._process_slots(r.json())
+                status_data = r.json()
+                self._printer_connected = status_data.get("connected", False)
+                self._process_slots(status_data)
                 logger.info(
-                    f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id}"
+                    f"Initial status fetched for Bambuddy printer {self._bambuddy_printer_id} "
+                    f"(printer connected={self._printer_connected})"
                 )
         except Exception as e:
             logger.warning(f"Could not fetch initial Bambuddy status: {e}")
@@ -941,7 +946,7 @@ class Driver(BaseDriver):
             "driver_key":          self.driver_key,
             "printer_id":          self.printer_id,
             "running":             self._running,
-            "connected":           self._connected,
+            "connected":           self._ws_connected and self._printer_connected,
             "bambuddy_printer_id": self._bambuddy_printer_id,
             "ams_count":           len(self._current_ams_units),
             "slot_count":          total_slots,
