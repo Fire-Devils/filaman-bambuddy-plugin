@@ -11,6 +11,13 @@
   "config_schema": {
     "type": "object",
     "properties": {
+      "sync_enabled": {
+        "type": "string",
+        "title": "Inventar-Synchronisation",
+        "description": "Wenn aktiviert, werden FilaMan-Spulen automatisch ins Bambuddy-Inventar synchronisiert. Bei Deaktivierung nutzt Bambuddy die Spoolman API.",
+        "enum": ["enabled", "disabled"],
+        "default": "enabled"
+      },
       "bambuddy_url": {
         "type": "string",
         "title": "Bambuddy URL",
@@ -19,7 +26,7 @@
       "api_key": {
         "type": "string",
         "title": "API Key",
-        "description": "Bambuddy API key (create in Bambuddy under Settings \u2192 API Keys)"
+        "description": "Bambuddy API key (create in Bambuddy under Settings → API Keys)"
       },
       "printer_id": {
         "type": "integer",
@@ -33,10 +40,7 @@
         "default": 30,
         "minimum": 5,
         "maximum": 300
-      }
-    },
-    "required": ["bambuddy_url", "api_key", "printer_id"],
-    "advanced": {
+      },
       "sync_interval_seconds": {
         "type": "integer",
         "title": "Sync-Intervall (Sekunden)",
@@ -45,7 +49,8 @@
         "minimum": 60,
         "maximum": 86400
       }
-    }
+    },
+    "required": ["bambuddy_url", "api_key", "printer_id"]
   },
   "capabilities": {
     "has_slots": true,
