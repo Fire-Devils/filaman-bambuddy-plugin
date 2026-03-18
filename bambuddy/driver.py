@@ -14,6 +14,7 @@ Flows:
    - WebSocket-Verbindung zu Bambuddy
    - print_complete-Event → SpoolService.record_consumption() direkt in FilaMan-DB
 """
+
 import asyncio
 import json
 import logging
@@ -43,17 +44,17 @@ logger = logging.getLogger(__name__)
 
 # Generische Bambu-Slicer-IDs für gängige Materialien (Fallback wenn kein bambu_idx gesetzt)
 _GENERIC_SLICER_IDS: dict[str, str] = {
-    "PLA":   "GFL99",
-    "PETG":  "GFG99",
-    "ABS":   "GFB99",
-    "ASA":   "GFB98",
-    "TPU":   "GFU99",
+    "PLA": "GFL99",
+    "PETG": "GFG99",
+    "ABS": "GFB99",
+    "ASA": "GFB98",
+    "TPU": "GFU99",
     "NYLON": "GFN99",
-    "PA":    "GFN99",
-    "PVA":   "GFS99",
-    "HIPS":  "GFS98",
-    "PC":    "GFC99",
-    "PP":    "GFP97",
+    "PA": "GFN99",
+    "PVA": "GFS99",
+    "HIPS": "GFS98",
+    "PC": "GFC99",
+    "PP": "GFP97",
 }
 
 
@@ -119,14 +120,17 @@ class Driver(BaseDriver):
 
         # -- Sync/Reconnect-Einstellungen --
         self._sync_interval: int = int(config.get("sync_interval_seconds", 300))
-        self._reconnect_interval: int = int(config.get("reconnect_interval_seconds", 30))
+        self._reconnect_interval: int = int(
+            config.get("reconnect_interval_seconds", 30)
+        )
+        self._sync_enabled: bool = config.get("sync_enabled", "enabled") == "enabled"
 
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
         self._sync_task: asyncio.Task | None = None
 
         # -- Verbindungs-Status --
-        self._ws_connected: bool = False      # WebSocket-Verbindung zu Bambuddy-Server
+        self._ws_connected: bool = False  # WebSocket-Verbindung zu Bambuddy-Server
         self._printer_connected: bool = False  # Bambu-Drucker↔Bambuddy Verbindung
 
         # -- Status-Cache --
@@ -178,7 +182,9 @@ class Driver(BaseDriver):
 
     def _peer_printer_ids(self) -> list[int]:
         """Alle printer_ids die dieselbe Bambuddy-URL nutzen (inkl. eigene)."""
-        return [d.printer_id for d in self._url_instances.get(self._bambuddy_url, [self])]
+        return [
+            d.printer_id for d in self._url_instances.get(self._bambuddy_url, [self])
+        ]
 
     def _is_sync_coordinator(self) -> bool:
         """True wenn dieser Driver der Sync-Koordinator für seine URL ist.
@@ -195,27 +201,30 @@ class Driver(BaseDriver):
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
 
-        # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
-        self._register()
+        if self._sync_enabled:
+            # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
+            self._register()
 
         # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
 
-        # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
-        await self._sync_all_spools()
+        if self._sync_enabled:
+            # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
+            await self._sync_all_spools()
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
 
-        # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
-        if self._is_sync_coordinator():
-            self._sync_task = asyncio.create_task(self._sync_inventory_loop())
-            logger.debug(
-                f"Printer {self.printer_id} is sync coordinator for {self._bambuddy_url}"
-            )
+        if self._sync_enabled:
+            # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
+            if self._is_sync_coordinator():
+                self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+                logger.debug(
+                    f"Printer {self.printer_id} is sync coordinator for {self._bambuddy_url}"
+                )
 
-        # DB-Event-Listener für sofortigen Push registrieren
-        event.listen(Session, "after_commit", self._on_session_commit)
+            # DB-Event-Listener für sofortigen Push registrieren
+            event.listen(Session, "after_commit", self._on_session_commit)
 
         logger.info(
             f"Bambuddy driver started for FilaMan printer {self.printer_id} "
@@ -225,11 +234,12 @@ class Driver(BaseDriver):
     async def stop(self) -> None:
         was_coordinator = self._is_sync_coordinator()
 
-        # DB-Event-Listener entfernen
-        try:
-            event.remove(Session, "after_commit", self._on_session_commit)
-        except Exception:
-            pass
+        if self._sync_enabled:
+            # DB-Event-Listener entfernen
+            try:
+                event.remove(Session, "after_commit", self._on_session_commit)
+            except Exception:
+                pass
         self._running = False
         for task in (self._ws_task, self._sync_task):
             if task and not task.done():
@@ -245,22 +255,23 @@ class Driver(BaseDriver):
             await self._client.aclose()
             self._client = None
 
-        # Instanz abmelden und ggf. Koordinator-Rolle delegieren
-        self._unregister()
-        if was_coordinator:
-            peers = self._url_instances.get(self._bambuddy_url, [])
-            if peers:
-                new_coord = peers[0]
-                if new_coord._running and (
-                    not new_coord._sync_task or new_coord._sync_task.done()
-                ):
-                    new_coord._sync_task = asyncio.create_task(
-                        new_coord._sync_inventory_loop()
-                    )
-                    logger.info(
-                        f"Sync coordinator delegated to printer {new_coord.printer_id} "
-                        f"for {self._bambuddy_url}"
-                    )
+        if self._sync_enabled:
+            # Instanz abmelden und ggf. Koordinator-Rolle delegieren
+            self._unregister()
+            if was_coordinator:
+                peers = self._url_instances.get(self._bambuddy_url, [])
+                if peers:
+                    new_coord = peers[0]
+                    if new_coord._running and (
+                        not new_coord._sync_task or new_coord._sync_task.done()
+                    ):
+                        new_coord._sync_task = asyncio.create_task(
+                            new_coord._sync_inventory_loop()
+                        )
+                        logger.info(
+                            f"Sync coordinator delegated to printer {new_coord.printer_id} "
+                            f"for {self._bambuddy_url}"
+                        )
 
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
 
@@ -273,7 +284,12 @@ class Driver(BaseDriver):
         damit nicht mehrere Drucker an derselben Bambuddy-Instanz gleichzeitig syncen.
         Ignoriert eigene Commits während eines laufenden Syncs (_syncing-Guard).
         """
-        if not self._running or not self._ws_connected or self._syncing:
+        if (
+            not self._running
+            or not self._ws_connected
+            or self._syncing
+            or not self._sync_enabled
+        ):
             return
         if not self._is_sync_coordinator():
             return
@@ -284,8 +300,15 @@ class Driver(BaseDriver):
     async def _debounced_sync(self) -> None:
         """Wartet 3 Sekunden auf weitere Commits, dann Inventory-Sync."""
         await asyncio.sleep(3)
-        if self._running and self._ws_connected and not self._syncing:
-            logger.debug(f"Data change detected, triggering inventory sync for printer {self.printer_id}")
+        if (
+            self._running
+            and self._ws_connected
+            and not self._syncing
+            and self._sync_enabled
+        ):
+            logger.debug(
+                f"Data change detected, triggering inventory sync for printer {self.printer_id}"
+            )
             await self._sync_all_spools()
 
     # -- Bambuddy HTTP-Helfer ------------------------------------------------
@@ -324,9 +347,9 @@ class Driver(BaseDriver):
                 .where(SpoolStatus.key != "archived")
                 .options(
                     selectinload(Spool.filament).selectinload(Filament.manufacturer),
-                    selectinload(Spool.filament).selectinload(
-                        Filament.filament_colors
-                    ).selectinload(FilamentColor.color),
+                    selectinload(Spool.filament)
+                    .selectinload(Filament.filament_colors)
+                    .selectinload(FilamentColor.color),
                     selectinload(Spool.printer_params),
                 )
             )
@@ -356,12 +379,14 @@ class Driver(BaseDriver):
                 if existing:
                     existing.param_value = str(bambuddy_spool_id)
                 else:
-                    db.add(SpoolPrinterParam(
-                        spool_id=filaman_spool_id,
-                        printer_id=pid,
-                        param_key="bambuddy_spool_id",
-                        param_value=str(bambuddy_spool_id),
-                    ))
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=filaman_spool_id,
+                            printer_id=pid,
+                            param_key="bambuddy_spool_id",
+                            param_value=str(bambuddy_spool_id),
+                        )
+                    )
             await db.commit()
 
     async def _report_consumption_db(
@@ -405,8 +430,8 @@ class Driver(BaseDriver):
           printer_params bambu_nozzle_*             → nozzle_temp_min/max
         """
         fil = spool.filament
-        manufacturer_name = (fil.manufacturer.name if fil and fil.manufacturer else None)
-        colors = (fil.filament_colors if fil else [])
+        manufacturer_name = fil.manufacturer.name if fil and fil.manufacturer else None
+        colors = fil.filament_colors if fil else []
 
         # Farbe: FilaMan 6-stellig hex → 8-stellig RRGGBBAA
         raw_color = "FFFFFF"
@@ -421,7 +446,11 @@ class Driver(BaseDriver):
 
         initial_weight = float(spool.initial_total_weight_g or 1000.0)
         remaining = spool.remaining_weight_g
-        weight_used = max(0.0, initial_weight - float(remaining)) if remaining is not None else 0.0
+        weight_used = (
+            max(0.0, initial_weight - float(remaining))
+            if remaining is not None
+            else 0.0
+        )
 
         # printer_params als {key: value} dict aus der Relationship
         pp: dict[str, str | None] = {
@@ -431,13 +460,13 @@ class Driver(BaseDriver):
         }
 
         payload: dict[str, Any] = {
-            "material":      (fil.material_type if fil else "PLA") or "PLA",
-            "brand":         manufacturer_name,
-            "rgba":          rgba,
-            "label_weight":  int(initial_weight),
-            "weight_used":   round(weight_used, 2),
+            "material": (fil.material_type if fil else "PLA") or "PLA",
+            "brand": manufacturer_name,
+            "rgba": rgba,
+            "label_weight": int(initial_weight),
+            "weight_used": round(weight_used, 2),
             "weight_locked": False,
-            "note":          f"filaman:{spool.id}",
+            "note": f"filaman:{spool.id}",
         }
 
         if spool.rfid_uid:
@@ -565,7 +594,6 @@ class Driver(BaseDriver):
         finally:
             self._syncing = False
 
-
     async def _sync_inventory_loop(self) -> None:
         """Periodischer Inventory-Sync alle sync_interval_seconds."""
         while self._running:
@@ -575,6 +603,9 @@ class Driver(BaseDriver):
 
     async def trigger_sync(self) -> None:
         """Manueller sofortiger Inventory-Sync (Drucker-Action)."""
+        if not self._sync_enabled:
+            logger.info("Inventory sync is disabled — skipping trigger_sync")
+            return
         await self._sync_all_spools()
 
     async def full_resync(self) -> None:
@@ -584,6 +615,9 @@ class Driver(BaseDriver):
         paralleler Debounce-Sync oder periodischer Sync Duplikate erzeugen kann.
         Löscht bambuddy_spool_id-Params für ALLE Drucker an dieser URL.
         """
+        if not self._sync_enabled:
+            logger.info("Inventory sync is disabled — skipping full_resync")
+            return
         if not self._client:
             raise RuntimeError("Driver not connected")
         url_lock = self._get_url_lock()
@@ -715,7 +749,9 @@ class Driver(BaseDriver):
 
     # -- Tray-Konfiguration (FilaMan → Bambuddy) ------------------------------
 
-    def send_filament_to_tray(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
+    def send_filament_to_tray(
+        self, ams_id: int, tray_id: int, filament_data: dict
+    ) -> None:
         """Weist FilaMan-Spule einem Bambuddy-AMS-Slot zu."""
         asyncio.create_task(self._assign_or_configure(ams_id, tray_id, filament_data))
 
@@ -730,7 +766,7 @@ class Driver(BaseDriver):
         → einfacher Assignment-Call genügt (Bambuddy konfiguriert AMS automatisch).
         """
         bambuddy_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
-        filaman_spool_id  = _int_or_none(filament_data.get("id"))
+        filaman_spool_id = _int_or_none(filament_data.get("id"))
         slot_key = f"{ams_id}-{tray_id}"
 
         if bambuddy_spool_id and self._client:
@@ -738,20 +774,20 @@ class Driver(BaseDriver):
                 response = await self._bb_post(
                     "/api/v1/inventory/assignments",
                     {
-                        "spool_id":   bambuddy_spool_id,
+                        "spool_id": bambuddy_spool_id,
                         "printer_id": self._bambuddy_printer_id,
-                        "ams_id":     ams_id,
-                        "tray_id":    tray_id,
+                        "ams_id": ams_id,
+                        "tray_id": tray_id,
                     },
                 )
                 self.log_debug(
                     "out",
                     f"POST /api/v1/inventory/assignments",
                     {
-                        "spool_id":   bambuddy_spool_id,
+                        "spool_id": bambuddy_spool_id,
                         "printer_id": self._bambuddy_printer_id,
-                        "ams_id":     ams_id,
-                        "tray_id":    tray_id,
+                        "ams_id": ams_id,
+                        "tray_id": tray_id,
                         "configured": response.get("configured"),
                     },
                 )
@@ -779,7 +815,9 @@ class Driver(BaseDriver):
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
-    async def _send_assignment(self, ams_id: int, tray_id: int, filament_data: dict) -> None:
+    async def _send_assignment(
+        self, ams_id: int, tray_id: int, filament_data: dict
+    ) -> None:
         """Konfiguriert einen AMS-Slot direkt über Bambuddys configure-Endpunkt.
 
         Sendet einen einzigen API-Call an Bambuddy, der sowohl ams_filament_setting
@@ -817,34 +855,32 @@ class Driver(BaseDriver):
         tray_sub_brands = filament_data.get("material_subgroup") or material
 
         # -- Temperaturen --
-        nozzle_temp_min = (
-            _int_or_none(filament_data.get("bambu_nozzle_temp_min"))
-            or _int_or_none(filament_data.get("nozzle_temp_min"))
-        )
-        nozzle_temp_max = (
-            _int_or_none(filament_data.get("bambu_nozzle_temp_max"))
-            or _int_or_none(filament_data.get("nozzle_temp_max"))
-        )
+        nozzle_temp_min = _int_or_none(
+            filament_data.get("bambu_nozzle_temp_min")
+        ) or _int_or_none(filament_data.get("nozzle_temp_min"))
+        nozzle_temp_max = _int_or_none(
+            filament_data.get("bambu_nozzle_temp_max")
+        ) or _int_or_none(filament_data.get("nozzle_temp_max"))
 
         # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
         k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
 
         configure_params: dict[str, Any] = {
-            "tray_info_idx":        slicer_filament,
-            "tray_type":            material,
-            "tray_sub_brands":      tray_sub_brands,
-            "tray_color":           color,                   # 8-stellig RRGGBBAA
-            "nozzle_temp_min":      nozzle_temp_min or 190,  # REQUIRED — Fallback 190°C
-            "nozzle_temp_max":      nozzle_temp_max or 230,  # REQUIRED — Fallback 230°C
-            "cali_idx":             (
+            "tray_info_idx": slicer_filament,
+            "tray_type": material,
+            "tray_sub_brands": tray_sub_brands,
+            "tray_color": color,  # 8-stellig RRGGBBAA
+            "nozzle_temp_min": nozzle_temp_min or 190,  # REQUIRED — Fallback 190°C
+            "nozzle_temp_max": nozzle_temp_max or 230,  # REQUIRED — Fallback 230°C
+            "cali_idx": (
                 _int_or_none(filament_data.get("bambu_cali_idx"))
                 if filament_data.get("bambu_cali_idx") is not None
-                else -1                                       # -1 = default 0.020
+                else -1  # -1 = default 0.020
             ),
-            "nozzle_diameter":      "0.4",
-            "setting_id":           filament_data.get("bambu_setting_id") or "",
+            "nozzle_diameter": "0.4",
+            "setting_id": filament_data.get("bambu_setting_id") or "",
             "kprofile_filament_id": slicer_filament,
-            "k_value":              k_value,                 # 0.0 = skip
+            "k_value": k_value,  # 0.0 = skip
         }
 
         try:
@@ -862,14 +898,16 @@ class Driver(BaseDriver):
 
             # Bambu-Params cachen (für UI-Status-Anzeige)
             self._slot_params_cache[f"{ams_id}-{tray_id}"] = {
-                "nozzle_temp_min":            nozzle_temp_min,
-                "nozzle_temp_max":            nozzle_temp_max,
-                "bambu_setting_id":           filament_data.get("bambu_setting_id", ""),
-                "bambu_cali_idx":             filament_data.get("bambu_cali_idx"),
-                "bambu_k_value":              filament_data.get("bambu_k_value"),
-                "bambu_bed_temp":             filament_data.get("bambu_bed_temp"),
-                "bambu_flow_ratio":           filament_data.get("bambu_flow_ratio"),
-                "bambu_max_volumetric_speed": filament_data.get("bambu_max_volumetric_speed"),
+                "nozzle_temp_min": nozzle_temp_min,
+                "nozzle_temp_max": nozzle_temp_max,
+                "bambu_setting_id": filament_data.get("bambu_setting_id", ""),
+                "bambu_cali_idx": filament_data.get("bambu_cali_idx"),
+                "bambu_k_value": filament_data.get("bambu_k_value"),
+                "bambu_bed_temp": filament_data.get("bambu_bed_temp"),
+                "bambu_flow_ratio": filament_data.get("bambu_flow_ratio"),
+                "bambu_max_volumetric_speed": filament_data.get(
+                    "bambu_max_volumetric_speed"
+                ),
             }
 
             logger.info(
@@ -921,102 +959,118 @@ class Driver(BaseDriver):
         for ams_unit in ams_list:
             ams_id = int(ams_unit.get("id", 0))
             trays = ams_unit.get("tray", ams_unit.get("trays", []))
-            ams_units.append({
-                "ams_id":     ams_id,
-                "humidity":   ams_unit.get("humidity"),
-                "temp":       ams_unit.get("temp", ams_unit.get("temperature")),
-                "tray_count": len(trays),
-                "is_ams_ht":  ams_unit.get("is_ams_ht", False),
-            })
+            ams_units.append(
+                {
+                    "ams_id": ams_id,
+                    "humidity": ams_unit.get("humidity"),
+                    "temp": ams_unit.get("temp", ams_unit.get("temperature")),
+                    "tray_count": len(trays),
+                    "is_ams_ht": ams_unit.get("is_ams_ht", False),
+                }
+            )
 
             for tray in trays:
-                tray_id    = int(tray.get("id", 0))
+                tray_id = int(tray.get("id", 0))
                 slot_index = f"{ams_id}-{tray_id}"
-                tray_type  = tray.get("tray_type", "")
+                tray_type = tray.get("tray_type", "")
                 tray_color = tray.get("tray_color", "")
-                cached     = self._slot_params_cache.get(slot_index, {})
+                cached = self._slot_params_cache.get(slot_index, {})
 
-                preset_id     = tray.get("preset_id", "")
-                tray_info_idx = _extract_bambu_idx(preset_id) or tray.get("tray_info_idx", "")
+                preset_id = tray.get("preset_id", "")
+                tray_info_idx = _extract_bambu_idx(preset_id) or tray.get(
+                    "tray_info_idx", ""
+                )
 
                 if not tray_type:
                     self._slot_params_cache.pop(slot_index, None)
                     self._slot_to_filaman_spool.pop(slot_index, None)
 
-                ams_slots.append({
-                    "slot_index":    slot_index,
-                    "slot_name":     f"AMS {ams_id + 1} - Slot {tray_id + 1}",
-                    "tray_info_idx": tray_info_idx,
-                    "tray_type":     tray_type,
-                    "tray_color":    tray_color,
-                    "nozzle_temp_min": (
-                        tray.get("nozzle_temp_min")
-                        if tray.get("nozzle_temp_min") is not None
-                        else cached.get("nozzle_temp_min")
-                    ),
-                    "nozzle_temp_max": (
-                        tray.get("nozzle_temp_max")
-                        if tray.get("nozzle_temp_max") is not None
-                        else cached.get("nozzle_temp_max")
-                    ),
-                    "setting_id": tray.get("setting_id") or cached.get("bambu_setting_id", ""),
-                    "cali_idx":   (
-                        tray.get("cali_idx")
-                        if tray.get("cali_idx") is not None
-                        else cached.get("bambu_cali_idx")
-                    ),
-                    "bambu_k_value":              cached.get("bambu_k_value"),
-                    "bambu_bed_temp":             cached.get("bambu_bed_temp"),
-                    "bambu_flow_ratio":           cached.get("bambu_flow_ratio"),
-                    "bambu_max_volumetric_speed": cached.get("bambu_max_volumetric_speed"),
-                    "remain":  tray.get("remain", 0),
-                    "present": bool(tray_type),
-                })
+                ams_slots.append(
+                    {
+                        "slot_index": slot_index,
+                        "slot_name": f"AMS {ams_id + 1} - Slot {tray_id + 1}",
+                        "tray_info_idx": tray_info_idx,
+                        "tray_type": tray_type,
+                        "tray_color": tray_color,
+                        "nozzle_temp_min": (
+                            tray.get("nozzle_temp_min")
+                            if tray.get("nozzle_temp_min") is not None
+                            else cached.get("nozzle_temp_min")
+                        ),
+                        "nozzle_temp_max": (
+                            tray.get("nozzle_temp_max")
+                            if tray.get("nozzle_temp_max") is not None
+                            else cached.get("nozzle_temp_max")
+                        ),
+                        "setting_id": tray.get("setting_id")
+                        or cached.get("bambu_setting_id", ""),
+                        "cali_idx": (
+                            tray.get("cali_idx")
+                            if tray.get("cali_idx") is not None
+                            else cached.get("bambu_cali_idx")
+                        ),
+                        "bambu_k_value": cached.get("bambu_k_value"),
+                        "bambu_bed_temp": cached.get("bambu_bed_temp"),
+                        "bambu_flow_ratio": cached.get("bambu_flow_ratio"),
+                        "bambu_max_volumetric_speed": cached.get(
+                            "bambu_max_volumetric_speed"
+                        ),
+                        "remain": tray.get("remain", 0),
+                        "present": bool(tray_type),
+                    }
+                )
 
         ext_slots: list[dict[str, Any]] = []
         for vt in vt_tray_list:
-            vt_id     = int(vt.get("id", 254))
-            vt_type   = vt.get("tray_type", "")
-            vt_color  = vt.get("tray_color", "")
-            vt_idx    = f"255-{vt_id}"
+            vt_id = int(vt.get("id", 254))
+            vt_type = vt.get("tray_type", "")
+            vt_color = vt.get("tray_color", "")
+            vt_idx = f"255-{vt_id}"
             vt_cached = self._slot_params_cache.get(vt_idx, {})
 
-            vt_preset_id     = vt.get("preset_id", "")
-            vt_tray_info_idx = _extract_bambu_idx(vt_preset_id) or vt.get("tray_info_idx", "")
+            vt_preset_id = vt.get("preset_id", "")
+            vt_tray_info_idx = _extract_bambu_idx(vt_preset_id) or vt.get(
+                "tray_info_idx", ""
+            )
 
             if not vt_type:
                 self._slot_params_cache.pop(vt_idx, None)
                 self._slot_to_filaman_spool.pop(vt_idx, None)
 
-            ext_slots.append({
-                "slot_index":    vt_idx,
-                "slot_name":     "External Tray",
-                "tray_info_idx": vt_tray_info_idx,
-                "tray_type":     vt_type,
-                "tray_color":    vt_color,
-                "nozzle_temp_min": (
-                    vt.get("nozzle_temp_min")
-                    if vt.get("nozzle_temp_min") is not None
-                    else vt_cached.get("nozzle_temp_min")
-                ),
-                "nozzle_temp_max": (
-                    vt.get("nozzle_temp_max")
-                    if vt.get("nozzle_temp_max") is not None
-                    else vt_cached.get("nozzle_temp_max")
-                ),
-                "setting_id": vt.get("setting_id") or vt_cached.get("bambu_setting_id", ""),
-                "cali_idx":   (
-                    vt.get("cali_idx")
-                    if vt.get("cali_idx") is not None
-                    else vt_cached.get("bambu_cali_idx")
-                ),
-                "bambu_k_value":              vt_cached.get("bambu_k_value"),
-                "bambu_bed_temp":             vt_cached.get("bambu_bed_temp"),
-                "bambu_flow_ratio":           vt_cached.get("bambu_flow_ratio"),
-                "bambu_max_volumetric_speed": vt_cached.get("bambu_max_volumetric_speed"),
-                "remain":  vt.get("remain", 0),
-                "present": bool(vt_type),
-            })
+            ext_slots.append(
+                {
+                    "slot_index": vt_idx,
+                    "slot_name": "External Tray",
+                    "tray_info_idx": vt_tray_info_idx,
+                    "tray_type": vt_type,
+                    "tray_color": vt_color,
+                    "nozzle_temp_min": (
+                        vt.get("nozzle_temp_min")
+                        if vt.get("nozzle_temp_min") is not None
+                        else vt_cached.get("nozzle_temp_min")
+                    ),
+                    "nozzle_temp_max": (
+                        vt.get("nozzle_temp_max")
+                        if vt.get("nozzle_temp_max") is not None
+                        else vt_cached.get("nozzle_temp_max")
+                    ),
+                    "setting_id": vt.get("setting_id")
+                    or vt_cached.get("bambu_setting_id", ""),
+                    "cali_idx": (
+                        vt.get("cali_idx")
+                        if vt.get("cali_idx") is not None
+                        else vt_cached.get("bambu_cali_idx")
+                    ),
+                    "bambu_k_value": vt_cached.get("bambu_k_value"),
+                    "bambu_bed_temp": vt_cached.get("bambu_bed_temp"),
+                    "bambu_flow_ratio": vt_cached.get("bambu_flow_ratio"),
+                    "bambu_max_volumetric_speed": vt_cached.get(
+                        "bambu_max_volumetric_speed"
+                    ),
+                    "remain": vt.get("remain", 0),
+                    "present": bool(vt_type),
+                }
+            )
 
         self._current_ams_units = ams_units
         has_external = len(ext_slots) > 0
@@ -1031,11 +1085,11 @@ class Driver(BaseDriver):
         if has_external:
             total_slots += len(ext_slots)
         ams_info = {
-            "ams_count":     len(ams_units),
-            "ams_type":      "AMS",
-            "slot_count":    total_slots,
+            "ams_count": len(ams_units),
+            "ams_type": "AMS",
+            "slot_count": total_slots,
             "external_spool": has_external,
-            "ams_units":     ams_units,
+            "ams_units": ams_units,
         }
 
         logger.info(
@@ -1048,30 +1102,33 @@ class Driver(BaseDriver):
     def health(self) -> dict[str, Any]:
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
         return {
-            "driver_key":          self.driver_key,
-            "printer_id":          self.printer_id,
-            "running":             self._running,
-            "connected":           self._ws_connected and self._printer_connected,
+            "driver_key": self.driver_key,
+            "printer_id": self.printer_id,
+            "running": self._running,
+            "connected": self._ws_connected and self._printer_connected,
             "bambuddy_printer_id": self._bambuddy_printer_id,
-            "ams_count":           len(self._current_ams_units),
-            "slot_count":          total_slots,
-            "ams_units":           self._current_ams_units,
-            "slots":               self._current_slots,
-            "last_sync_count":     self._last_sync_count,
-            "last_sync_error":     self._last_sync_error,
+            "ams_count": len(self._current_ams_units),
+            "slot_count": total_slots,
+            "ams_units": self._current_ams_units,
+            "slots": self._current_slots,
+            "last_sync_count": self._last_sync_count,
+            "last_sync_error": self._last_sync_error,
             "active_slot_mappings": len(self._slot_to_filaman_spool),
+            "sync_enabled": self._sync_enabled,
             "sync_actions": [
                 {
-                    "action":   "trigger_sync",
-                    "label":    "Sync Now",
+                    "action": "trigger_sync",
+                    "label": "Sync Now",
                     "label_de": "Jetzt synchronisieren",
-                    "variant":  "secondary",
+                    "variant": "secondary",
                 },
                 {
-                    "action":   "full_resync",
-                    "label":    "Full Resync",
+                    "action": "full_resync",
+                    "label": "Full Resync",
                     "label_de": "Vollständiger Resync",
-                    "variant":  "danger",
+                    "variant": "danger",
                 },
-            ],
+            ]
+            if self._sync_enabled
+            else [],
         }
