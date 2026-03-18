@@ -119,7 +119,7 @@ class Driver(BaseDriver):
         self._client: httpx.AsyncClient | None = None
 
         # -- Sync/Reconnect-Einstellungen --
-        self._sync_interval: int = int(config.get("sync_interval_seconds", 300))
+        self._sync_interval: int = int(config.get("sync_interval_seconds", 3600))
         self._reconnect_interval: int = int(
             config.get("reconnect_interval_seconds", 30)
         )
