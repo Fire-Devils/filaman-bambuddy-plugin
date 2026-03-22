@@ -247,11 +247,13 @@ class Driver(BaseDriver):
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
+        self._ws_task.add_done_callback(self._on_task_done)
 
         if self._sync_enabled:
             # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
             if self._is_sync_coordinator():
                 self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+                self._sync_task.add_done_callback(self._on_task_done)
                 logger.debug(
                     f"Printer {self.printer_id} is sync coordinator for {self._bambuddy_url}"
                 )
@@ -343,6 +345,15 @@ class Driver(BaseDriver):
                 f"Data change detected, triggering inventory sync for printer {self.printer_id}"
             )
             await self._sync_all_spools()
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Callback to catch unhandled exceptions in background tasks."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass  # Expected on shutdown
+        except Exception as e:
+            logger.error(f"Background task failed: {e}", exc_info=True)
 
     # -- Bambuddy HTTP-Helfer ------------------------------------------------
 
@@ -632,7 +643,10 @@ class Driver(BaseDriver):
         while self._running:
             await asyncio.sleep(self._sync_interval)
             if self._running:
-                await self._sync_all_spools()
+                try:
+                    await self._sync_all_spools()
+                except Exception as e:
+                    logger.error(f"Inventory sync failed: {e}")
 
     async def trigger_sync(self) -> None:
         """Manueller sofortiger Inventory-Sync (Drucker-Action)."""
@@ -724,6 +738,7 @@ class Driver(BaseDriver):
 
     async def _handle_ws_event(self, event: dict) -> None:
         """Verarbeitet eingehende Bambuddy WebSocket-Events."""
+        self.log_debug("in", "websocket", event)
         event_type = event.get("type")
 
         if event_type == "printer_status":
