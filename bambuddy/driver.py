@@ -140,6 +140,8 @@ class Driver(BaseDriver):
         self._slot_params_cache: dict[str, dict] = {}
         # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
         self._slot_to_filaman_spool: dict[str, int] = {}
+        # Slot-Key ("ams_id-tray_id") → Bambu tray_uuid (für Spoolman-Link)
+        self._slot_to_tray_uuid: dict[str, str] = {}
         # Letzte Sync-Statistik
         self._last_sync_count: int = 0
         self._last_sync_error: str | None = None
@@ -215,9 +217,11 @@ class Driver(BaseDriver):
             )
             if resp.status_code == 200:
                 data = resp.json()
-                self._spoolman_enabled = (
-                    data.get("spoolman_enabled", "").lower() == "true"
-                )
+                spoolman_val = data.get("spoolman_enabled", False)
+                if isinstance(spoolman_val, bool):
+                    self._spoolman_enabled = spoolman_val
+                else:
+                    self._spoolman_enabled = str(spoolman_val).lower() == "true"
                 self._spoolman_url = data.get("spoolman_url", "") or ""
                 logger.debug(
                     f"Spoolman status cached: enabled={self._spoolman_enabled}, "
@@ -798,6 +802,16 @@ class Driver(BaseDriver):
         filaman_spool_id = _int_or_none(filament_data.get("id"))
         slot_key = f"{ams_id}-{tray_id}"
 
+        # -- Alte Spule aus Standort entfernen wenn Slot überschrieben wird --
+        old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
+        if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
+            # Alte Spule aus diesem Slot entfernen
+            asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
+            logger.info(
+                f"Removed old spool {old_filaman_spool_id} from slot {slot_key} "
+                f"(replaced by {filaman_spool_id})"
+            )
+
         # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
         if filaman_spool_id:
             try:
@@ -811,7 +825,11 @@ class Driver(BaseDriver):
                     f"Failed to cache original location for FilaMan spool "
                     f"{filaman_spool_id}: {e}"
                 )
-            await self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+            # Spoolman-Linking asynchron im Hintergrund ausführen
+            # (nicht blockieren - Assignment soll sofort durchlaufen)
+            asyncio.create_task(
+                self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+            )
 
         if bambuddy_spool_id and self._client:
             try:
@@ -1014,31 +1032,48 @@ class Driver(BaseDriver):
                         f"from tray {ams_id}/{tray_id}: {e}"
                     )
 
+            # tray_uuid from cache holen
+            slot_key = f"{ams_id}-{tray_id}"
+            tray_uuid = self._slot_to_tray_uuid.get(slot_key)
+
+            # Wenn nicht im Cache: Status explizit abrufen
+            if not tray_uuid:
+                logger.info(
+                    f"tray_uuid not in cache for slot {slot_key}, "
+                    f"fetching printer status..."
+                )
+                await self._fetch_and_emit_status()
+                # Nochmal versuchen
+                tray_uuid = self._slot_to_tray_uuid.get(slot_key)
+
+            if not tray_uuid:
+                logger.warning(
+                    f"Cannot link Spoolman spool {filaman_spool_id}: "
+                    f"tray_uuid not available for slot {slot_key} "
+                    f"(AMS tray may not be initialized yet)"
+                )
+                return
+
             try:
                 link_resp = await self._client.post(
                     f"{self._bambuddy_url}/api/v1/spoolman/spools/{filaman_spool_id}/link",
-                    json={
-                        "printer_id": self._bambuddy_printer_id,
-                        "ams_id": ams_id,
-                        "tray_id": tray_id,
-                    },
+                    json={"tray_uuid": tray_uuid},
                 )
                 self.log_debug(
                     "out",
                     f"POST /api/v1/spoolman/spools/{filaman_spool_id}/link",
                     {
                         "status": link_resp.status_code,
-                        "ams_id": ams_id,
-                        "tray_id": tray_id,
+                        "tray_uuid": tray_uuid,
                     },
                 )
                 logger.info(
-                    f"Linked Spoolman spool {filaman_spool_id} to tray {ams_id}/{tray_id}"
+                    f"Linked Spoolman spool {filaman_spool_id} to tray {tray_uuid}"
                 )
             except Exception as e:
                 logger.warning(
                     f"Failed to link Spoolman spool {filaman_spool_id} "
-                    f"to tray {ams_id}/{tray_id}: {e}"
+                    f"to tray {tray_uuid}: {e}"
                 )
 
         except Exception as e:
@@ -1120,6 +1155,10 @@ class Driver(BaseDriver):
             for tray in trays:
                 tray_id = int(tray.get("id", 0))
                 slot_index = f"{ams_id}-{tray_id}"
+                # tray_uuid für Spoolman-Link cachen
+                tray_uuid = tray.get("tray_uuid")
+                if tray_uuid:
+                    self._slot_to_tray_uuid[slot_index] = tray_uuid
                 tray_type = tray.get("tray_type", "")
                 tray_color = tray.get("tray_color", "")
                 cached = self._slot_params_cache.get(slot_index, {})
