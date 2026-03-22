@@ -72,6 +72,7 @@ local_cache
 releases
 *.zip
 .opencode
+.agents
 bump.sh
 AGENTS.md
 
