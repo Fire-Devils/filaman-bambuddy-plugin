@@ -831,6 +831,14 @@ class Driver(BaseDriver):
                 self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
             )
 
+        # -- Delayed Refetch Helper --
+        async def _delayed_refetch():
+            await asyncio.sleep(3)
+            try:
+                await self._fetch_and_emit_status()
+            except Exception as e:
+                logger.warning(f"Delayed refetch after assignment failed: {e}")
+
         if bambuddy_spool_id and self._client:
             try:
                 response = await self._bb_post(
@@ -861,6 +869,8 @@ class Driver(BaseDriver):
                 # Slot-Spool-Cache für Verbrauchsmeldung nach Druckende aktualisieren
                 if filaman_spool_id:
                     self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+
+                asyncio.create_task(self._delayed_refetch())
                 return
             except Exception as e:
                 logger.warning(
@@ -874,6 +884,9 @@ class Driver(BaseDriver):
         # Slot-Spool-Cache auch beim Fallback aktualisieren
         if filaman_spool_id:
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+
+        # -- Delayed Refetch nach Fallback --
+        asyncio.create_task(self._delayed_refetch())
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
