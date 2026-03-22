@@ -464,7 +464,7 @@ class Driver(BaseDriver):
         """
         fil = spool.filament
         manufacturer_name = fil.manufacturer.name if fil and fil.manufacturer else None
-        colors = fil.filament_colors if fil else []
+        colors = sorted(fil.filament_colors, key=lambda fc: fc.position) if fil else []
 
         # Farbe: FilaMan 6-stellig hex → 8-stellig RRGGBBAA
         raw_color = "FFFFFF"
@@ -996,6 +996,27 @@ class Driver(BaseDriver):
             return
 
         try:
+            # Bambuddy-Spool-ID aus DB holen (für Spoolman-Link)
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.spool_id == filaman_spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                    )
+                )
+                param = result.scalar_one_or_none()
+                bambuddy_spool_id_link = (
+                    int(param.param_value) if param and param.param_value else None
+                )
+
+            if not bambuddy_spool_id_link:
+                logger.warning(
+                    f"Cannot link Spoolman spool: Bambuddy spool ID not found "
+                    f"for FilaMan spool {filaman_spool_id} on printer {self.printer_id}"
+                )
+                return
+
             assignments = await self._bb_get(
                 "/api/v1/inventory/assignments",
                 params={"printer_id": self._bambuddy_printer_id},
@@ -1056,23 +1077,23 @@ class Driver(BaseDriver):
 
             try:
                 link_resp = await self._client.post(
-                    f"{self._bambuddy_url}/api/v1/spoolman/spools/{filaman_spool_id}/link",
+                    f"{self._bambuddy_url}/api/v1/spoolman/spools/{bambuddy_spool_id_link}/link",
                     json={"tray_uuid": tray_uuid},
                 )
                 self.log_debug(
                     "out",
-                    f"POST /api/v1/spoolman/spools/{filaman_spool_id}/link",
+                    f"POST /api/v1/spoolman/spools/{bambuddy_spool_id_link}/link",
                     {
                         "status": link_resp.status_code,
                         "tray_uuid": tray_uuid,
                     },
                 )
                 logger.info(
-                    f"Linked Spoolman spool {filaman_spool_id} to tray {tray_uuid}"
+                    f"Linked Spoolman spool {bambuddy_spool_id_link} to tray {tray_uuid}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to link Spoolman spool {filaman_spool_id} "
+                    f"Failed to link Spoolman spool {bambuddy_spool_id_link} "
                     f"to tray {tray_uuid}: {e}"
                 )
 
