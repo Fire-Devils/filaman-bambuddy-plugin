@@ -148,6 +148,9 @@ class Driver(BaseDriver):
         self._spoolman_enabled: bool = False
         self._spoolman_url: str = ""
 
+        # -- Original-Location-Cache für Spoolman-Verknüpfung --
+        self._spool_original_location: dict[int, int | None] = {}
+
         # Sofortiger Push: Guard gegen Endlosschleife + Debounce-Task
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
@@ -797,6 +800,17 @@ class Driver(BaseDriver):
 
         # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
         if filaman_spool_id:
+            try:
+                async with async_session_maker() as db:
+                    spool = await db.get(Spool, filaman_spool_id)
+                    self._spool_original_location[filaman_spool_id] = (
+                        spool.location_id if spool else None
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to cache original location for FilaMan spool "
+                    f"{filaman_spool_id}: {e}"
+                )
             await self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
 
         if bambuddy_spool_id and self._client:
@@ -1030,6 +1044,33 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"Spoolman linking failed for tray {ams_id}/{tray_id}: {e}")
 
+    async def _restore_spool_location(self, filaman_spool_id: int) -> None:
+        """Restores a spool's original FilaMan location when its AMS tray becomes empty."""
+        if filaman_spool_id not in self._spool_original_location:
+            return
+
+        # Check if the spool is assigned to another tray (use list() to avoid dict modification during iteration)
+        if filaman_spool_id in list(self._slot_to_filaman_spool.values()):
+            return
+
+        original_location_id = self._spool_original_location.pop(filaman_spool_id, None)
+        if original_location_id is None:
+            return
+
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if spool and spool.location_id != original_location_id:
+                    SpoolService(db).move_location(
+                        spool,
+                        original_location_id,
+                        datetime.now(timezone.utc),
+                        source="driver",
+                        note="Restored from AMS tray",
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to restore spool {filaman_spool_id} location: {e}")
+
     # -- Initialer Status-Fetch -----------------------------------------------
 
     async def _fetch_and_emit_status(self) -> None:
@@ -1090,6 +1131,9 @@ class Driver(BaseDriver):
 
                 if not tray_type:
                     self._slot_params_cache.pop(slot_index, None)
+                    old_spool_id = self._slot_to_filaman_spool.get(slot_index)
+                    if old_spool_id:
+                        asyncio.create_task(self._restore_spool_location(old_spool_id))
                     self._slot_to_filaman_spool.pop(slot_index, None)
 
                 ams_slots.append(
@@ -1142,6 +1186,9 @@ class Driver(BaseDriver):
 
             if not vt_type:
                 self._slot_params_cache.pop(vt_idx, None)
+                old_spool_id = self._slot_to_filaman_spool.get(vt_idx)
+                if old_spool_id:
+                    asyncio.create_task(self._restore_spool_location(old_spool_id))
                 self._slot_to_filaman_spool.pop(vt_idx, None)
 
             ext_slots.append(
