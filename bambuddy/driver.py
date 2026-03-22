@@ -124,6 +124,7 @@ class Driver(BaseDriver):
             config.get("reconnect_interval_seconds", 30)
         )
         self._sync_enabled: bool = config.get("sync_enabled", "enabled") == "enabled"
+        self._debug_enabled: bool = config.get("debug_enabled", False)
 
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
@@ -724,6 +725,7 @@ class Driver(BaseDriver):
                             break
                         try:
                             event = json.loads(message)
+                            logger.info(f"WS message received: {event}")
                             await self._handle_ws_event(event)
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
