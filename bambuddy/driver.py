@@ -144,6 +144,10 @@ class Driver(BaseDriver):
         self._last_sync_count: int = 0
         self._last_sync_error: str | None = None
 
+        # -- Spoolman-Cache --
+        self._spoolman_enabled: bool = False
+        self._spoolman_url: str = ""
+
         # Sofortiger Push: Guard gegen Endlosschleife + Debounce-Task
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
@@ -200,6 +204,28 @@ class Driver(BaseDriver):
     async def start(self) -> None:
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
+
+        # -- Spoolman-Settings cachen --
+        try:
+            resp = await self._client.get(
+                f"{self._bambuddy_url}/api/v1/settings/spoolman"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._spoolman_enabled = (
+                    data.get("spoolman_enabled", "").lower() == "true"
+                )
+                self._spoolman_url = data.get("spoolman_url", "") or ""
+                logger.debug(
+                    f"Spoolman status cached: enabled={self._spoolman_enabled}, "
+                    f"url={self._spoolman_url}"
+                )
+            else:
+                logger.warning(
+                    f"Spoolman settings returned {resp.status_code}, assuming disabled"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch Spoolman settings: {e}")
 
         if self._sync_enabled:
             # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
@@ -769,6 +795,10 @@ class Driver(BaseDriver):
         filaman_spool_id = _int_or_none(filament_data.get("id"))
         slot_key = f"{ams_id}-{tray_id}"
 
+        # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
+        if filaman_spool_id:
+            await self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+
         if bambuddy_spool_id and self._client:
             try:
                 response = await self._bb_post(
@@ -921,7 +951,84 @@ class Driver(BaseDriver):
                 f"{e.response.status_code} {e.response.text}"
             )
         except Exception as e:
-            logger.error(f"Failed to configure Bambuddy slot {ams_id}-{tray_id}: {e}")
+            logger.error(f"Failed to configure Bambuddy slot {ams_id}/{tray_id}: {e}")
+
+    async def _handle_spoolman_linking(
+        self, ams_id: int, tray_id: int, filaman_spool_id: int
+    ) -> None:
+        if not self._spoolman_enabled:
+            return
+
+        if not self._client:
+            logger.warning("Spoolman linking skipped: HTTP client not initialized")
+            return
+
+        try:
+            assignments = await self._bb_get(
+                "/api/v1/inventory/assignments",
+                params={"printer_id": self._bambuddy_printer_id},
+            )
+            if not isinstance(assignments, list):
+                assignments = []
+
+            old_spool_id: int | None = None
+            for assignment in assignments:
+                if (
+                    int(assignment.get("ams_id", -1)) == ams_id
+                    and int(assignment.get("tray_id", -1)) == tray_id
+                ):
+                    old_spool_id = _int_or_none(assignment.get("spool_id"))
+                    break
+
+            if old_spool_id and old_spool_id != filaman_spool_id:
+                try:
+                    unlink_resp = await self._client.post(
+                        f"{self._bambuddy_url}/api/v1/spoolman/spools/{old_spool_id}/unlink"
+                    )
+                    self.log_debug(
+                        "out",
+                        f"POST /api/v1/spoolman/spools/{old_spool_id}/unlink",
+                        {"status": unlink_resp.status_code},
+                    )
+                    logger.info(
+                        f"Unlinked old Spoolman spool {old_spool_id} from tray "
+                        f"{ams_id}/{tray_id} (replaced by {filaman_spool_id})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to unlink Spoolman spool {old_spool_id} "
+                        f"from tray {ams_id}/{tray_id}: {e}"
+                    )
+
+            try:
+                link_resp = await self._client.post(
+                    f"{self._bambuddy_url}/api/v1/spoolman/spools/{filaman_spool_id}/link",
+                    json={
+                        "printer_id": self._bambuddy_printer_id,
+                        "ams_id": ams_id,
+                        "tray_id": tray_id,
+                    },
+                )
+                self.log_debug(
+                    "out",
+                    f"POST /api/v1/spoolman/spools/{filaman_spool_id}/link",
+                    {
+                        "status": link_resp.status_code,
+                        "ams_id": ams_id,
+                        "tray_id": tray_id,
+                    },
+                )
+                logger.info(
+                    f"Linked Spoolman spool {filaman_spool_id} to tray {ams_id}/{tray_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to link Spoolman spool {filaman_spool_id} "
+                    f"to tray {ams_id}/{tray_id}: {e}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Spoolman linking failed for tray {ams_id}/{tray_id}: {e}")
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
@@ -1113,6 +1220,8 @@ class Driver(BaseDriver):
             "slots": self._current_slots,
             "last_sync_count": self._last_sync_count,
             "last_sync_error": self._last_sync_error,
+            "spoolman_enabled": self._spoolman_enabled,
+            "spoolman_url": self._spoolman_url,
             "active_slot_mappings": len(self._slot_to_filaman_spool),
             "sync_enabled": self._sync_enabled,
             "sync_actions": [
