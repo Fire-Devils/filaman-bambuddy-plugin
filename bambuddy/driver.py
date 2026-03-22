@@ -870,7 +870,7 @@ class Driver(BaseDriver):
                 if filaman_spool_id:
                     self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
-                asyncio.create_task(self._delayed_refetch())
+                asyncio.create_task(_delayed_refetch())
                 return
             except Exception as e:
                 logger.warning(
@@ -886,7 +886,7 @@ class Driver(BaseDriver):
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
         # -- Delayed Refetch nach Fallback --
-        asyncio.create_task(self._delayed_refetch())
+        asyncio.create_task(_delayed_refetch())
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
