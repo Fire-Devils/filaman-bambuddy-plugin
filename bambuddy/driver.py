@@ -163,6 +163,20 @@ class Driver(BaseDriver):
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
 
+        # -- Task Restart Management --
+        self._ws_restart_count: int = 0
+        self._sync_restart_count: int = 0
+        self._last_ws_restart: float = 0.0
+        self._last_sync_restart: float = 0.0
+        self._max_restart_attempts: int = 5
+        self._restart_backoff_base: float = 2.0  # Exponential backoff base
+
+        # -- Event Emission Tracking --
+        self._last_status_emit: float = 0.0
+        self._status_emit_interval: float = (
+            10.0  # Emit status every 10s even if unchanged
+        )
+
     # -- URL-basierte Sync-Koordination ----------------------------------------
 
     def _register(self) -> None:
@@ -355,13 +369,89 @@ class Driver(BaseDriver):
             await self._sync_all_spools()
 
     def _on_task_done(self, task: asyncio.Task) -> None:
-        """Callback to catch unhandled exceptions in background tasks."""
+        """Callback to catch unhandled exceptions in background tasks.
+
+        Automatically restarts critical tasks (WebSocket, Sync) with exponential backoff.
+        """
         try:
             task.result()
         except asyncio.CancelledError:
             pass  # Expected on shutdown
         except Exception as e:
             logger.error(f"Background task failed: {e}", exc_info=True)
+
+            # Nur restarten wenn Driver noch läuft
+            if not self._running:
+                return
+
+            # Identifiziere welcher Task gefailed ist
+            task_name = "unknown"
+            restart_count = 0
+            last_restart = 0.0
+
+            if task is self._ws_task:
+                task_name = "WebSocket"
+                self._ws_restart_count += 1
+                restart_count = self._ws_restart_count
+                self._last_ws_restart = time.monotonic()
+                last_restart = self._last_ws_restart
+            elif task is self._sync_task:
+                task_name = "Sync"
+                self._sync_restart_count += 1
+                restart_count = self._sync_restart_count
+                self._last_sync_restart = time.monotonic()
+                last_restart = self._last_sync_restart
+            else:
+                # Andere Tasks (debounce, assignment etc.) nicht automatisch restarten
+                logger.warning(f"Untracked background task failed, not restarting")
+                return
+
+            # Max restart attempts check
+            if restart_count > self._max_restart_attempts:
+                logger.error(
+                    f"{task_name} task failed {restart_count} times, "
+                    f"exceeded max restart attempts ({self._max_restart_attempts}). "
+                    f"Manual intervention required."
+                )
+                return
+
+            # Exponential backoff berechnen
+            backoff_delay = min(
+                self._restart_backoff_base ** (restart_count - 1),
+                300,  # Max 5 Minuten
+            )
+
+            logger.warning(
+                f"{task_name} task crashed (attempt {restart_count}/{self._max_restart_attempts}). "
+                f"Restarting in {backoff_delay:.1f}s..."
+            )
+
+            # Task mit Delay neu starten
+            asyncio.create_task(self._restart_task_delayed(task_name, backoff_delay))
+
+    async def _restart_task_delayed(self, task_name: str, delay: float) -> None:
+        """Startet einen gecrasht Task nach Delay neu."""
+        await asyncio.sleep(delay)
+
+        if not self._running:
+            logger.debug(f"Driver stopped, skipping {task_name} restart")
+            return
+
+        try:
+            if task_name == "WebSocket":
+                logger.info(
+                    f"Restarting WebSocket task (attempt {self._ws_restart_count})"
+                )
+                self._ws_task = asyncio.create_task(self._ws_loop())
+                self._ws_task.add_done_callback(self._on_task_done)
+            elif task_name == "Sync":
+                logger.info(
+                    f"Restarting Sync task (attempt {self._sync_restart_count})"
+                )
+                self._sync_task = asyncio.create_task(self._sync_inventory_loop())
+                self._sync_task.add_done_callback(self._on_task_done)
+        except Exception as e:
+            logger.error(f"Failed to restart {task_name} task: {e}", exc_info=True)
 
     # -- Bambuddy HTTP-Helfer ------------------------------------------------
 
@@ -653,6 +743,13 @@ class Driver(BaseDriver):
             if self._running:
                 try:
                     await self._sync_all_spools()
+                    # Reset restart counter bei erfolgreichem Durchlauf
+                    if self._sync_restart_count > 0:
+                        logger.info(
+                            f"Sync task stable after {self._sync_restart_count} restarts, "
+                            "resetting restart counter"
+                        )
+                        self._sync_restart_count = 0
                 except Exception as e:
                     logger.error(f"Inventory sync failed: {e}")
 
@@ -727,12 +824,24 @@ class Driver(BaseDriver):
                 ) as ws:
                     self._ws_connected = True
                     logger.info(f"WebSocket connected: {uri}")
+
+                    # Reset restart counter bei erfolgreicher Verbindung
+                    if self._ws_restart_count > 0:
+                        logger.info(
+                            f"WebSocket stable after {self._ws_restart_count} restarts, "
+                            "resetting restart counter"
+                        )
+                        self._ws_restart_count = 0
+
                     async for message in ws:
                         if not self._running:
                             break
                         try:
                             event = json.loads(message)
-                            logger.debug(f"WS message received: {event}")
+                            logger.info(
+                                f"WS message received (type={json.loads(message).get('type')})"
+                            )
+                            logger.debug(f"WS message full payload: {event}")
                             await self._handle_ws_event(event)
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
@@ -753,8 +862,34 @@ class Driver(BaseDriver):
         if event_type == "printer_status":
             data = event.get("data", {})
             if event.get("printer_id") == self._bambuddy_printer_id:
+                old_connected = self._printer_connected
                 self._printer_connected = data.get("connected", self._printer_connected)
+
+                # Process slots (may emit slots_update if changed)
                 self._process_slots(data)
+
+                # Emit heartbeat status if:
+                # 1. Connection state changed, OR
+                # 2. Enough time passed since last emit (heartbeat)
+                now = time.monotonic()
+                connection_changed = old_connected != self._printer_connected
+                heartbeat_due = (
+                    now - self._last_status_emit
+                ) >= self._status_emit_interval
+
+                if connection_changed or heartbeat_due:
+                    self._last_status_emit = now
+                    self.emit(
+                        {
+                            "event_type": "printer_status",
+                            "connected": self._printer_connected,
+                            "timestamp": now,
+                        }
+                    )
+                    logger.debug(
+                        f"Emitted printer_status: connected={self._printer_connected} "
+                        f"(reason: {'connection_change' if connection_changed else 'heartbeat'})"
+                    )
 
         elif event_type == "print_complete":
             data = event.get("data", {})
@@ -1341,7 +1476,12 @@ class Driver(BaseDriver):
         has_external = len(ext_slots) > 0
         slots = ams_slots + ext_slots
 
-        if slots == self._current_slots:
+        # Prüfe ob Slots sich geändert haben (skip emit wenn unverändert)
+        # ABER: Beim ersten Start IMMER emittieren (self._current_slots ist [])
+        slots_changed = slots != self._current_slots
+        is_first_status = len(self._current_slots) == 0 and len(slots) > 0
+
+        if not slots_changed and not is_first_status:
             return
 
         self._current_slots = slots
@@ -1366,11 +1506,35 @@ class Driver(BaseDriver):
 
     def health(self) -> dict[str, Any]:
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
+
+        # Task-Liveness prüfen
+        ws_task_alive = self._ws_task is not None and not self._ws_task.done()
+        sync_task_alive = (
+            (self._sync_task is not None and not self._sync_task.done())
+            if self._sync_enabled and self._is_sync_coordinator()
+            else None
+        )
+
+        # Task-Status Details
+        task_status = {
+            "ws_task_alive": ws_task_alive,
+            "ws_restart_count": self._ws_restart_count,
+            "sync_task_alive": sync_task_alive,
+            "sync_restart_count": self._sync_restart_count,
+        }
+
+        # Overall health: critical tasks müssen leben
+        tasks_healthy = ws_task_alive
+        if sync_task_alive is not None:  # Nur wenn dieser Driver Sync-Coordinator ist
+            tasks_healthy = tasks_healthy and sync_task_alive
+
         return {
             "driver_key": self.driver_key,
             "printer_id": self.printer_id,
             "running": self._running,
             "connected": self._ws_connected and self._printer_connected,
+            "tasks_healthy": tasks_healthy,
+            "task_status": task_status,
             "bambuddy_printer_id": self._bambuddy_printer_id,
             "ams_count": len(self._current_ams_units),
             "slot_count": total_slots,
