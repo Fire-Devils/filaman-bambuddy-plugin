@@ -23,11 +23,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar
 
 import httpx
-from sqlalchemy import delete, event, select
+from sqlalchemy import delete, event, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import async_session_maker
 from app.models.filament import Filament, FilamentColor
+from app.models.location import Location
+from app.models.printer import Printer
 from app.models.printer_params import SpoolPrinterParam
 from app.models.spool import Spool, SpoolStatus
 from app.services.spool_service import SpoolService
@@ -159,6 +161,9 @@ class Driver(BaseDriver):
         # -- Original-Location-Cache für Spoolman-Verknüpfung --
         self._spool_original_location: dict[int, int | None] = {}
 
+        # -- Drucker-Name für Location-Generierung --
+        self._printer_name: str | None = None
+
         # Sofortiger Push: Guard gegen Endlosschleife + Debounce-Task
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
@@ -229,6 +234,17 @@ class Driver(BaseDriver):
     async def start(self) -> None:
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
+
+        # -- Drucker-Name für Location-Generierung cachen --
+        try:
+            async with async_session_maker() as db:
+                printer = await db.get(Printer, self.printer_id)
+                self._printer_name = (
+                    printer.name if printer else f"Printer {self.printer_id}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load printer name: {e}")
+            self._printer_name = f"Printer {self.printer_id}"
 
         # -- Spoolman-Settings cachen --
         try:
@@ -1030,6 +1046,11 @@ class Driver(BaseDriver):
                     f"printer {self._bambuddy_printer_id} AMS {ams_id}/{tray_id} "
                     f"(auto-configured={response.get('configured', False)})"
                 )
+
+                # Location nach erfolgreichem Assignment setzen
+                if filaman_spool_id:
+                    await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
+
                 # Slot-Spool-Cache für Verbrauchsmeldung nach Druckende aktualisieren
                 if filaman_spool_id:
                     self._slot_to_filaman_spool[slot_key] = filaman_spool_id
@@ -1045,6 +1066,10 @@ class Driver(BaseDriver):
 
         # Fallback: Direkter configure-Call mit allen Feldern
         await self._send_assignment(ams_id, tray_id, filament_data)
+
+        # Location nach erfolgreichem Fallback-Assignment setzen
+        if filaman_spool_id:
+            await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
 
         # Slot-Spool-Cache auch beim Fallback aktualisieren
         if filaman_spool_id:
@@ -1308,6 +1333,97 @@ class Driver(BaseDriver):
                     )
         except Exception as e:
             logger.warning(f"Failed to restore spool {filaman_spool_id} location: {e}")
+
+    def _generate_slot_location_name(self, ams_id: int, tray_id: int) -> str:
+        """Generiert Location-Namen für AMS-Slot.
+
+        Format:
+        - AMS Slots: "{Drucker Name} - AMS A{ams_id+1}"
+        - External Slots: "{Drucker Name} - ext. Slot {tray_id+1}"
+
+        Beispiele:
+        - "Bambu P1S - AMS A2" (AMS 0, Slot 1)
+        - "Bambu X1C - ext. Slot 1" (External, Slot 0)
+        """
+        printer_name = self._printer_name or f"Printer {self.printer_id}"
+
+        if ams_id >= 200:  # External slot
+            return f"{printer_name} - ext. Slot {tray_id + 1}"
+        else:
+            # AMS slots: A1, A2, A3, A4 (tray_id 0-3)
+            slot_label = chr(65 + tray_id)  # 65 = 'A' in ASCII
+            return f"{printer_name} - AMS {slot_label}{ams_id + 1}"
+
+    async def _update_spool_location(
+        self, filaman_spool_id: int, ams_id: int, tray_id: int
+    ) -> None:
+        """Setzt Spulen-Standort auf AMS-Slot-Location.
+
+        Erstellt die Location automatisch falls sie noch nicht existiert.
+        Nutzt SpoolService.move_location() für konsistente Event-Generierung.
+        """
+        try:
+            slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
+
+            async with async_session_maker() as db:
+                # 1. Location suchen (case-insensitive)
+                result = await db.execute(
+                    select(Location).where(
+                        func.lower(Location.name) == slot_location_name.lower()
+                    )
+                )
+                location = result.scalar_one_or_none()
+
+                # 2. Location erstellen falls nicht vorhanden
+                if not location:
+                    location = Location(
+                        name=slot_location_name,
+                        identifier=f"bambuddy_{self.printer_id}_{ams_id}_{tray_id}",
+                        custom_fields={
+                            "managed_by": "bambuddy_plugin",
+                            "printer_id": self.printer_id,
+                        },
+                    )
+                    db.add(location)
+                    await db.flush()  # Für location.id
+                    await db.commit()
+                    logger.info(f"Created location: {slot_location_name}")
+
+                # 3. Spule zur Location bewegen (wenn nicht bereits dort)
+                spool = await db.get(Spool, filaman_spool_id)
+                if not spool:
+                    logger.warning(
+                        f"Spool {filaman_spool_id} not found, cannot update location"
+                    )
+                    return
+
+                if spool.location_id == location.id:
+                    logger.debug(
+                        f"Spool {filaman_spool_id} already at location '{slot_location_name}'"
+                    )
+                    return
+
+                # SpoolService für konsistente Event-Generierung nutzen
+                await SpoolService(db).move_location(
+                    spool,
+                    location.id,
+                    datetime.now(timezone.utc),
+                    source="driver",
+                    note=f"Assigned to {slot_location_name}",
+                )
+                await db.commit()
+
+                logger.info(
+                    f"Moved spool {filaman_spool_id} to location '{slot_location_name}' "
+                    f"(location_id={location.id})"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Failed to update location for spool {filaman_spool_id} "
+                f"(slot {ams_id}-{tray_id}): {e}",
+                exc_info=True,
+            )
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
