@@ -124,7 +124,12 @@ class Driver(BaseDriver):
             config.get("reconnect_interval_seconds", 30)
         )
         self._sync_enabled: bool = config.get("sync_enabled", "enabled") == "enabled"
-        self._debug_enabled: bool = config.get("debug_enabled", False)
+        _debug_val = config.get("debug_enabled", False)
+        self._debug_enabled: bool = (
+            _debug_val
+            if isinstance(_debug_val, bool)
+            else str(_debug_val).lower() in ("true", "1", "enabled")
+        )
 
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
@@ -304,6 +309,7 @@ class Driver(BaseDriver):
                         new_coord._sync_task = asyncio.create_task(
                             new_coord._sync_inventory_loop()
                         )
+                        new_coord._sync_task.add_done_callback(new_coord._on_task_done)
                         logger.info(
                             f"Sync coordinator delegated to printer {new_coord.printer_id} "
                             f"for {self._bambuddy_url}"
@@ -332,6 +338,7 @@ class Driver(BaseDriver):
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
         self._debounce_task = asyncio.create_task(self._debounced_sync())
+        self._debounce_task.add_done_callback(self._on_task_done)
 
     async def _debounced_sync(self) -> None:
         """Wartet 3 Sekunden auf weitere Commits, dann Inventory-Sync."""
@@ -725,7 +732,7 @@ class Driver(BaseDriver):
                             break
                         try:
                             event = json.loads(message)
-                            logger.info(f"WS message received: {event}")
+                            logger.debug(f"WS message received: {event}")
                             await self._handle_ws_event(event)
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
@@ -803,7 +810,10 @@ class Driver(BaseDriver):
         self, ams_id: int, tray_id: int, filament_data: dict
     ) -> None:
         """Weist FilaMan-Spule einem Bambuddy-AMS-Slot zu."""
-        asyncio.create_task(self._assign_or_configure(ams_id, tray_id, filament_data))
+        _t = asyncio.create_task(
+            self._assign_or_configure(ams_id, tray_id, filament_data)
+        )
+        _t.add_done_callback(self._on_task_done)
 
     async def _assign_or_configure(
         self, ams_id: int, tray_id: int, filament_data: dict
@@ -823,7 +833,8 @@ class Driver(BaseDriver):
         old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
         if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
             # Alte Spule aus diesem Slot entfernen
-            asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
+            _t = asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
+            _t.add_done_callback(self._on_task_done)
             logger.info(
                 f"Removed old spool {old_filaman_spool_id} from slot {slot_key} "
                 f"(replaced by {filaman_spool_id})"
@@ -844,9 +855,10 @@ class Driver(BaseDriver):
                 )
             # Spoolman-Linking asynchron im Hintergrund ausführen
             # (nicht blockieren - Assignment soll sofort durchlaufen)
-            asyncio.create_task(
+            _t = asyncio.create_task(
                 self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
             )
+            _t.add_done_callback(self._on_task_done)
 
         # -- Delayed Refetch Helper --
         async def _delayed_refetch():
@@ -887,7 +899,8 @@ class Driver(BaseDriver):
                 if filaman_spool_id:
                     self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
-                asyncio.create_task(_delayed_refetch())
+                _t = asyncio.create_task(_delayed_refetch())
+                _t.add_done_callback(self._on_task_done)
                 return
             except Exception as e:
                 logger.warning(
@@ -903,7 +916,8 @@ class Driver(BaseDriver):
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
         # -- Delayed Refetch nach Fallback --
-        asyncio.create_task(_delayed_refetch())
+        _t = asyncio.create_task(_delayed_refetch())
+        _t.add_done_callback(self._on_task_done)
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
@@ -1094,6 +1108,9 @@ class Driver(BaseDriver):
                     f"fetching printer status..."
                 )
                 await self._fetch_and_emit_status()
+                await asyncio.sleep(
+                    0
+                )  # Yield to event loop to let _process_slots populate cache
                 # Nochmal versuchen
                 tray_uuid = self._slot_to_tray_uuid.get(slot_key)
 
@@ -1147,7 +1164,7 @@ class Driver(BaseDriver):
             async with async_session_maker() as db:
                 spool = await db.get(Spool, filaman_spool_id)
                 if spool and spool.location_id != original_location_id:
-                    SpoolService(db).move_location(
+                    await SpoolService(db).move_location(
                         spool,
                         original_location_id,
                         datetime.now(timezone.utc),
@@ -1223,7 +1240,10 @@ class Driver(BaseDriver):
                     self._slot_params_cache.pop(slot_index, None)
                     old_spool_id = self._slot_to_filaman_spool.get(slot_index)
                     if old_spool_id:
-                        asyncio.create_task(self._restore_spool_location(old_spool_id))
+                        _t = asyncio.create_task(
+                            self._restore_spool_location(old_spool_id)
+                        )
+                        _t.add_done_callback(self._on_task_done)
                     self._slot_to_filaman_spool.pop(slot_index, None)
 
                 ams_slots.append(
@@ -1278,7 +1298,8 @@ class Driver(BaseDriver):
                 self._slot_params_cache.pop(vt_idx, None)
                 old_spool_id = self._slot_to_filaman_spool.get(vt_idx)
                 if old_spool_id:
-                    asyncio.create_task(self._restore_spool_location(old_spool_id))
+                    _t = asyncio.create_task(self._restore_spool_location(old_spool_id))
+                    _t.add_done_callback(self._on_task_done)
                 self._slot_to_filaman_spool.pop(vt_idx, None)
 
             ext_slots.append(
