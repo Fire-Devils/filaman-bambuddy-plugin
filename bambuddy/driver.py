@@ -1386,7 +1386,6 @@ class Driver(BaseDriver):
                     )
                     db.add(location)
                     await db.flush()  # Für location.id
-                    await db.commit()
                     logger.info(f"Created location: {slot_location_name}")
 
                 # 3. Spule zur Location bewegen (wenn nicht bereits dort)
@@ -1411,6 +1410,8 @@ class Driver(BaseDriver):
                     source="driver",
                     note=f"Assigned to {slot_location_name}",
                 )
+
+                # Einmaliger commit für beide Operationen (Location + Move)
                 await db.commit()
 
                 logger.info(
