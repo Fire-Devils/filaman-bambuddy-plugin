@@ -270,6 +270,28 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"Failed to fetch Spoolman settings: {e}")
 
+        # -- Cleanup: Alte bambuddy_spool_id Einträge entfernen wenn Sync deaktiviert --
+        if not self._sync_enabled:
+            try:
+                async with async_session_maker() as db:
+                    result = await db.execute(
+                        select(SpoolPrinterParam).where(
+                            SpoolPrinterParam.printer_id == self.printer_id,
+                            SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                        )
+                    )
+                    old_params = result.scalars().all()
+                    for param in old_params:
+                        await db.delete(param)
+                    await db.commit()
+                    if old_params:
+                        logger.info(
+                            f"Cleaned up {len(old_params)} old bambuddy_spool_id entries "
+                            f"(inventory sync is disabled)"
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to cleanup old bambuddy_spool_id entries: {e}")
+
         if self._sync_enabled:
             # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
             self._register()
@@ -523,6 +545,10 @@ class Driver(BaseDriver):
         Danach liefert enrich_filament_data() automatisch bambuddy_spool_id
         in filament_data["printer_params"] für jeden dieser Drucker.
         """
+        # Keine IDs speichern wenn Inventory-Sync deaktiviert ist
+        if not self._sync_enabled:
+            return
+
         printer_ids = self._peer_printer_ids()
         async with async_session_maker() as db:
             for pid in printer_ids:
@@ -1019,7 +1045,8 @@ class Driver(BaseDriver):
             except Exception as e:
                 logger.warning(f"Delayed refetch after assignment failed: {e}")
 
-        if bambuddy_spool_id and self._client:
+        # Inventory-Assignment nur wenn Sync aktiviert ist
+        if bambuddy_spool_id and self._client and self._sync_enabled:
             try:
                 response = await self._bb_post(
                     "/api/v1/inventory/assignments",
