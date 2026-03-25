@@ -1200,26 +1200,10 @@ class Driver(BaseDriver):
             return
 
         try:
-            # Bambuddy-Spool-ID aus DB holen (für Spoolman-Link)
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(SpoolPrinterParam).where(
-                        SpoolPrinterParam.spool_id == filaman_spool_id,
-                        SpoolPrinterParam.printer_id == self.printer_id,
-                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
-                    )
-                )
-                param = result.scalar_one_or_none()
-                bambuddy_spool_id_link = (
-                    int(param.param_value) if param and param.param_value else None
-                )
-
-            if not bambuddy_spool_id_link:
-                logger.warning(
-                    f"Cannot link Spoolman spool: Bambuddy spool ID not found "
-                    f"for FilaMan spool {filaman_spool_id} on printer {self.printer_id}"
-                )
-                return
+            # Bei Spoolman-Integration ist die FilaMan-Spool-ID identisch mit der
+            # Spoolman-Spool-ID (via SpoolmanAPI-Plugin). Diese wird direkt für
+            # den Link-API-Call verwendet, NICHT die Bambuddy-Inventory-Spool-ID.
+            spoolman_spool_id = filaman_spool_id
 
             assignments = await self._bb_get(
                 "/api/v1/inventory/assignments",
@@ -1237,7 +1221,7 @@ class Driver(BaseDriver):
                     old_spool_id = _int_or_none(assignment.get("spool_id"))
                     break
 
-            if old_spool_id and old_spool_id != filaman_spool_id:
+            if old_spool_id and old_spool_id != spoolman_spool_id:
                 try:
                     unlink_resp = await self._client.post(
                         f"{self._bambuddy_url}/api/v1/spoolman/spools/{old_spool_id}/unlink"
@@ -1249,7 +1233,7 @@ class Driver(BaseDriver):
                     )
                     logger.info(
                         f"Unlinked old Spoolman spool {old_spool_id} from tray "
-                        f"{ams_id}/{tray_id} (replaced by {filaman_spool_id})"
+                        f"{ams_id}/{tray_id} (replaced by {spoolman_spool_id})"
                     )
                 except Exception as e:
                     logger.warning(
@@ -1276,7 +1260,7 @@ class Driver(BaseDriver):
 
             if not tray_uuid:
                 logger.warning(
-                    f"Cannot link Spoolman spool {filaman_spool_id}: "
+                    f"Cannot link Spoolman spool {spoolman_spool_id}: "
                     f"tray_uuid not available for slot {slot_key} "
                     f"(AMS tray may not be initialized yet)"
                 )
@@ -1284,23 +1268,23 @@ class Driver(BaseDriver):
 
             try:
                 link_resp = await self._client.post(
-                    f"{self._bambuddy_url}/api/v1/spoolman/spools/{bambuddy_spool_id_link}/link",
+                    f"{self._bambuddy_url}/api/v1/spoolman/spools/{spoolman_spool_id}/link",
                     json={"tray_uuid": tray_uuid},
                 )
                 self.log_debug(
                     "out",
-                    f"POST /api/v1/spoolman/spools/{bambuddy_spool_id_link}/link",
+                    f"POST /api/v1/spoolman/spools/{spoolman_spool_id}/link",
                     {
                         "status": link_resp.status_code,
                         "tray_uuid": tray_uuid,
                     },
                 )
                 logger.info(
-                    f"Linked Spoolman spool {bambuddy_spool_id_link} to tray {tray_uuid}"
+                    f"Linked Spoolman spool {spoolman_spool_id} to tray {tray_uuid}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to link Spoolman spool {bambuddy_spool_id_link} "
+                    f"Failed to link Spoolman spool {spoolman_spool_id} "
                     f"to tray {tray_uuid}: {e}"
                 )
 
