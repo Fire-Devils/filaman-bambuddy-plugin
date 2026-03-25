@@ -1030,12 +1030,13 @@ class Driver(BaseDriver):
                     f"Failed to cache original location for FilaMan spool "
                     f"{filaman_spool_id}: {e}"
                 )
-            # Spoolman-Linking asynchron im Hintergrund ausführen
-            # (nicht blockieren - Assignment soll sofort durchlaufen)
-            _t = asyncio.create_task(
-                self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
-            )
-            _t.add_done_callback(self._on_task_done)
+            # Spoolman-Linking nur wenn Inventory-Sync aktiviert ist
+            # (Spoolman-Link synchronisiert Bambuddy-Inventory → Spoolman, ohne Inventory nicht nötig)
+            if self._spoolman_integration_enabled and self._sync_enabled:
+                _t = asyncio.create_task(
+                    self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
+                )
+                _t.add_done_callback(self._on_task_done)
 
         # -- Delayed Refetch Helper --
         async def _delayed_refetch():
@@ -1286,11 +1287,19 @@ class Driver(BaseDriver):
                 tray_uuid = self._slot_to_tray_uuid.get(slot_key)
 
             if not tray_uuid:
-                logger.warning(
-                    f"Cannot link Spoolman spool {spoolman_spool_id}: "
-                    f"tray_uuid not available for slot {slot_key} "
-                    f"(AMS tray may not be initialized yet)"
-                )
+                # Defensive Programmierung: Diese Funktion sollte nur mit _sync_enabled=True
+                # aufgerufen werden (Guard in _assign_or_configure), aber falls doch...
+                if self._sync_enabled:
+                    logger.warning(
+                        f"Cannot link Spoolman spool {spoolman_spool_id}: "
+                        f"tray_uuid not available for slot {slot_key} "
+                        f"(AMS tray may not be initialized yet)"
+                    )
+                else:
+                    logger.debug(
+                        f"Skipping Spoolman link for spool {spoolman_spool_id}: "
+                        f"inventory sync disabled (tray_uuid: {tray_uuid})"
+                    )
                 return
 
             try:
