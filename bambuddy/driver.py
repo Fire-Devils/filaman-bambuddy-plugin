@@ -125,7 +125,7 @@ class Driver(BaseDriver):
         self._reconnect_interval: int = int(
             config.get("reconnect_interval_seconds", 30)
         )
-        self._sync_enabled: bool = config.get("sync_enabled", "enabled") == "enabled"
+        self._sync_enabled: bool = config.get("sync_enabled", "disabled") == "enabled"
         _debug_val = config.get("debug_enabled", False)
         self._debug_enabled: bool = (
             _debug_val
@@ -1030,9 +1030,10 @@ class Driver(BaseDriver):
                     f"Failed to cache original location for FilaMan spool "
                     f"{filaman_spool_id}: {e}"
                 )
-            # Spoolman-Linking nur wenn Inventory-Sync aktiviert ist
-            # (Spoolman-Link synchronisiert Bambuddy-Inventory → Spoolman, ohne Inventory nicht nötig)
-            if self._spoolman_integration_enabled and self._sync_enabled:
+            # Spoolman-Linking nur wenn Inventory-Sync DEAKTIVIERT ist
+            # (Bei aktiviertem Sync nutzt Bambuddy sein eigenes Inventar, nicht Spoolman)
+            # Funktion selbst prüft zusätzlich _spoolman_enabled (defensive Programmierung)
+            if not self._sync_enabled:
                 _t = asyncio.create_task(
                     self._handle_spoolman_linking(ams_id, tray_id, filaman_spool_id)
                 )
@@ -1220,6 +1221,11 @@ class Driver(BaseDriver):
     async def _handle_spoolman_linking(
         self, ams_id: int, tray_id: int, filaman_spool_id: int
     ) -> None:
+        # Early return wenn Inventory-Sync AKTIVIERT
+        # (Bei aktiviertem Sync nutzt Bambuddy sein Inventar, nicht Spoolman)
+        if self._sync_enabled:
+            return
+
         if not self._spoolman_enabled:
             return
 
@@ -1287,18 +1293,19 @@ class Driver(BaseDriver):
                 tray_uuid = self._slot_to_tray_uuid.get(slot_key)
 
             if not tray_uuid:
-                # Defensive Programmierung: Diese Funktion sollte nur mit _sync_enabled=True
-                # aufgerufen werden (Guard in _assign_or_configure), aber falls doch...
+                # Mit early return oben sollte dieser Code nie mit _sync_enabled=False erreicht werden
+                # Aber defensive Programmierung: falls doch, nur Debug-Log
                 if self._sync_enabled:
                     logger.warning(
                         f"Cannot link Spoolman spool {spoolman_spool_id}: "
-                        f"tray_uuid not available for slot {slot_key} "
-                        f"(AMS tray may not be initialized yet)"
+                        f"tray_uuid not available for slot {slot_key}. "
+                        f"AMS tray may not be initialized yet or printer firmware does not provide UUIDs."
                     )
                 else:
+                    # Sollte nie erreicht werden (early return oben), aber zur Sicherheit
                     logger.debug(
-                        f"Skipping Spoolman link for spool {spoolman_spool_id}: "
-                        f"inventory sync disabled (tray_uuid: {tray_uuid})"
+                        f"[DEFENSIVE] Reached tray_uuid check with sync disabled - "
+                        f"this indicates a logic bug (slot {slot_key})"
                     )
                 return
 
