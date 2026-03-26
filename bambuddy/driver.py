@@ -654,7 +654,7 @@ class Driver(BaseDriver):
         }
 
         if spool.rfid_uid:
-            payload["tag_uid"] = spool.rfid_uid
+            payload["tag_uid"] = self._to_hex_tag(spool.rfid_uid)
 
         if slicer := pp.get("bambu_idx") or pp.get("bambu_tray_idx"):
             payload["slicer_filament"] = slicer
@@ -1218,6 +1218,22 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.error(f"Failed to configure Bambuddy slot {ams_id}/{tray_id}: {e}")
 
+    @staticmethod
+    def _to_hex_tag(raw: str) -> str:
+        """Strip ALL non-hex chars and pad to 16 (or 32) uppercase hex characters.
+
+        Bambuddy requires spool tags to be exactly 16 or 32 hex characters.
+        FilaMan stores rfid_uid colon-separated (e.g. '04:f5:02:3a') which
+        needs to be converted to raw uppercase hex, zero-padded.
+        """
+        _HEX = set("0123456789abcdefABCDEF")
+        hex_only = "".join(c for c in raw if c in _HEX)
+        if not hex_only:
+            return ""
+        if len(hex_only) > 16:
+            return hex_only.upper().zfill(32)
+        return hex_only.upper().zfill(16)
+
     async def _handle_spoolman_linking(
         self, ams_id: int, tray_id: int, filaman_spool_id: int
     ) -> None:
@@ -1227,11 +1243,22 @@ class Driver(BaseDriver):
             return
 
         if not self._spoolman_enabled:
+            logger.debug(
+                f"Spoolman linking skipped for spool {filaman_spool_id}: "
+                f"spoolman_enabled=False on Bambuddy side"
+            )
             return
 
         if not self._client:
             logger.warning("Spoolman linking skipped: HTTP client not initialized")
             return
+
+        # -- Diagnostic-Log am Einstiegspunkt --
+        logger.info(
+            f"Spoolman linking: spool={filaman_spool_id} -> tray {ams_id}/{tray_id} "
+            f"(sync_enabled={self._sync_enabled}, "
+            f"spoolman_enabled={self._spoolman_enabled})"
+        )
 
         try:
             # Bei Spoolman-Integration ist die FilaMan-Spool-ID identisch mit der
@@ -1239,27 +1266,66 @@ class Driver(BaseDriver):
             # den Link-API-Call verwendet, NICHT die Bambuddy-Inventory-Spool-ID.
             spoolman_spool_id = filaman_spool_id
 
-            assignments = await self._bb_get(
-                "/api/v1/inventory/assignments",
-                params={"printer_id": self._bambuddy_printer_id},
+            # -- tray_uuid optional aus Cache holen --
+            slot_key = f"{ams_id}-{tray_id}"
+            tray_uuid = self._slot_to_tray_uuid.get(slot_key)
+
+            # -- rfid_uid (NFC-Tag) aus FilaMan-Spool laden --
+            rfid_uid: str | None = None
+            try:
+                async with async_session_maker() as db:
+                    spool = await db.get(Spool, filaman_spool_id)
+                    if spool:
+                        rfid_uid = spool.rfid_uid
+            except Exception as e:
+                logger.debug(
+                    f"Could not load rfid_uid for spool {filaman_spool_id}: {e}"
+                )
+
+            # -- Tag-Identifikation bestimmen --
+            # Priorität: 1. tray_uuid  2. rfid_uid (NFC)  3. synthetischer Tag
+            tag_source = "none"
+            if tray_uuid:
+                tag_source = "tray_uuid"
+            elif rfid_uid:
+                tag_source = "rfid_uid"
+            else:
+                tag_source = "synthetic"
+
+            logger.debug(
+                f"Spoolman link tag resolution for slot {slot_key}: "
+                f"tray_uuid={tray_uuid}, rfid_uid={rfid_uid}, source={tag_source}"
             )
-            if not isinstance(assignments, list):
-                assignments = []
 
+            # -- Alte Spoolman-Verknüpfung erkennen und entfernen --
+            # Über die Spoolman-Linked-API abfragen (nicht Inventory-Assignments,
+            # da diese bei deaktiviertem Sync leer sind).
             old_spool_id: int | None = None
-            for assignment in assignments:
-                if (
-                    int(assignment.get("ams_id", -1)) == ams_id
-                    and int(assignment.get("tray_id", -1)) == tray_id
-                ):
-                    old_spool_id = _int_or_none(assignment.get("spool_id"))
-                    break
+            try:
+                linked = await self._bb_get("/api/v1/spoolman/spools/linked")
+                if isinstance(linked, dict):
+                    # linked ist {tag: spool_id} — Tag kann tray_uuid, rfid_uid
+                    # oder synthetischer Wert sein. Alle möglichen Tags prüfen.
+                    synthetic_tag = (
+                        f"{int(self._bambuddy_printer_id):04X}{ams_id:04X}{tray_id:08X}"
+                    )
+                    for tag_candidate in (tray_uuid, rfid_uid, synthetic_tag):
+                        if tag_candidate:
+                            old_id = linked.get(tag_candidate)
+                            if old_id is not None:
+                                old_id_int = int(old_id)
+                                if old_id_int != spoolman_spool_id:
+                                    old_spool_id = old_id_int
+                                break  # Gefunden — nicht weitersuchen
+            except Exception as e:
+                logger.debug(f"Could not fetch linked spools for unlink check: {e}")
 
-            if old_spool_id and old_spool_id != spoolman_spool_id:
+            if old_spool_id:
                 try:
                     unlink_resp = await self._client.post(
                         f"{self._bambuddy_url}/api/v1/spoolman/spools/{old_spool_id}/unlink"
                     )
+                    unlink_resp.raise_for_status()
                     self.log_debug(
                         "out",
                         f"POST /api/v1/spoolman/spools/{old_spool_id}/unlink",
@@ -1275,60 +1341,67 @@ class Driver(BaseDriver):
                         f"from tray {ams_id}/{tray_id}: {e}"
                     )
 
-            # tray_uuid from cache holen
-            slot_key = f"{ams_id}-{tray_id}"
-            tray_uuid = self._slot_to_tray_uuid.get(slot_key)
-
-            # Wenn nicht im Cache: Status explizit abrufen
-            if not tray_uuid:
-                logger.info(
-                    f"tray_uuid not in cache for slot {slot_key}, "
-                    f"fetching printer status..."
-                )
-                await self._fetch_and_emit_status()
-                await asyncio.sleep(
-                    0
-                )  # Yield to event loop to let _process_slots populate cache
-                # Nochmal versuchen
-                tray_uuid = self._slot_to_tray_uuid.get(slot_key)
-
-            if not tray_uuid:
-                # Mit early return oben sollte dieser Code nie mit _sync_enabled=False erreicht werden
-                # Aber defensive Programmierung: falls doch, nur Debug-Log
-                if self._sync_enabled:
-                    logger.warning(
-                        f"Cannot link Spoolman spool {spoolman_spool_id}: "
-                        f"tray_uuid not available for slot {slot_key}. "
-                        f"AMS tray may not be initialized yet or printer firmware does not provide UUIDs."
-                    )
+            # -- Neue Spoolman-Verknüpfung setzen --
+            # Bambuddy erwartet einen spool_tag (tray_uuid oder tag_uid).
+            # Zusätzlich senden wir printer_id/ams_id/tray_id zur Identifikation.
+            synthetic_hex = (
+                f"{int(self._bambuddy_printer_id):04X}{ams_id:04X}{tray_id:08X}"
+            )
+            link_body: dict[str, Any] = {
+                "printer_id": self._bambuddy_printer_id,
+                "ams_id": ams_id,
+                "tray_id": tray_id,
+            }
+            if tray_uuid:
+                link_body["tray_uuid"] = tray_uuid
+            if rfid_uid:
+                hex_tag = self._to_hex_tag(rfid_uid)
+                if hex_tag:
+                    link_body["tag_uid"] = hex_tag
                 else:
-                    # Sollte nie erreicht werden (early return oben), aber zur Sicherheit
-                    logger.debug(
-                        f"[DEFENSIVE] Reached tray_uuid check with sync disabled - "
-                        f"this indicates a logic bug (slot {slot_key})"
+                    # rfid_uid hatte keinen verwertbaren Hex-Content
+                    logger.warning(
+                        f"rfid_uid '{rfid_uid}' for spool {spoolman_spool_id} "
+                        f"contains no hex chars, falling back to synthetic tag"
                     )
-                return
+                    link_body["tag_uid"] = synthetic_hex
+            if "tray_uuid" not in link_body and "tag_uid" not in link_body:
+                # Synthetischer Hex-Tag als Fallback wenn weder tray_uuid noch NFC-Tag
+                # Bambuddy verlangt 16 oder 32 Hex-Zeichen
+                link_body["tag_uid"] = synthetic_hex
+
+            logger.debug(
+                f"Spoolman link request for spool {spoolman_spool_id}: {link_body}"
+            )
 
             try:
                 link_resp = await self._client.post(
                     f"{self._bambuddy_url}/api/v1/spoolman/spools/{spoolman_spool_id}/link",
-                    json={"tray_uuid": tray_uuid},
+                    json=link_body,
                 )
+                link_resp.raise_for_status()
                 self.log_debug(
                     "out",
                     f"POST /api/v1/spoolman/spools/{spoolman_spool_id}/link",
                     {
                         "status": link_resp.status_code,
-                        "tray_uuid": tray_uuid,
+                        **link_body,
                     },
                 )
                 logger.info(
-                    f"Linked Spoolman spool {spoolman_spool_id} to tray {tray_uuid}"
+                    f"Linked Spoolman spool {spoolman_spool_id} to "
+                    f"printer {self._bambuddy_printer_id} tray {ams_id}/{tray_id} "
+                    f"(tag_source={tag_source})"
+                )
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    f"Spoolman link API error for spool {spoolman_spool_id}: "
+                    f"{e.response.status_code} {e.response.text}"
                 )
             except Exception as e:
                 logger.warning(
                     f"Failed to link Spoolman spool {spoolman_spool_id} "
-                    f"to tray {tray_uuid}: {e}"
+                    f"to tray {ams_id}/{tray_id}: {e}"
                 )
 
         except Exception as e:
