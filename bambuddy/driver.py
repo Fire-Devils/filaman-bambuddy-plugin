@@ -150,6 +150,8 @@ class Driver(BaseDriver):
         self._slot_to_filaman_spool: dict[str, int] = {}
         # Slot-Key ("ams_id-tray_id") → Bambu tray_uuid (für Spoolman-Link)
         self._slot_to_tray_uuid: dict[str, str] = {}
+        # Drucker-Seriennummer (für Spoolman Fallback-Tag-Berechnung)
+        self._printer_serial: str = ""
         # Letzte Sync-Statistik
         self._last_sync_count: int = 0
         self._last_sync_error: str | None = None
@@ -1225,6 +1227,8 @@ class Driver(BaseDriver):
         Bambuddy requires spool tags to be exactly 16 or 32 hex characters.
         FilaMan stores rfid_uid colon-separated (e.g. '04:f5:02:3a') which
         needs to be converted to raw uppercase hex, zero-padded.
+
+        Used for Inventory Sync payload (tag_uid field).
         """
         _HEX = set("0123456789abcdefABCDEF")
         hex_only = "".join(c for c in raw if c in _HEX)
@@ -1233,6 +1237,34 @@ class Driver(BaseDriver):
         if len(hex_only) > 16:
             return hex_only.upper().zfill(32)
         return hex_only.upper().zfill(16)
+
+    @staticmethod
+    def _hash_serial_to_hex32(serial: str) -> str:
+        """FNV-1a hash of printer serial number to 8 uppercase hex chars.
+
+        Mirrors Bambuddy frontend hashSerialToHex32() and backend
+        _hash_serial_to_hex32() exactly — deterministic tag generation.
+        """
+        input_str = (serial or "").strip().upper()
+        hash_value = 0x811C9DC5
+        for char in input_str:
+            hash_value ^= ord(char)
+            hash_value = (hash_value * 0x01000193) & 0xFFFFFFFF
+        return format(hash_value, "X").zfill(8)
+
+    def _get_fallback_spool_tag(self, ams_id: int, tray_id: int) -> str:
+        """Generate deterministic 16-hex-char spool tag from printer serial + slot.
+
+        Mirrors Bambuddy frontend getFallbackSpoolTag(serial, amsId, trayId)
+        and backend _get_fallback_spool_tag() exactly. Used for Spoolman
+        linking when the AMS tray has no Bambu Lab RFID tag (third-party spools).
+        """
+        if not self._printer_serial:
+            return ""
+        h = self._hash_serial_to_hex32(self._printer_serial)
+        a = format(max(0, ams_id), "X").zfill(4)[-4:]
+        t = format(max(0, tray_id), "X").zfill(4)[-4:]
+        return f"{h}{a}{t}"
 
     async def _handle_spoolman_linking(
         self, ams_id: int, tray_id: int, filaman_spool_id: int
@@ -1266,58 +1298,41 @@ class Driver(BaseDriver):
             # den Link-API-Call verwendet, NICHT die Bambuddy-Inventory-Spool-ID.
             spoolman_spool_id = filaman_spool_id
 
-            # -- tray_uuid optional aus Cache holen --
-            slot_key = f"{ams_id}-{tray_id}"
-            tray_uuid = self._slot_to_tray_uuid.get(slot_key)
-
-            # -- rfid_uid (NFC-Tag) aus FilaMan-Spool laden --
-            rfid_uid: str | None = None
-            try:
-                async with async_session_maker() as db:
-                    spool = await db.get(Spool, filaman_spool_id)
-                    if spool:
-                        rfid_uid = spool.rfid_uid
-            except Exception as e:
-                logger.debug(
-                    f"Could not load rfid_uid for spool {filaman_spool_id}: {e}"
+            # -- Fallback-Tag berechnen --
+            # Für Drittanbieter-Spulen (ohne Bambu-RFID) generiert das Frontend
+            # einen deterministischen Tag aus Drucker-Serial + Slot-Position.
+            # Wir verwenden exakt denselben Algorithmus (FNV-1a), damit das
+            # Frontend die Verknüpfung erkennt.
+            resolved_tag = self._get_fallback_spool_tag(ams_id, tray_id)
+            if not resolved_tag:
+                logger.warning(
+                    f"Spoolman linking skipped for spool {spoolman_spool_id}: "
+                    f"no printer serial available (needed for fallback tag)"
                 )
-
-            # -- Tag-Identifikation bestimmen --
-            # Priorität: 1. tray_uuid  2. rfid_uid (NFC)  3. synthetischer Tag
-            tag_source = "none"
-            if tray_uuid:
-                tag_source = "tray_uuid"
-            elif rfid_uid:
-                tag_source = "rfid_uid"
-            else:
-                tag_source = "synthetic"
+                return
 
             logger.debug(
-                f"Spoolman link tag resolution for slot {slot_key}: "
-                f"tray_uuid={tray_uuid}, rfid_uid={rfid_uid}, source={tag_source}"
+                f"Spoolman link tag for slot {ams_id}/{tray_id}: "
+                f"tag={resolved_tag} (fallback from serial={self._printer_serial!r})"
             )
 
             # -- Alte Spoolman-Verknüpfung erkennen und entfernen --
-            # Über die Spoolman-Linked-API abfragen (nicht Inventory-Assignments,
-            # da diese bei deaktiviertem Sync leer sind).
+            # Über die Spoolman-Linked-API abfragen. Das Format ist
+            # {"linked": {"<TAG_UPPER>": {"id": ..., ...}}}
             old_spool_id: int | None = None
             try:
-                linked = await self._bb_get("/api/v1/spoolman/spools/linked")
-                if isinstance(linked, dict):
-                    # linked ist {tag: spool_id} — Tag kann tray_uuid, rfid_uid
-                    # oder synthetischer Wert sein. Alle möglichen Tags prüfen.
-                    # Synthetischer Tag basiert auf spool_id (nie all-zero)
-                    synthetic_tag = f"{spoolman_spool_id:016X}"
-                    # rfid_uid als Hex normalisiert
-                    rfid_hex = self._to_hex_tag(rfid_uid) if rfid_uid else None
-                    for tag_candidate in (tray_uuid, rfid_hex, synthetic_tag):
-                        if tag_candidate:
-                            old_id = linked.get(tag_candidate)
-                            if old_id is not None:
-                                old_id_int = int(old_id)
-                                if old_id_int != spoolman_spool_id:
-                                    old_spool_id = old_id_int
-                                break  # Gefunden — nicht weitersuchen
+                linked_resp = await self._bb_get("/api/v1/spoolman/spools/linked")
+                if isinstance(linked_resp, dict):
+                    linked_map = linked_resp.get("linked", linked_resp)
+                    existing = linked_map.get(resolved_tag.upper())
+                    if existing is not None:
+                        # existing kann int oder dict mit "id" sein
+                        if isinstance(existing, dict):
+                            existing_id = int(existing.get("id", 0))
+                        else:
+                            existing_id = int(existing)
+                        if existing_id and existing_id != spoolman_spool_id:
+                            old_spool_id = existing_id
             except Exception as e:
                 logger.debug(f"Could not fetch linked spools for unlink check: {e}")
 
@@ -1343,21 +1358,10 @@ class Driver(BaseDriver):
                     )
 
             # -- Neue Spoolman-Verknüpfung setzen --
-            # Bambuddy prüft: spool_tag > tray_uuid > tag_uid (OR-Kette).
-            # Wir senden immer als spool_tag (höchste Prio), so wie Bambuddys
-            # eigenes Frontend es auch macht.
-            # Tag-Auflösung: tray_uuid > rfid_uid (hex) > spool_id als Fake-Hex
-            resolved_tag: str = ""
-            if tray_uuid:
-                resolved_tag = tray_uuid
-            elif rfid_uid:
-                resolved_tag = self._to_hex_tag(rfid_uid)
-            if not resolved_tag:
-                # Synthetischer Tag aus spool_id — immer 16 Hex, nie all-zero
-                # (da spool_id > 0)
-                resolved_tag = f"{spoolman_spool_id:016X}"
-                tag_source = "synthetic"
-
+            # Bambuddy speichert den Tag als extra.tag auf dem Spoolman-Spool.
+            # Das Frontend schaut dann per getFallbackSpoolTag() nach genau
+            # diesem Tag. Wir senden als spool_tag (höchste Prio in der
+            # OR-Kette: spool_tag > tray_uuid > tag_uid).
             link_body: dict[str, Any] = {
                 "spool_tag": resolved_tag,
                 "printer_id": self._bambuddy_printer_id,
@@ -1386,7 +1390,7 @@ class Driver(BaseDriver):
                 logger.info(
                     f"Linked Spoolman spool {spoolman_spool_id} to "
                     f"printer {self._bambuddy_printer_id} tray {ams_id}/{tray_id} "
-                    f"(tag_source={tag_source})"
+                    f"(tag={resolved_tag})"
                 )
             except httpx.HTTPStatusError as e:
                 logger.error(
@@ -1527,6 +1531,28 @@ class Driver(BaseDriver):
         """Initialen Drucker-Status von Bambuddy REST-API laden und als slots_update emittieren."""
         if not self._client or not self._bambuddy_printer_id:
             return
+
+        # -- Printer-Seriennummer laden (für Spoolman Fallback-Tag) --
+        if not self._printer_serial:
+            try:
+                pr = await self._client.get(
+                    f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}"
+                )
+                if pr.status_code == 200:
+                    self._printer_serial = pr.json().get("serial_number", "")
+                    if self._printer_serial:
+                        logger.info(
+                            f"Loaded printer serial '{self._printer_serial}' "
+                            f"for Bambuddy printer {self._bambuddy_printer_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Bambuddy printer {self._bambuddy_printer_id} "
+                            f"has no serial_number — Spoolman fallback tag unavailable"
+                        )
+            except Exception as e:
+                logger.warning(f"Could not fetch printer serial: {e}")
+
         try:
             r = await self._client.get(
                 f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
