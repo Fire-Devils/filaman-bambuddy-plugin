@@ -1306,10 +1306,11 @@ class Driver(BaseDriver):
                 if isinstance(linked, dict):
                     # linked ist {tag: spool_id} — Tag kann tray_uuid, rfid_uid
                     # oder synthetischer Wert sein. Alle möglichen Tags prüfen.
-                    synthetic_tag = (
-                        f"{int(self._bambuddy_printer_id):04X}{ams_id:04X}{tray_id:08X}"
-                    )
-                    for tag_candidate in (tray_uuid, rfid_uid, synthetic_tag):
+                    # Synthetischer Tag basiert auf spool_id (nie all-zero)
+                    synthetic_tag = f"{spoolman_spool_id:016X}"
+                    # rfid_uid als Hex normalisiert
+                    rfid_hex = self._to_hex_tag(rfid_uid) if rfid_uid else None
+                    for tag_candidate in (tray_uuid, rfid_hex, synthetic_tag):
                         if tag_candidate:
                             old_id = linked.get(tag_candidate)
                             if old_id is not None:
@@ -1342,33 +1343,27 @@ class Driver(BaseDriver):
                     )
 
             # -- Neue Spoolman-Verknüpfung setzen --
-            # Bambuddy erwartet einen spool_tag (tray_uuid oder tag_uid).
-            # Zusätzlich senden wir printer_id/ams_id/tray_id zur Identifikation.
-            synthetic_hex = (
-                f"{int(self._bambuddy_printer_id):04X}{ams_id:04X}{tray_id:08X}"
-            )
+            # Bambuddy prüft: spool_tag > tray_uuid > tag_uid (OR-Kette).
+            # Wir senden immer als spool_tag (höchste Prio), so wie Bambuddys
+            # eigenes Frontend es auch macht.
+            # Tag-Auflösung: tray_uuid > rfid_uid (hex) > spool_id als Fake-Hex
+            resolved_tag: str = ""
+            if tray_uuid:
+                resolved_tag = tray_uuid
+            elif rfid_uid:
+                resolved_tag = self._to_hex_tag(rfid_uid)
+            if not resolved_tag:
+                # Synthetischer Tag aus spool_id — immer 16 Hex, nie all-zero
+                # (da spool_id > 0)
+                resolved_tag = f"{spoolman_spool_id:016X}"
+                tag_source = "synthetic"
+
             link_body: dict[str, Any] = {
+                "spool_tag": resolved_tag,
                 "printer_id": self._bambuddy_printer_id,
                 "ams_id": ams_id,
                 "tray_id": tray_id,
             }
-            if tray_uuid:
-                link_body["tray_uuid"] = tray_uuid
-            if rfid_uid:
-                hex_tag = self._to_hex_tag(rfid_uid)
-                if hex_tag:
-                    link_body["tag_uid"] = hex_tag
-                else:
-                    # rfid_uid hatte keinen verwertbaren Hex-Content
-                    logger.warning(
-                        f"rfid_uid '{rfid_uid}' for spool {spoolman_spool_id} "
-                        f"contains no hex chars, falling back to synthetic tag"
-                    )
-                    link_body["tag_uid"] = synthetic_hex
-            if "tray_uuid" not in link_body and "tag_uid" not in link_body:
-                # Synthetischer Hex-Tag als Fallback wenn weder tray_uuid noch NFC-Tag
-                # Bambuddy verlangt 16 oder 32 Hex-Zeichen
-                link_body["tag_uid"] = synthetic_hex
 
             logger.debug(
                 f"Spoolman link request for spool {spoolman_spool_id}: {link_body}"
