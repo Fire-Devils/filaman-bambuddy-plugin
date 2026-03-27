@@ -304,6 +304,8 @@ class Driver(BaseDriver):
         if self._sync_enabled:
             # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
             await self._sync_all_spools()
+            # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
+            await self._restore_slot_cache_from_assignments()
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
@@ -574,6 +576,61 @@ class Driver(BaseDriver):
                         )
                     )
             await db.commit()
+
+    async def _store_original_location_db(
+        self, filaman_spool_id: int, location_id: int | None
+    ) -> None:
+        """Persistiert die Original-Location einer Spule vor AMS-Zuweisung.
+
+        Wird beim Startup genutzt, um _spool_original_location wiederherzustellen,
+        da der In-Memory-Cache bei Plugin-Neustart verloren geht.
+        """
+        if location_id is None:
+            return
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.spool_id == filaman_spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "original_location_id",
+                    )
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.param_value = str(location_id)
+                else:
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=filaman_spool_id,
+                            printer_id=self.printer_id,
+                            param_key="original_location_id",
+                            param_value=str(location_id),
+                        )
+                    )
+                await db.commit()
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist original location for spool {filaman_spool_id}: {e}"
+            )
+
+    async def _delete_original_location_db(self, filaman_spool_id: int) -> None:
+        """Entfernt den persistierten Original-Location-Eintrag nach Restore."""
+        try:
+            async with async_session_maker() as db:
+                await db.execute(
+                    delete(SpoolPrinterParam).where(
+                        SpoolPrinterParam.spool_id == filaman_spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "original_location_id",
+                    )
+                )
+                await db.commit()
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete original location param for spool "
+                f"{filaman_spool_id}: {e}"
+            )
 
     async def _report_consumption_db(
         self, filaman_spool_id: int, delta_g: float
@@ -1012,7 +1069,9 @@ class Driver(BaseDriver):
         # -- Alte Spule aus Standort entfernen wenn Slot überschrieben wird --
         old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
         if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
-            # Alte Spule aus diesem Slot entfernen
+            # Slot SOFORT freigeben, damit der Restore-Task den Guard in
+            # _restore_spool_location() nicht als "noch aktiv" interpretiert
+            del self._slot_to_filaman_spool[slot_key]
             _t = asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
             _t.add_done_callback(self._on_task_done)
             logger.info(
@@ -1025,8 +1084,11 @@ class Driver(BaseDriver):
             try:
                 async with async_session_maker() as db:
                     spool = await db.get(Spool, filaman_spool_id)
-                    self._spool_original_location[filaman_spool_id] = (
-                        spool.location_id if spool else None
+                    original_loc = spool.location_id if spool else None
+                    self._spool_original_location[filaman_spool_id] = original_loc
+                    # Original-Location in DB persistieren (überlebt Plugin-Neustart)
+                    await self._store_original_location_db(
+                        filaman_spool_id, original_loc
                     )
             except Exception as e:
                 logger.warning(
@@ -1431,6 +1493,8 @@ class Driver(BaseDriver):
                         source="driver",
                         note="Restored from AMS tray",
                     )
+            # Persistierten Original-Location-Eintrag aufräumen
+            await self._delete_original_location_db(filaman_spool_id)
         except Exception as e:
             logger.warning(f"Failed to restore spool {filaman_spool_id} location: {e}")
 
@@ -1500,9 +1564,12 @@ class Driver(BaseDriver):
                     logger.debug(
                         f"Spool {filaman_spool_id} already at location '{slot_location_name}'"
                     )
+                    # Nur ggf. neu erstellte Location persistieren (kein Move nötig)
+                    await db.commit()
                     return
 
                 # SpoolService für konsistente Event-Generierung nutzen
+                # (move_location() committet intern — inkl. gefluschter Location)
                 await SpoolService(db).move_location(
                     spool,
                     location.id,
@@ -1510,9 +1577,6 @@ class Driver(BaseDriver):
                     source="driver",
                     note=f"Assigned to {slot_location_name}",
                 )
-
-                # Einmaliger commit für beide Operationen (Location + Move)
-                await db.commit()
 
                 logger.info(
                     f"Moved spool {filaman_spool_id} to location '{slot_location_name}' "
@@ -1527,6 +1591,86 @@ class Driver(BaseDriver):
             )
 
     # -- Initialer Status-Fetch -----------------------------------------------
+
+    async def _restore_slot_cache_from_assignments(self) -> None:
+        """Stellt _slot_to_filaman_spool und _spool_original_location beim Start wieder her.
+
+        Nutzt Bambuddys GET /api/v1/inventory/assignments um zu erfahren, welche
+        Spulen aktuell welchen AMS-Slots zugewiesen sind. Über SpoolPrinterParam
+        wird die bambuddy_spool_id auf die filaman_spool_id zurückgemappt.
+        """
+        if not self._client or not self._bambuddy_printer_id:
+            return
+
+        try:
+            assignments = await self._bb_get(
+                "/api/v1/inventory/assignments",
+                params={"printer_id": self._bambuddy_printer_id},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch assignments for cache recovery: {e}")
+            return
+
+        if not assignments:
+            return
+
+        # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup aufbauen
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                    )
+                )
+                bb_params = result.scalars().all()
+                bb_to_filaman: dict[int, int] = {
+                    int(p.param_value): p.spool_id for p in bb_params
+                }
+
+                # Original-Location-Einträge laden
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "original_location_id",
+                    )
+                )
+                loc_params = result.scalars().all()
+                orig_locs: dict[int, int] = {
+                    p.spool_id: int(p.param_value) for p in loc_params
+                }
+        except Exception as e:
+            logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
+            return
+
+        recovered = 0
+        for assignment in assignments:
+            bb_spool_id = assignment.get("spool_id")
+            ams_id = assignment.get("ams_id")
+            tray_id = assignment.get("tray_id")
+
+            if bb_spool_id is None or ams_id is None or tray_id is None:
+                continue
+
+            filaman_spool_id = bb_to_filaman.get(bb_spool_id)
+            if not filaman_spool_id:
+                continue
+
+            slot_key = f"{ams_id}-{tray_id}"
+            self._slot_to_filaman_spool[slot_key] = filaman_spool_id
+
+            # Original-Location aus DB wiederherstellen
+            if filaman_spool_id in orig_locs:
+                self._spool_original_location[filaman_spool_id] = orig_locs[
+                    filaman_spool_id
+                ]
+
+            recovered += 1
+
+        if recovered:
+            logger.info(
+                f"Recovered {recovered} slot-to-spool assignments from Bambuddy API"
+            )
 
     async def _fetch_and_emit_status(self) -> None:
         """Initialen Drucker-Status von Bambuddy REST-API laden und als slots_update emittieren."""
