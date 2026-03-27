@@ -1283,48 +1283,6 @@ class Driver(BaseDriver):
         _t = asyncio.create_task(_delayed_refetch())
         _t.add_done_callback(self._on_task_done)
 
-    # -- K-Profil-Lookup vom Drucker ----------------------------------------
-
-    async def _lookup_default_kprofile(self, filament_id: str) -> int:
-        """Fragt die K-Profile des Druckers ab und sucht das Standard-Profil
-        für die gegebene filament_id (z.B. "GFL99").
-
-        Gibt den ``cali_idx`` (slot_id) des gefundenen Profils zurück,
-        oder ``-1`` wenn kein passendes Profil gefunden wird.
-        """
-        if not self._client or not self._bambuddy_printer_id:
-            return -1
-
-        try:
-            r = await self._client.get(
-                f"{self._bambuddy_url}/api/v1/printers/"
-                f"{self._bambuddy_printer_id}/kprofiles/"
-            )
-            r.raise_for_status()
-            data = r.json()
-            profiles = data.get("profiles") or []
-
-            for p in profiles:
-                if p.get("filament_id") == filament_id:
-                    slot_id = p.get("slot_id")
-                    if slot_id is not None and slot_id >= 0:
-                        logger.debug(
-                            "K-profile match for %s: slot_id=%s, k=%s",
-                            filament_id,
-                            slot_id,
-                            p.get("k_value"),
-                        )
-                        return int(slot_id)
-
-            logger.debug(
-                "No K-profile found for filament_id=%s, using default (-1)",
-                filament_id,
-            )
-        except Exception as exc:
-            logger.warning("K-profile lookup failed, using default (-1): %s", exc)
-
-        return -1
-
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
     async def _send_assignment(
@@ -1381,15 +1339,10 @@ class Driver(BaseDriver):
         # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
         k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
 
-        # -- K-Profil-Auswahl (cali_idx) --
-        # Wenn die Spule einen expliziten cali_idx mitbringt, diesen verwenden.
-        # Ansonsten: Standard-K-Profil für den Filament-Typ vom Drucker abfragen.
-        user_cali_idx = _int_or_none(filament_data.get("bambu_cali_idx"))
-        if user_cali_idx is not None:
-            cali_idx = user_cali_idx
-        else:
-            # K-Profile vom Drucker abfragen und nach filament_id matchen
-            cali_idx = await self._lookup_default_kprofile(slicer_filament)
+        # cali_idx: Aus Zusatzfeldern der Spule, oder -1 (Drucker-Default)
+        cali_idx = _int_or_none(filament_data.get("bambu_cali_idx"))
+        if cali_idx is None:
+            cali_idx = -1
 
         configure_params: dict[str, Any] = {
             "tray_info_idx": slicer_filament,
