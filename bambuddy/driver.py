@@ -1354,10 +1354,26 @@ class Driver(BaseDriver):
             "nozzle_diameter": "0.4",
             "setting_id": filament_data.get("bambu_setting_id") or "",
             "kprofile_filament_id": slicer_filament,
+            "kprofile_setting_id": filament_data.get("bambu_setting_id") or "",
             "k_value": k_value,  # 0.0 = skip
         }
 
         try:
+            # Slot erst resetten, damit altes K-Profil / Filament-Profil sauber
+            # entfernt wird bevor die neue Konfiguration gesetzt wird.
+            reset_url = (
+                f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}"
+                f"/ams/{ams_id}/tray/{tray_id}/reset"
+            )
+            r_reset = await self._client.post(reset_url)
+            r_reset.raise_for_status()
+            self.log_debug(
+                "out",
+                f"POST /api/v1/printers/{self._bambuddy_printer_id}/ams/{ams_id}/tray/{tray_id}/reset",
+                {},
+            )
+
+            # Neue Konfiguration setzen
             r = await self._client.post(
                 f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}"
                 f"/slots/{ams_id}/{tray_id}/configure",
