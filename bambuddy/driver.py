@@ -882,10 +882,11 @@ class Driver(BaseDriver):
                             break
                         try:
                             event = json.loads(message)
-                            logger.info(
-                                f"WS message received (type={json.loads(message).get('type')})"
+                            self.log_debug(
+                                "in",
+                                f"ws/{event.get('type', 'unknown')}",
+                                event,
                             )
-                            logger.debug(f"WS message full payload: {event}")
                             await self._handle_ws_event(event)
                         except Exception as e:
                             logger.warning(f"WS message handling error: {e}")
@@ -1554,11 +1555,12 @@ class Driver(BaseDriver):
                 logger.warning(f"Could not fetch printer serial: {e}")
 
         try:
-            r = await self._client.get(
-                f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
-            )
+            status_url = f"/api/v1/printers/{self._bambuddy_printer_id}/status"
+            self.log_debug("out", f"GET {status_url}", {})
+            r = await self._client.get(f"{self._bambuddy_url}{status_url}")
             if r.status_code == 200:
                 status_data = r.json()
+                self.log_debug("in", f"GET {status_url}", status_data)
                 self._printer_connected = status_data.get("connected", False)
                 self._process_slots(status_data)
                 logger.info(
