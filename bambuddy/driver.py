@@ -18,6 +18,7 @@ Flows:
 import asyncio
 import json
 import logging
+import pathlib
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar
@@ -58,6 +59,112 @@ _GENERIC_SLICER_IDS: dict[str, str] = {
     "PC": "GFC99",
     "PP": "GFP97",
 }
+
+# Reverse-Lookup: Anzeigename → Slicer-Code (z.B. "Generic PLA" → "GFL99")
+# FilaMan-Dropdowns speichern den Anzeigenamen, nicht den Key aus bambu_filaments.json.
+_FILAMENTS_FILE = pathlib.Path(__file__).parent / "bambu_filaments.json"
+_FILAMENT_IDX_TO_NAME: dict[str, str] = {}  # "GFL99" → "Generic PLA"
+_FILAMENT_NAME_TO_IDX: dict[str, str] = {}  # "Generic PLA" → "GFL99"
+if _FILAMENTS_FILE.exists():
+    _raw = json.loads(_FILAMENTS_FILE.read_text(encoding="utf-8"))
+    _FILAMENT_IDX_TO_NAME = {k: v for k, v in _raw.items() if not k.startswith("_")}
+    _FILAMENT_NAME_TO_IDX = {v: k for k, v in _FILAMENT_IDX_TO_NAME.items()}
+
+
+def _resolve_slicer_id(raw_value: str | None, material: str) -> str:
+    """Löst einen Bambu Slicer-Code aus einem Rohwert auf.
+
+    Der Rohwert kann sein:
+    - Ein gültiger Slicer-Code (z.B. "GFL99") → wird direkt zurückgegeben
+    - Ein Anzeigename aus dem Dropdown (z.B. "Generic PLA") → Reverse-Lookup
+    - None/leer → generischer Fallback anhand des Material-Typs
+
+    Returns:
+        Gültiger Bambu Slicer-Code (z.B. "GFL99").
+    """
+    if not raw_value:
+        return _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
+    # Bereits ein gültiger Slicer-Code?
+    if raw_value in _FILAMENT_IDX_TO_NAME:
+        return raw_value
+    # Reverse-Lookup: Anzeigename → Code
+    if raw_value in _FILAMENT_NAME_TO_IDX:
+        return _FILAMENT_NAME_TO_IDX[raw_value]
+    # Unbekannter Wert: Material-basierter Fallback
+    return _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
+
+
+# Normalisierung von FilaMan-Materialtypen auf Bambu-Basistypen für tray_type.
+# Der Drucker erwartet den Basistyp (z.B. "PLA"), nicht Varianten wie "PLA+" oder "PLA-CF".
+_MATERIAL_TYPE_NORMALIZE: dict[str, str] = {
+    # PLA-Varianten
+    "PLA+": "PLA",
+    "PLA-CF": "PLA",
+    "PLA SILK": "PLA",
+    "PLA MATTE": "PLA",
+    "PLA GLOW": "PLA",
+    "PLA WOOD": "PLA",
+    "PLA MARBLE": "PLA",
+    "PLA METAL": "PLA",
+    "PLA GALAXY": "PLA",
+    "PLA SPARKLE": "PLA",
+    "PLA HIGH SPEED": "PLA",
+    # PETG-Varianten
+    "PETG-CF": "PETG",
+    "PETG HF": "PETG",
+    "PCTG": "PETG",
+    # ABS/ASA-Varianten
+    "ABS-GF": "ABS",
+    "ASA-CF": "ASA",
+    # PA/Nylon-Varianten
+    "PA-CF": "PA",
+    "PA6-CF": "PA",
+    "PA6-GF": "PA",
+    "PA12-CF": "PA",
+    "PA612-CF": "PA",
+    "PAHT-CF": "PA",
+    "PPA-CF": "PA",
+    "PPA-GF": "PA",
+    "NYLON": "PA",
+    # TPU-Varianten
+    "TPU 95A": "TPU",
+    "TPU 95A HF": "TPU",
+    "TPU 90A": "TPU",
+    "TPU 85A": "TPU",
+    "TPU FOR AMS": "TPU",
+    # PC-Varianten
+    "PC FR": "PC",
+    # PET-Varianten
+    "PET-CF": "PET",
+    # PPS-Varianten
+    "PPS-CF": "PPS",
+    # PP-Varianten
+    "PP-CF": "PP",
+    "PP-GF": "PP",
+    # PE-Varianten
+    "PE-CF": "PE",
+    # Support-Materialien
+    "SUPPORT": "PLA",
+    "SUPPORT G": "PLA",
+    "SUPPORT W": "PLA",
+    "SUPPORT FOR PLA": "PLA",
+    "SUPPORT FOR PLA/PETG": "PLA",
+    "SUPPORT FOR PA/PET": "PA",
+    "SUPPORT FOR ABS": "ABS",
+}
+
+
+def _normalize_tray_type(material: str) -> str:
+    """Normalisiert einen FilaMan-Materialtyp auf den Bambu-Basistyp.
+
+    Args:
+        material: Materialtyp aus FilaMan (z.B. "PLA+", "PETG-CF", "PA6-CF")
+
+    Returns:
+        Bambu-Basistyp (z.B. "PLA", "PETG", "PA")
+    """
+    upper = material.upper().strip()
+    return _MATERIAL_TYPE_NORMALIZE.get(upper, upper)
 
 
 def _int_or_none(v: Any) -> int | None:
@@ -715,8 +822,11 @@ class Driver(BaseDriver):
         if spool.rfid_uid:
             payload["tag_uid"] = self._to_hex_tag(spool.rfid_uid)
 
-        if slicer := pp.get("bambu_idx") or pp.get("bambu_tray_idx"):
-            payload["slicer_filament"] = slicer
+        raw_slicer = pp.get("bambu_idx") or pp.get("bambu_tray_idx")
+        if raw_slicer:
+            payload["slicer_filament"] = _resolve_slicer_id(
+                raw_slicer, payload["material"]
+            )
 
         if (nozzle_min := _int_or_none(pp.get("bambu_nozzle_temp_min"))) is not None:
             payload["nozzle_temp_min"] = nozzle_min
@@ -1204,15 +1314,19 @@ class Driver(BaseDriver):
         color = color.upper()
 
         # -- Bambu Material Index (slicer_filament = tray_info_idx) --
-        material = filament_data.get("material_type", "PLA")
-        slicer_filament = (
-            filament_data.get("bambu_idx")
-            or filament_data.get("bambu_tray_idx")
-            or _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
+        material_raw = filament_data.get("material_type", "PLA")
+        material = _normalize_tray_type(material_raw)  # z.B. "PLA+" → "PLA"
+        slicer_filament = _resolve_slicer_id(
+            filament_data.get("bambu_idx") or filament_data.get("bambu_tray_idx"),
+            material,
         )
 
-        # tray_sub_brands: sub-brand/profile-name (z.B. "PLA Basic", "PETG HF")
-        tray_sub_brands = filament_data.get("material_subgroup") or material
+        # tray_sub_brands: Filament-Anzeigename aus Lookup oder Fallback auf Material
+        tray_sub_brands = (
+            filament_data.get("material_subgroup")
+            or _FILAMENT_IDX_TO_NAME.get(slicer_filament)
+            or material_raw
+        )
 
         # -- Temperaturen --
         nozzle_temp_min = _int_or_none(
