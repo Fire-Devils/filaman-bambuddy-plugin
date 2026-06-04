@@ -277,6 +277,12 @@ class Driver(BaseDriver):
         self._syncing: bool = False
         self._debounce_task: asyncio.Task | None = None
 
+        # -- Pending Spool (auto-assign via scale RFID scan) --
+        self._pending_spool_id: int | None = None
+        self._pending_filament_data: dict | None = None
+        self._pending_rfid_hex: str | None = None
+        self._pending_timer: asyncio.Task | None = None
+
         # -- Task Restart Management --
         self._ws_restart_count: int = 0
         self._sync_restart_count: int = 0
@@ -455,6 +461,7 @@ class Driver(BaseDriver):
         self._ws_task = self._sync_task = None
         self._ws_connected = False
         self._printer_connected = False
+        self._clear_pending()
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -1008,6 +1015,68 @@ class Driver(BaseDriver):
             await self._do_sync_inner()
             self._url_last_sync[self._bambuddy_url] = time.monotonic()
             logger.info(f"Full resync complete for URL {self._bambuddy_url}")
+
+    # -- Pending Spool (auto-assign) -----------------------------------------
+
+    async def assign_pending_spool(
+        self,
+        spool_id: int,
+        filament_data: dict,
+        slot_index: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """Mark a spool as pending for the next AMS tray insertion.
+
+        Called by Filaman's auto-assign flow when the scale scans a spool RFID.
+        Stores the spool ID and preloads its rfid_uid so _process_slots can
+        match it against incoming tray data from Bambuddy's WebSocket.
+        """
+        if self._pending_timer and not self._pending_timer.done():
+            self._pending_timer.cancel()
+
+        rfid_hex: str | None = None
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, spool_id)
+                if spool and spool.rfid_uid:
+                    rfid_hex = self._to_hex_tag(spool.rfid_uid)
+        except Exception as e:
+            logger.warning(f"Could not load rfid_uid for pending spool {spool_id}: {e}")
+
+        self._pending_spool_id = spool_id
+        self._pending_filament_data = {**filament_data}
+        self._pending_rfid_hex = rfid_hex
+
+        effective_timeout = timeout_seconds if timeout_seconds is not None else 300
+        self._pending_timer = asyncio.create_task(
+            self._pending_timeout(effective_timeout)
+        )
+        self._pending_timer.add_done_callback(self._on_task_done)
+        logger.info(
+            f"Pending spool {spool_id} set for printer {self.printer_id} "
+            f"(rfid={rfid_hex}, timeout={effective_timeout}s)"
+        )
+
+    async def _pending_timeout(self, timeout: int) -> None:
+        await asyncio.sleep(timeout)
+        if self._pending_spool_id is not None:
+            logger.info(
+                f"Pending spool {self._pending_spool_id} timed out "
+                f"on printer {self.printer_id}"
+            )
+        self._pending_spool_id = None
+        self._pending_filament_data = None
+        self._pending_rfid_hex = None
+        self._pending_timer = None
+
+    def _clear_pending(self) -> None:
+        """Clear pending spool state and cancel timeout."""
+        if self._pending_timer and not self._pending_timer.done():
+            self._pending_timer.cancel()
+        self._pending_spool_id = None
+        self._pending_filament_data = None
+        self._pending_rfid_hex = None
+        self._pending_timer = None
 
     # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
 
@@ -1916,6 +1985,41 @@ class Driver(BaseDriver):
                     }
                 )
 
+                # Pending spool: fire send_filament_to_tray when a spool is inserted.
+                #
+                # Two strategies in priority order:
+                # 1. RFID match — tray tag_uid equals pending spool's rfid_uid.
+                #    Works for genuine Bambu spools whose NFC the AMS can read.
+                # 2. Slot-appeared match — slot transitioned empty → occupied.
+                #    Works for all third-party spools (tag_uid stays null because
+                #    the AMS cannot read external RFID stickers; only the scale can).
+                if self._pending_spool_id is not None and tray_type:
+                    tray_tag_uid = (tray.get("tag_uid") or "").upper()
+                    prev_slot = next(
+                        (s for s in self._current_slots if s["slot_index"] == slot_index),
+                        None,
+                    )
+                    slot_was_empty = prev_slot is None or not prev_slot.get("present", False)
+
+                    rfid_matched = bool(
+                        tray_tag_uid
+                        and self._pending_rfid_hex
+                        and tray_tag_uid == self._pending_rfid_hex
+                    )
+                    # For third-party spools tag_uid is null; fall back to slot transition.
+                    slot_matched = slot_was_empty and not tray_tag_uid
+
+                    if rfid_matched or slot_matched:
+                        reason = "rfid" if rfid_matched else "slot-appeared"
+                        logger.info(
+                            f"Pending spool {self._pending_spool_id} matched "
+                            f"AMS {ams_id}/tray {tray_id} ({reason})"
+                        )
+                        self.send_filament_to_tray(
+                            ams_id, tray_id, {**self._pending_filament_data}
+                        )
+                        self._clear_pending()
+
         ext_slots: list[dict[str, Any]] = []
         for vt in vt_tray_list:
             vt_id = int(vt.get("id", 254))
@@ -1971,6 +2075,34 @@ class Driver(BaseDriver):
                     "present": bool(vt_type),
                 }
             )
+
+            # Pending spool matching for external/bypass tray — same logic as AMS trays
+            if self._pending_spool_id is not None and vt_type:
+                vt_tag_uid = (vt.get("tag_uid") or "").upper()
+                prev_vt = next(
+                    (s for s in self._current_slots if s["slot_index"] == vt_idx),
+                    None,
+                )
+                vt_was_empty = prev_vt is None or not prev_vt.get("present", False)
+
+                rfid_matched = bool(
+                    vt_tag_uid
+                    and self._pending_rfid_hex
+                    and vt_tag_uid == self._pending_rfid_hex
+                )
+                slot_matched = vt_was_empty and not vt_tag_uid
+
+                if rfid_matched or slot_matched:
+                    reason = "rfid" if rfid_matched else "slot-appeared"
+                    ams_id_ext, tray_id_ext = 255, vt_id
+                    logger.info(
+                        f"Pending spool {self._pending_spool_id} matched "
+                        f"external tray {ams_id_ext}/{tray_id_ext} ({reason})"
+                    )
+                    self.send_filament_to_tray(
+                        ams_id_ext, tray_id_ext, {**self._pending_filament_data}
+                    )
+                    self._clear_pending()
 
         self._current_ams_units = ams_units
         has_external = len(ext_slots) > 0
@@ -2035,6 +2167,7 @@ class Driver(BaseDriver):
             "connected": self._ws_connected and self._printer_connected,
             "tasks_healthy": tasks_healthy,
             "task_status": task_status,
+            "pending": self._pending_spool_id is not None,
             "bambuddy_printer_id": self._bambuddy_printer_id,
             "ams_count": len(self._current_ams_units),
             "slot_count": total_slots,
