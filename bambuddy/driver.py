@@ -1385,10 +1385,26 @@ class Driver(BaseDriver):
         # -- Bambu Material Index (slicer_filament = tray_info_idx) --
         material_raw = filament_data.get("material_type", "PLA")
         material = _normalize_tray_type(material_raw)  # z.B. "PLA+" → "PLA"
-        slicer_filament = _resolve_slicer_id(
-            filament_data.get("bambu_idx") or filament_data.get("bambu_tray_idx"),
-            material,
-        )
+
+        # Prefer the Bambuddy inventory spool's slicer_filament — set when the user
+        # manually configures a slot via the Bambuddy UI with a cloud-synced profile.
+        # This is the same profile the manual "Configure" action in Bambuddy uses.
+        bambu_idx_hint = filament_data.get("bambu_idx") or filament_data.get("bambu_tray_idx")
+        if not bambu_idx_hint:
+            bb_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
+            if bb_spool_id and self._client:
+                try:
+                    bb_spool = await self._bb_get(f"/api/v1/inventory/spools/{bb_spool_id}")
+                    bambu_idx_hint = bb_spool.get("slicer_filament") or None
+                    if bambu_idx_hint:
+                        logger.info(
+                            f"Using Bambuddy spool {bb_spool_id} slicer_filament "
+                            f"{bambu_idx_hint!r} for slot {ams_id}/{tray_id}"
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not fetch Bambuddy spool {bb_spool_id}: {e}")
+
+        slicer_filament = _resolve_slicer_id(bambu_idx_hint, material)
 
         # tray_sub_brands: Filament-Anzeigename aus Lookup oder Fallback auf Material
         tray_sub_brands = (
