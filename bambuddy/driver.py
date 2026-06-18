@@ -31,7 +31,7 @@ from app.core.database import async_session_maker
 from app.models.filament import Filament, FilamentColor
 from app.models.location import Location
 from app.models.printer import Printer
-from app.models.printer_params import SpoolPrinterParam
+from app.models.printer_params import FilamentPrinterParam, SpoolPrinterParam
 from app.models.spool import Spool, SpoolStatus
 from app.services.spool_service import SpoolService
 
@@ -59,6 +59,8 @@ _GENERIC_SLICER_IDS: dict[str, str] = {
     "PC": "GFC99",
     "PP": "GFP97",
 }
+# Frozenset for O(1) "is this a generic fallback?" checks
+_GENERIC_SLICER_ID_SET: frozenset[str] = frozenset(_GENERIC_SLICER_IDS.values())
 
 # Reverse-Lookup: Anzeigename → Slicer-Code (z.B. "Generic PLA" → "GFL99")
 # FilaMan-Dropdowns speichern den Anzeigenamen, nicht den Key aus bambu_filaments.json.
@@ -90,6 +92,9 @@ def _resolve_slicer_id(raw_value: str | None, material: str) -> str:
     # Reverse-Lookup: Anzeigename → Code
     if raw_value in _FILAMENT_NAME_TO_IDX:
         return _FILAMENT_NAME_TO_IDX[raw_value]
+    # Sieht wie ein gültiger Slicer-Code aus (z.B. "SUN20019") → direkt verwenden
+    if raw_value.isalnum() and raw_value == raw_value.upper() and len(raw_value) >= 3:
+        return raw_value
     # Unbekannter Wert: Material-basierter Fallback
     return _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
 
@@ -100,6 +105,10 @@ _MATERIAL_TYPE_NORMALIZE: dict[str, str] = {
     # PLA-Varianten
     "PLA+": "PLA",
     "PLA-CF": "PLA",
+    "PLA-PLUS": "PLA",
+    "PLA+/PRO": "PLA",
+    "PLA+WOOD": "PLA",
+    "APLA": "PLA",
     "PLA SILK": "PLA",
     "PLA MATTE": "PLA",
     "PLA GLOW": "PLA",
@@ -109,20 +118,28 @@ _MATERIAL_TYPE_NORMALIZE: dict[str, str] = {
     "PLA GALAXY": "PLA",
     "PLA SPARKLE": "PLA",
     "PLA HIGH SPEED": "PLA",
+    "WOOD": "PLA",
     # PETG-Varianten
     "PETG-CF": "PETG",
+    "PETG-PLUS": "PETG",
     "PETG HF": "PETG",
     "PCTG": "PETG",
     # ABS/ASA-Varianten
     "ABS-GF": "ABS",
+    "ABS-PLUS": "ABS",
     "ASA-CF": "ASA",
+    "ASA-PLUS": "ASA",
     # PA/Nylon-Varianten
     "PA-CF": "PA",
+    "PA6": "PA",
     "PA6-CF": "PA",
     "PA6-GF": "PA",
+    "PA12": "PA",
     "PA12-CF": "PA",
     "PA612-CF": "PA",
+    "PAHT": "PA",
     "PAHT-CF": "PA",
+    "PPA": "PA",
     "PPA-CF": "PA",
     "PPA-GF": "PA",
     "NYLON": "PA",
@@ -131,11 +148,17 @@ _MATERIAL_TYPE_NORMALIZE: dict[str, str] = {
     "TPU 95A HF": "TPU",
     "TPU 90A": "TPU",
     "TPU 85A": "TPU",
+    "TPU-85A": "TPU",
+    "TPU-90A": "TPU",
+    "TPU-95A": "TPU",
     "TPU FOR AMS": "TPU",
     # PC-Varianten
     "PC FR": "PC",
+    "PC-ABS": "PC",
     # PET-Varianten
     "PET-CF": "PET",
+    # PVA/PVB-Varianten
+    "PVB": "PVA",
     # PPS-Varianten
     "PPS-CF": "PPS",
     # PP-Varianten
@@ -296,6 +319,16 @@ class Driver(BaseDriver):
         self._status_emit_interval: float = (
             10.0  # Emit status every 10s even if unchanged
         )
+
+        # -- Bambu-Cloud Preset-Auflösung (PFUS… → AMS-Code wie SUN20013) --
+        # filament-id-map (AMS-Code → Anzeigename); reverse für Name → Code.
+        self._cloud_idmap_reverse: dict[str, str] = {}
+        # forward (AMS-Code → Anzeigename), für slicer_filament_name im Inventory.
+        self._cloud_idmap_forward: dict[str, str] = {}
+        self._cloud_idmap_ts: float = 0.0
+        self._cloud_idmap_ttl: float = 3600.0  # 1h Cache
+        # preset_id (PFUS…) → AMS-Code, einmal aufgelöst, dann gecached.
+        self._cloud_preset_cache: dict[str, str] = {}
 
     # -- URL-basierte Sync-Koordination ----------------------------------------
 
@@ -648,6 +681,9 @@ class Driver(BaseDriver):
                     selectinload(Spool.filament)
                     .selectinload(Filament.filament_colors)
                     .selectinload(FilamentColor.color),
+                    selectinload(Spool.filament).selectinload(
+                        Filament.printer_params
+                    ),
                     selectinload(Spool.printer_params),
                 )
             )
@@ -698,9 +734,11 @@ class Driver(BaseDriver):
 
         Wird beim Startup genutzt, um _spool_original_location wiederherzustellen,
         da der In-Memory-Cache bei Plugin-Neustart verloren geht.
+        "0" ist der Sentinel für None (Spule kam aus dem Lager ohne Location).
         """
-        if location_id is None:
-            return
+        # "0" = no location (came from storage) — must be persisted so restart
+        # recovery can distinguish "unknown origin" from "known: was in storage"
+        param_value = str(location_id) if location_id is not None else "0"
         try:
             async with async_session_maker() as db:
                 result = await db.execute(
@@ -712,20 +750,279 @@ class Driver(BaseDriver):
                 )
                 existing = result.scalar_one_or_none()
                 if existing:
-                    existing.param_value = str(location_id)
+                    existing.param_value = param_value
                 else:
                     db.add(
                         SpoolPrinterParam(
                             spool_id=filaman_spool_id,
                             printer_id=self.printer_id,
                             param_key="original_location_id",
-                            param_value=str(location_id),
+                            param_value=param_value,
                         )
                     )
                 await db.commit()
         except Exception as e:
             logger.warning(
                 f"Failed to persist original location for spool {filaman_spool_id}: {e}"
+            )
+
+    async def _get_cloud_idmap_reverse(self) -> dict[str, str]:
+        """Lädt (gecached) die Bambu-Cloud filament-id-map als Name → AMS-Code.
+
+        Die Cloud-Map liefert AMS-Code → Anzeigename (z.B. "SUN20013" →
+        "SUNLU PLA PLUS GEN2"). Wir cachen das umgekehrte Mapping für die
+        Preset-Auflösung. Benötigt einen Cloud-authentifizierten API-Key.
+        """
+        now = time.monotonic()
+        if self._cloud_idmap_reverse and (
+            now - self._cloud_idmap_ts < self._cloud_idmap_ttl
+        ):
+            return self._cloud_idmap_reverse
+        try:
+            idmap = await self._bb_get("/api/v1/cloud/filament-id-map")
+            if isinstance(idmap, dict) and idmap and "detail" not in idmap:
+                # code → name  ⇒  name → code
+                self._cloud_idmap_reverse = {
+                    name: code for code, name in idmap.items()
+                }
+                self._cloud_idmap_forward = dict(idmap)
+                self._cloud_idmap_ts = now
+        except Exception as e:
+            logger.debug(f"Could not load cloud filament-id-map: {e}")
+        return self._cloud_idmap_reverse
+
+    async def _resolve_cloud_preset(self, preset_id: str) -> str | None:
+        """Löst einen Bambu-Cloud-Preset (z.B. "PFUS…") zum AMS-Code auf.
+
+        Ablauf:
+          1. Ist es bereits ein bekannter AMS-Code (in der id-map)? → direkt zurück.
+          2. filament-info(preset_id) → Anzeigename (z.B. "SUNLU PLA PLUS GEN2
+             @Bambu Lab P2S 0.4 nozzle"); "@…"-Suffix entfernen → Basisname.
+          3. Reverse-Lookup in der id-map: Basisname → AMS-Code (z.B. "SUN20013").
+
+        Ergebnisse werden gecached. Gibt None zurück wenn nicht auflösbar
+        (z.B. Cloud nicht verbunden oder unbekannter Custom-Preset).
+        """
+        if not preset_id:
+            return None
+        if preset_id in self._cloud_preset_cache:
+            return self._cloud_preset_cache[preset_id]
+
+        reverse = await self._get_cloud_idmap_reverse()
+        # 1. Schon ein gültiger AMS-Code? (id-map-Werte sind Namen, Keys sind Codes)
+        forward_codes = set(reverse.values())
+        if preset_id in forward_codes:
+            self._cloud_preset_cache[preset_id] = preset_id
+            return preset_id
+
+        # 2. + 3. filament-info → Name → Basisname → reverse-Lookup
+        try:
+            info = await self._bb_post("/api/v1/cloud/filament-info", [preset_id])
+        except Exception as e:
+            logger.debug(f"cloud/filament-info failed for {preset_id}: {e}")
+            return None
+        if not isinstance(info, dict):
+            return None
+        entry = info.get(preset_id) or {}
+        name = (entry.get("name") or "").strip()
+        if not name:
+            return None
+        base_name = name.split(" @", 1)[0].strip()
+        code = reverse.get(base_name) or reverse.get(name)
+        if code:
+            self._cloud_preset_cache[preset_id] = code
+            logger.info(
+                f"Resolved Bambu cloud preset {preset_id!r} "
+                f"({base_name!r}) → AMS code {code!r}"
+            )
+            return code
+        logger.debug(
+            f"Cloud preset {preset_id!r} name {base_name!r} not found in id-map"
+        )
+        return None
+
+    async def _spool_cloud_preset(self, filaman_spool_id: int | None) -> str | None:
+        """Liest den vom Nutzer in Bambuddy gesetzten Cloud-Preset einer Spule.
+
+        Bambuddy schreibt die Profilauswahl via Spoolman-Feld zurück nach FilaMan,
+        gespeichert in spools.custom_fields["bambu_slicer_filament"] (z.B. "PFUS…").
+        """
+        if not filaman_spool_id:
+            return None
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if not spool or not spool.custom_fields:
+                    return None
+                cf = spool.custom_fields
+                if isinstance(cf, str):
+                    cf = json.loads(cf)
+                if isinstance(cf, dict):
+                    return cf.get("bambu_slicer_filament") or None
+        except Exception as e:
+            logger.debug(
+                f"Could not read cloud preset for spool {filaman_spool_id}: {e}"
+            )
+        return None
+
+    async def _upsert_filament_bambu_idx(
+        self, db: Any, filament_id: int, tray_info_idx: str
+    ) -> bool:
+        """Setzt bambu_idx für ein Filament (innerhalb einer offenen Session).
+
+        Der AMS-Slicer-Code (z.B. "SUN20013") ist ein globaler Bambu-Identifier,
+        nicht druckerspezifisch. Deshalb wird der Wert für ALLE Drucker an dieser
+        Bambuddy-URL geschrieben, damit ein auf einem Drucker gelerntes Profil
+        sofort auf allen anderen Druckern verfügbar ist (eine Spule kann in jeden
+        Drucker gelegt werden). Spiegelt _store_bambuddy_id_db, das ebenfalls für
+        alle Peer-printer_ids schreibt.
+
+        Returns True wenn ein Wert neu geschrieben/geändert wurde, sonst False.
+        Commit erfolgt durch den Aufrufer.
+        """
+        printer_ids = self._peer_printer_ids()
+        result = await db.execute(
+            select(FilamentPrinterParam).where(
+                FilamentPrinterParam.filament_id == filament_id,
+                FilamentPrinterParam.printer_id.in_(printer_ids),
+                FilamentPrinterParam.param_key == "bambu_idx",
+            )
+        )
+        existing_by_pid = {p.printer_id: p for p in result.scalars().all()}
+        changed = False
+        for pid in printer_ids:
+            existing = existing_by_pid.get(pid)
+            if existing:
+                if existing.param_value != tray_info_idx:
+                    existing.param_value = tray_info_idx
+                    changed = True
+            else:
+                db.add(
+                    FilamentPrinterParam(
+                        filament_id=filament_id,
+                        printer_id=pid,
+                        param_key="bambu_idx",
+                        param_value=tray_info_idx,
+                    )
+                )
+                changed = True
+        return changed
+
+    async def _persist_filament_bambu_idx(
+        self, filaman_spool_id: int | None, tray_info_idx: str
+    ) -> None:
+        """Persistiert einen aufgelösten AMS-Code dauerhaft am Filament der Spule.
+
+        Eigene Session + Commit (Standalone-Variante von _upsert_filament_bambu_idx).
+        """
+        if not filaman_spool_id or not tray_info_idx:
+            return
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if not spool or not spool.filament_id:
+                    return
+                if await self._upsert_filament_bambu_idx(
+                    db, spool.filament_id, tray_info_idx
+                ):
+                    await db.commit()
+        except Exception as e:
+            logger.debug(
+                f"Could not persist bambu_idx for spool {filaman_spool_id}: {e}"
+            )
+
+    async def _learn_slot_profile(
+        self,
+        filaman_spool_id: int,
+        tray_info_idx: str,
+        ams_id: int | None = None,
+        tray_id: int | None = None,
+    ) -> None:
+        """Lernt das AMS-Profil (tray_info_idx) für das Filament einer Spule.
+
+        Wenn der Nutzer einen Slot manuell in der Bambuddy-UI konfiguriert, löst
+        Bambuddy den Bambu-Cloud-Preset (z.B. "PFUS...") zum AMS-Code (z.B.
+        "SUN20013") auf und setzt ihn im AMS. Der Driver beobachtet diesen Code
+        und persistiert ihn als FilamentPrinterParam `bambu_idx`. Beim nächsten
+        Auto-Assign liefert enrich_filament_data() diesen Wert direkt — der Slot
+        bekommt sofort das richtige Profil, ohne Cloud-Zugriff.
+
+        Zusätzlich wird der Code auf ALLE Filamente propagiert, die denselben
+        Bambu-Cloud-Preset (custom_fields.bambu_slicer_filament) verwenden — so
+        muss pro Preset nur EINE Farbe einmal manuell konfiguriert werden, nicht
+        jede Farbe einzeln.
+        """
+        if not tray_info_idx or tray_info_idx in _GENERIC_SLICER_ID_SET:
+            return
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if not spool or not spool.filament_id:
+                    return
+
+                wrote = await self._upsert_filament_bambu_idx(
+                    db, spool.filament_id, tray_info_idx
+                )
+
+                # Propagation: alle Filamente mit gleichem Cloud-Preset mitlernen.
+                # Preset-Quelle 1 (stabil): Bambuddy slot-preset, gesetzt durch das
+                # manuelle Configure das dieses Lernen ausgelöst hat.
+                # Quelle 2 (volatil, Fallback): FilaMan custom_fields.
+                preset = None
+                if ams_id is not None and tray_id is not None and self._client:
+                    try:
+                        sp = await self._bb_get(
+                            f"/api/v1/printers/{self._bambuddy_printer_id}"
+                            f"/slot-presets/{ams_id}/{tray_id}"
+                        )
+                        preset = (sp or {}).get("preset_id") or None
+                    except Exception as e:
+                        logger.debug(f"Could not read slot preset for learning: {e}")
+                if not preset and spool.custom_fields:
+                    try:
+                        cf = json.loads(spool.custom_fields)
+                        if isinstance(cf, dict):
+                            preset = cf.get("bambu_slicer_filament") or None
+                    except (ValueError, TypeError):
+                        preset = None
+
+                propagated: list[int] = []
+                if preset:
+                    sib = await db.execute(
+                        select(Spool.filament_id)
+                        .where(
+                            func.json_extract(
+                                Spool.custom_fields, "$.bambu_slicer_filament"
+                            )
+                            == preset,
+                            Spool.filament_id.isnot(None),
+                            Spool.filament_id != spool.filament_id,
+                        )
+                        .distinct()
+                    )
+                    for (sib_fid,) in sib.all():
+                        if await self._upsert_filament_bambu_idx(
+                            db, sib_fid, tray_info_idx
+                        ):
+                            propagated.append(sib_fid)
+
+                if not wrote and not propagated:
+                    return  # nothing changed
+                await db.commit()
+                msg = (
+                    f"Learned AMS profile {tray_info_idx!r} for filament "
+                    f"{spool.filament_id} (from slot config)"
+                )
+                if propagated:
+                    msg += (
+                        f"; propagated to {len(propagated)} sibling filament(s) "
+                        f"sharing preset {preset!r}: {propagated}"
+                    )
+                msg += " — future auto-assigns will apply it automatically"
+                logger.info(msg)
+        except Exception as e:
+            logger.warning(
+                f"Failed to learn slot profile for spool {filaman_spool_id}: {e}"
             )
 
     async def _delete_original_location_db(self, filaman_spool_id: int) -> None:
@@ -772,7 +1069,12 @@ class Driver(BaseDriver):
 
     # -- Inventory Sync (FilaMan → Bambuddy) ---------------------------------
 
-    def _map_spool(self, spool: Spool) -> dict:
+    def _map_spool(
+        self,
+        spool: Spool,
+        existing_slicer: str | None = None,
+        existing_name: str | None = None,
+    ) -> dict:
         """FilaMan Spool (ORM) → Bambuddy SpoolCreate/Update-Payload.
 
         Mapping:
@@ -815,6 +1117,14 @@ class Driver(BaseDriver):
             for p in (spool.printer_params or [])
             if p.printer_id == self.printer_id
         }
+        # bambu_idx (das gelernte AMS-Profil) wird auf Filament-Ebene persistiert
+        # (filament_printer_params, via _learn_slot_profile/_reconcile_cloud_presets),
+        # nicht auf Spool-Ebene. Daher hier die Filament-Params zusätzlich einlesen.
+        fpp: dict[str, str | None] = {
+            p.param_key: p.param_value
+            for p in ((fil.printer_params or []) if fil else [])
+            if p.printer_id == self.printer_id
+        }
 
         payload: dict[str, Any] = {
             "material": (fil.material_type if fil else "PLA") or "PLA",
@@ -829,11 +1139,29 @@ class Driver(BaseDriver):
         if spool.rfid_uid:
             payload["tag_uid"] = self._to_hex_tag(spool.rfid_uid)
 
-        raw_slicer = pp.get("bambu_idx") or pp.get("bambu_tray_idx")
-        if raw_slicer:
-            payload["slicer_filament"] = _resolve_slicer_id(
-                raw_slicer, payload["material"]
+        # Profil-Auflösung: Das in Bambuddy gewählte Profil ist maßgeblich (der
+        # Nutzer wählt dort das echte Slicer-Preset). Dieses NIE überschreiben —
+        # nur erhalten. Ein gelerntes bambu_idx füllt lediglich einen leeren Slot
+        # (Erst-Sync, bevor der Nutzer ein Preset gesetzt hat). Sonst würde jeder
+        # Sync die Nutzerauswahl wieder auf den gelernten Basis-Code zurücksetzen
+        # (z.B. spezifisches Preset → "SUN20013"), was das AMS falsch konfiguriert.
+        if existing_slicer:
+            payload["slicer_filament"] = existing_slicer
+            if existing_name:
+                payload["slicer_filament_name"] = existing_name
+        else:
+            raw_slicer = (
+                fpp.get("bambu_idx")
+                or fpp.get("bambu_tray_idx")
+                or pp.get("bambu_idx")
+                or pp.get("bambu_tray_idx")
             )
+            if raw_slicer:
+                code = _resolve_slicer_id(raw_slicer, payload["material"])
+                payload["slicer_filament"] = code
+                name = self._cloud_idmap_forward.get(code)
+                if name:
+                    payload["slicer_filament_name"] = name
 
         if (nozzle_min := _int_or_none(pp.get("bambu_nozzle_temp_min"))) is not None:
             payload["nozzle_temp_min"] = nozzle_min
@@ -884,6 +1212,10 @@ class Driver(BaseDriver):
             return
         self._syncing = True
         try:
+            # 0. Cloud-id-map (code → name) vorwärmen, damit _map_spool den
+            #    lesbaren slicer_filament_name mitsenden kann (gecached, 1h TTL).
+            await self._get_cloud_idmap_reverse()
+
             # 1. FilaMan-Spulen direkt aus DB holen
             fm_spools: list[Spool] = await self._fetch_fm_spools()
 
@@ -901,11 +1233,16 @@ class Driver(BaseDriver):
             for fm_spool in fm_spools:
                 fm_id = fm_spool.id
                 note_key = f"filaman:{fm_id}"
-                payload = self._map_spool(fm_spool)
+                existing = note_index.get(note_key)
+                payload = self._map_spool(
+                    fm_spool,
+                    existing_slicer=(existing or {}).get("slicer_filament"),
+                    existing_name=(existing or {}).get("slicer_filament_name"),
+                )
 
                 try:
-                    if note_key in note_index:
-                        bb_id = note_index[note_key]["id"]
+                    if existing is not None:
+                        bb_id = existing["id"]
                         await self._bb_patch(
                             f"/api/v1/inventory/spools/{bb_id}", payload
                         )
@@ -948,11 +1285,45 @@ class Driver(BaseDriver):
                 f"to Bambuddy printer {self._bambuddy_printer_id}"
             )
 
+            # Proaktive Cloud-Preset-Auflösung: jede Spule mit einem in Bambuddy
+            # gesetzten Profil (custom_fields.bambu_slicer_filament) wird zum AMS-Code
+            # aufgelöst und dauerhaft am Filament gespeichert — solange das volatile
+            # custom_fields-Feld noch befüllt ist. So ist der Code vor dem Einlegen
+            # bereit und Auto-Assign braucht keinen Cloud-Call mehr.
+            await self._reconcile_cloud_presets(fm_spools)
+
         except Exception as e:
             self._last_sync_error = str(e)
             logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
         finally:
             self._syncing = False
+
+    async def _reconcile_cloud_presets(self, fm_spools: list[Spool]) -> None:
+        """Löst gesetzte Bambu-Cloud-Presets auf und persistiert sie am Filament.
+
+        Liest pro Spule custom_fields.bambu_slicer_filament (z.B. "PFUS…"), löst
+        es via Bambu cloud zum AMS-Code (z.B. "SUN20013") auf und schreibt es als
+        bambu_idx ins filament_printer_params. Idempotent — nur Änderungen werden
+        geschrieben. Fehlende Cloud-Auth oder unbekannte Presets werden still
+        übersprungen.
+        """
+        for spool in fm_spools:
+            try:
+                cf = spool.custom_fields
+                if isinstance(cf, str):
+                    cf = json.loads(cf)
+                if not isinstance(cf, dict):
+                    continue
+                preset_id = cf.get("bambu_slicer_filament") or None
+                if not preset_id:
+                    continue
+                code = await self._resolve_cloud_preset(preset_id)
+                if code:
+                    await self._persist_filament_bambu_idx(spool.id, code)
+            except Exception as e:
+                logger.debug(
+                    f"Cloud-preset reconcile skipped for spool {spool.id}: {e}"
+                )
 
     async def _sync_inventory_loop(self) -> None:
         """Periodischer Inventory-Sync alle sync_interval_seconds."""
@@ -1078,6 +1449,25 @@ class Driver(BaseDriver):
         self._pending_rfid_hex = None
         self._pending_timer = None
 
+    def _clear_pending_peers(self) -> None:
+        """Clear pending state on this driver AND all peer drivers on the same
+        Bambuddy URL.
+
+        A scale scan arms every printer (Filaman's auto-assign notifies all
+        drivers). Once the spool is physically inserted into one printer and
+        matched here, the other printers must be disarmed too — otherwise a
+        DIFFERENT spool inserted into another printer within the remaining
+        auto-assign window would false-match this pending spool. Third-party
+        spools have no readable RFID, so they match purely on slot-appeared,
+        which makes that mis-trigger easy to hit.
+        """
+        # Capture the target before the loop: clearing self mid-iteration would
+        # null self._pending_spool_id and skip the remaining peers.
+        target = self._pending_spool_id
+        for d in self._url_instances.get(self._bambuddy_url, [self]):
+            if d._pending_spool_id == target:
+                d._clear_pending()
+
     # -- WebSocket (Bambuddy → FilaMan Verbrauchsmeldung) --------------------
 
     async def _ws_loop(self) -> None:
@@ -1090,12 +1480,26 @@ class Driver(BaseDriver):
             return
 
         while self._running:
-            uri = (
+            ws_base = (
                 self._bambuddy_url.rstrip("/")
                 .replace("https://", "wss://")
                 .replace("http://", "ws://")
             ) + "/api/v1/ws"
             try:
+                # Bambuddy (>=0.2.4) requires a short-lived ws-token for the
+                # WebSocket handshake; the X-API-Key header alone returns HTTP 403.
+                # Mint a fresh token per connection attempt and pass it as a query
+                # param (the header is kept for backward compatibility).
+                uri = ws_base
+                try:
+                    if self._client is not None:
+                        tok_resp = await self._bb_post("/api/v1/auth/ws-token", {})
+                        ws_token = (tok_resp or {}).get("token")
+                        if ws_token:
+                            uri = f"{ws_base}?token={ws_token}"
+                except Exception as e:
+                    logger.warning(f"Could not mint ws-token (will try without): {e}")
+
                 async with websockets.connect(
                     uri,
                     additional_headers={"X-API-Key": self._api_key},
@@ -1291,7 +1695,8 @@ class Driver(BaseDriver):
             except Exception as e:
                 logger.warning(f"Delayed refetch after assignment failed: {e}")
 
-        # Inventory-Assignment nur wenn Sync aktiviert ist
+        # Inventory-Assignment (best-effort): registriert Bambuddy-interne Verknüpfung,
+        # steuert aber NICHT zuverlässig tray_info_idx — deshalb immer _send_assignment danach.
         if bambuddy_spool_id and self._client and self._sync_enabled:
             try:
                 response = await self._bb_post(
@@ -1319,36 +1724,19 @@ class Driver(BaseDriver):
                     f"printer {self._bambuddy_printer_id} AMS {ams_id}/{tray_id} "
                     f"(auto-configured={response.get('configured', False)})"
                 )
-
-                # Location nach erfolgreichem Assignment setzen
-                if filaman_spool_id:
-                    await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
-
-                # Slot-Spool-Cache für Verbrauchsmeldung nach Druckende aktualisieren
-                if filaman_spool_id:
-                    self._slot_to_filaman_spool[slot_key] = filaman_spool_id
-
-                _t = asyncio.create_task(_delayed_refetch())
-                _t.add_done_callback(self._on_task_done)
-                return
             except Exception as e:
                 logger.warning(
                     f"Assignment API failed (slot {ams_id}/{tray_id}), "
-                    f"falling back to configure-call: {e}"
+                    f"continuing with configure-call: {e}"
                 )
 
-        # Fallback: Direkter configure-Call mit allen Feldern
+        # Immer configure-Call ausführen um tray_info_idx via MQTT zu setzen
         await self._send_assignment(ams_id, tray_id, filament_data)
 
-        # Location nach erfolgreichem Fallback-Assignment setzen
         if filaman_spool_id:
             await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
-
-        # Slot-Spool-Cache auch beim Fallback aktualisieren
-        if filaman_spool_id:
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
-        # -- Delayed Refetch nach Fallback --
         _t = asyncio.create_task(_delayed_refetch())
         _t.add_done_callback(self._on_task_done)
 
@@ -1386,10 +1774,29 @@ class Driver(BaseDriver):
         material_raw = filament_data.get("material_type", "PLA")
         material = _normalize_tray_type(material_raw)  # z.B. "PLA+" → "PLA"
 
-        # Prefer the Bambuddy inventory spool's slicer_filament — set when the user
-        # manually configures a slot via the Bambuddy UI with a cloud-synced profile.
-        # This is the same profile the manual "Configure" action in Bambuddy uses.
+        # Priority 1: a previously resolved/learned AMS code in the filament's
+        # printer params (durable, fed in via enrich_filament_data as bambu_idx).
         bambu_idx_hint = filament_data.get("bambu_idx") or filament_data.get("bambu_tray_idx")
+
+        # Priority 2: the cloud preset the user set on the spool in Bambuddy
+        # (stored in FilaMan custom_fields as "bambu_slicer_filament", e.g. "PFUS…").
+        # Resolve it live via Bambu cloud → AMS code (e.g. "SUN20013") and persist
+        # the result to the filament's bambu_idx so it survives custom_fields wipes
+        # and every future auto-assign is instant without another cloud call.
+        if not bambu_idx_hint:
+            fm_spool_id = _int_or_none(filament_data.get("id"))
+            preset_id = await self._spool_cloud_preset(fm_spool_id)
+            if preset_id:
+                resolved = await self._resolve_cloud_preset(preset_id)
+                if resolved:
+                    bambu_idx_hint = resolved
+                    await self._persist_filament_bambu_idx(fm_spool_id, resolved)
+                    logger.info(
+                        f"Using cloud preset {preset_id!r} → {resolved!r} "
+                        f"for slot {ams_id}/{tray_id}"
+                    )
+
+        # Priority 3: the Bambuddy inventory spool's slicer_filament (legacy path).
         if not bambu_idx_hint:
             bb_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
             if bb_spool_id and self._client:
@@ -1679,9 +2086,7 @@ class Driver(BaseDriver):
         if filaman_spool_id in list(self._slot_to_filaman_spool.values()):
             return
 
-        original_location_id = self._spool_original_location.pop(filaman_spool_id, None)
-        if original_location_id is None:
-            return
+        original_location_id = self._spool_original_location.pop(filaman_spool_id)
 
         try:
             async with async_session_maker() as db:
@@ -1689,7 +2094,7 @@ class Driver(BaseDriver):
                 if spool and spool.location_id != original_location_id:
                     await SpoolService(db).move_location(
                         spool,
-                        original_location_id,
+                        original_location_id,  # None = clear location (spool came from storage)
                         datetime.now(timezone.utc),
                         source="driver",
                         note="Restored from AMS tray",
@@ -1698,6 +2103,29 @@ class Driver(BaseDriver):
             await self._delete_original_location_db(filaman_spool_id)
         except Exception as e:
             logger.warning(f"Failed to restore spool {filaman_spool_id} location: {e}")
+
+    async def _reconfigure_slot_with_profile(
+        self, ams_id: int, tray_id: int, tray_info_idx: str, tray: dict
+    ) -> None:
+        """Re-push slot config when AMS NFC read completes with a specific profile.
+
+        Called when _process_slots detects a tray_info_idx transition from
+        generic/empty → specific (e.g. "" → "GFA01") on an already-assigned slot.
+        Builds minimal filament_data from cached slot params and calls _send_assignment.
+        """
+        slot_key = f"{ams_id}-{tray_id}"
+        cached = self._slot_params_cache.get(slot_key, {})
+        filament_data = {
+            "color": tray.get("tray_color", "FFFFFFFF"),
+            "material_type": tray.get("tray_type", "PLA"),
+            "bambu_idx": tray_info_idx,
+            "bambu_nozzle_temp_min": cached.get("nozzle_temp_min"),
+            "bambu_nozzle_temp_max": cached.get("nozzle_temp_max"),
+            "bambu_k_value": cached.get("bambu_k_value"),
+            "bambu_cali_idx": cached.get("bambu_cali_idx"),
+            "bambu_setting_id": cached.get("bambu_setting_id"),
+        }
+        await self._send_assignment(ams_id, tray_id, filament_data)
 
     def _generate_slot_location_name(self, ams_id: int, tray_id: int) -> str:
         """Generiert Location-Namen für AMS-Slot.
@@ -1837,8 +2265,9 @@ class Driver(BaseDriver):
                     )
                 )
                 loc_params = result.scalars().all()
-                orig_locs: dict[int, int] = {
-                    p.spool_id: int(p.param_value) for p in loc_params
+                orig_locs: dict[int, int | None] = {
+                    p.spool_id: (None if p.param_value in ("0", "null", "") else int(p.param_value))
+                    for p in loc_params
                 }
         except Exception as e:
             logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
@@ -2023,10 +2452,23 @@ class Driver(BaseDriver):
                         and tray_tag_uid == self._pending_rfid_hex
                     )
                     # For third-party spools tag_uid is null; fall back to slot transition.
-                    slot_matched = slot_was_empty and not tray_tag_uid
+                    # Also detect direct swaps: if Bambuddy collapses occupied→empty→occupied
+                    # into a single occupied→occupied snapshot, slot_was_empty is False even
+                    # though a physical spool swap happened. Treat content changes (type or
+                    # color differing from previous snapshot) as a swap trigger.
+                    prev_tray_type = (prev_slot.get("tray_type") or "") if prev_slot else ""
+                    prev_tray_color = (prev_slot.get("tray_color") or "") if prev_slot else ""
+                    content_changed = (
+                        not slot_was_empty
+                        and prev_slot is not None
+                        and prev_slot.get("present", False)
+                        and not tray_tag_uid
+                        and (tray_type != prev_tray_type or tray_color != prev_tray_color)
+                    )
+                    slot_matched = (slot_was_empty or content_changed) and not tray_tag_uid
 
                     if rfid_matched or slot_matched:
-                        reason = "rfid" if rfid_matched else "slot-appeared"
+                        reason = "rfid" if rfid_matched else ("direct-swap" if content_changed else "slot-appeared")
                         logger.info(
                             f"Pending spool {self._pending_spool_id} matched "
                             f"AMS {ams_id}/tray {tray_id} ({reason})"
@@ -2034,7 +2476,42 @@ class Driver(BaseDriver):
                         self.send_filament_to_tray(
                             ams_id, tray_id, {**self._pending_filament_data}
                         )
-                        self._clear_pending()
+                        self._clear_pending_peers()
+
+                # Specific (non-generic) profile on a known slot: learn it.
+                # Captures the AMS code Bambuddy resolved when the user manually
+                # configures a slot (cloud preset → e.g. "SUN20013"), and persists
+                # it for the filament so future auto-assigns apply it without cloud.
+                if (
+                    tray_type
+                    and slot_index in self._slot_to_filaman_spool
+                    and tray_info_idx
+                    and tray_info_idx not in _GENERIC_SLICER_ID_SET
+                ):
+                    learn_spool_id = self._slot_to_filaman_spool[slot_index]
+                    _lt = asyncio.create_task(
+                        self._learn_slot_profile(
+                            learn_spool_id, tray_info_idx, ams_id, tray_id
+                        )
+                    )
+                    _lt.add_done_callback(self._on_task_done)
+
+                    # Late-NFC reconfigure: AMS finished reading NFC chip after our
+                    # configure call. On generic/empty → specific transition, re-push.
+                    prev_nfc_slot = next(
+                        (s for s in self._current_slots if s["slot_index"] == slot_index),
+                        None,
+                    )
+                    prev_idx = (prev_nfc_slot.get("tray_info_idx") or "") if prev_nfc_slot else ""
+                    if not prev_idx or prev_idx in _GENERIC_SLICER_ID_SET:
+                        logger.info(
+                            f"Late NFC read on slot {slot_index}: "
+                            f"{prev_idx!r} → {tray_info_idx!r}, reconfiguring"
+                        )
+                        _t = asyncio.create_task(
+                            self._reconfigure_slot_with_profile(ams_id, tray_id, tray_info_idx, tray)
+                        )
+                        _t.add_done_callback(self._on_task_done)
 
         ext_slots: list[dict[str, Any]] = []
         for vt in vt_tray_list:
@@ -2118,7 +2595,29 @@ class Driver(BaseDriver):
                     self.send_filament_to_tray(
                         ams_id_ext, tray_id_ext, {**self._pending_filament_data}
                     )
-                    self._clear_pending()
+                    self._clear_pending_peers()
+
+            # Late-NFC reconfigure for external tray
+            if (
+                vt_type
+                and vt_idx in self._slot_to_filaman_spool
+                and vt_tray_info_idx
+                and vt_tray_info_idx not in _GENERIC_SLICER_ID_SET
+            ):
+                prev_nfc_vt = next(
+                    (s for s in self._current_slots if s["slot_index"] == vt_idx),
+                    None,
+                )
+                prev_vt_idx = (prev_nfc_vt.get("tray_info_idx") or "") if prev_nfc_vt else ""
+                if not prev_vt_idx or prev_vt_idx in _GENERIC_SLICER_ID_SET:
+                    logger.info(
+                        f"Late NFC read on external tray {vt_idx}: "
+                        f"{prev_vt_idx!r} → {vt_tray_info_idx!r}, reconfiguring"
+                    )
+                    _t = asyncio.create_task(
+                        self._reconfigure_slot_with_profile(255, vt_id, vt_tray_info_idx, vt)
+                    )
+                    _t.add_done_callback(self._on_task_done)
 
         self._current_ams_units = ams_units
         has_external = len(ext_slots) > 0
