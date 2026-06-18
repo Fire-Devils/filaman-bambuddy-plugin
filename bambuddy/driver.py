@@ -330,6 +330,17 @@ class Driver(BaseDriver):
         # preset_id (PFUS…) → AMS-Code, einmal aufgelöst, dann gecached.
         self._cloud_preset_cache: dict[str, str] = {}
 
+        # -- Cloud-Profil-Picker (Option A) --
+        # Gemergte Preset-Liste (cloud/filaments + builtin) für die FilaMan-UI.
+        # code → {code, name, displayName, isCustom}; gecached mit TTL.
+        self._cloud_presets: list[dict[str, Any]] = []
+        self._cloud_presets_by_code: dict[str, dict[str, Any]] = {}
+        self._cloud_presets_ts: float = 0.0
+        self._cloud_presets_ttl: float = 600.0  # 10min Cache
+        # FilaMan-Spool-ID → monotonic ts der letzten lokalen Profiländerung
+        # (für Last-Writer-Wins beim Bambuddy→FilaMan-Reflect).
+        self._local_profile_writes: dict[int, float] = {}
+
     # -- URL-basierte Sync-Koordination ----------------------------------------
 
     def _register(self) -> None:
@@ -865,6 +876,258 @@ class Driver(BaseDriver):
             )
         return None
 
+    # -- Cloud-Profil-Picker (Option A) ----------------------------------------
+
+    async def _load_cloud_presets(self, force: bool = False) -> list[dict[str, Any]]:
+        """Lädt (gecached) die gemergte Bambu-Cloud-Preset-Liste.
+
+        Quelle (genau wie Bambuddys nativer Picker):
+          - GET /api/v1/cloud/filaments       (~1825 Cloud-Presets, code = setting_id)
+          - GET /api/v1/cloud/builtin-filaments (generische Basis, code = filament_id/GFxx)
+
+        Liefert eine Liste aus {code, name, displayName, isCustom}. Bei fehlender
+        Cloud-Verbindung wird eine leere Liste zurückgegeben (nie Exception).
+        """
+        now = time.monotonic()
+        if (
+            not force
+            and self._cloud_presets
+            and (now - self._cloud_presets_ts) < self._cloud_presets_ttl
+        ):
+            return self._cloud_presets
+
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # 1. Generische Basis-Presets (GFxx)
+        try:
+            builtins = await self._bb_get("/api/v1/cloud/builtin-filaments")
+            if isinstance(builtins, list):
+                for b in builtins:
+                    code = (b.get("filament_id") or "").strip()
+                    name = (b.get("name") or "").strip()
+                    if not code or code in seen:
+                        continue
+                    seen.add(code)
+                    merged.append(
+                        {
+                            "code": code,
+                            "name": name,
+                            "displayName": name,
+                            "isCustom": False,
+                        }
+                    )
+        except Exception as e:
+            logger.debug(f"Could not load cloud/builtin-filaments: {e}")
+
+        # 2. Cloud-Presets (setting_id), inkl. Drucker-/Düsen-Varianten
+        try:
+            cloud = await self._bb_get("/api/v1/cloud/filaments")
+            if isinstance(cloud, list):
+                for c in cloud:
+                    code = (c.get("setting_id") or "").strip()
+                    name = (c.get("name") or "").strip()
+                    if not code or code in seen:
+                        continue
+                    seen.add(code)
+                    is_custom = bool(c.get("is_custom"))
+                    display = f"{name} (Custom)" if is_custom else name
+                    merged.append(
+                        {
+                            "code": code,
+                            "name": name,
+                            "displayName": display,
+                            "isCustom": is_custom,
+                        }
+                    )
+        except Exception as e:
+            logger.debug(f"Could not load cloud/filaments: {e}")
+
+        if merged:
+            self._cloud_presets = merged
+            self._cloud_presets_by_code = {p["code"]: p for p in merged}
+            self._cloud_presets_ts = now
+        return self._cloud_presets
+
+    async def list_cloud_presets(self, force: bool = False) -> dict[str, Any]:
+        """Öffentliche Action: gibt die Cloud-Preset-Liste für die FilaMan-UI zurück.
+
+        Returns {"presets": [...], "count": N}.
+        """
+        presets = await self._load_cloud_presets(force=force)
+        return {"presets": presets, "count": len(presets)}
+
+    async def resolve_preset_name(self, code: str | None) -> str | None:
+        """Löst einen gespeicherten Code zum Anzeigenamen auf (wie Bambuddys Label).
+
+        Reihenfolge:
+          1. filament-id-map (SUN…/GFxx → Name) — gecachte forward-Map
+          2. gemergte Preset-Liste (setting_id/GFxx → name)
+        """
+        if not code:
+            return None
+        # 1. id-map forward (AMS-Codes wie SUN20013, GFxx)
+        await self._get_cloud_idmap_reverse()
+        name = self._cloud_idmap_forward.get(code)
+        if name:
+            return name
+        # 2. gemergte Preset-Liste (setting_id)
+        if not self._cloud_presets_by_code:
+            await self._load_cloud_presets()
+        entry = self._cloud_presets_by_code.get(code)
+        if entry:
+            return entry.get("name") or entry.get("displayName")
+        return None
+
+    async def _get_bambuddy_spool_id(self, filaman_spool_id: int) -> int | None:
+        """Liest die in FilaMan gespeicherte Bambuddy-Spool-ID einer Spule."""
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.spool_id == filaman_spool_id,
+                        SpoolPrinterParam.printer_id.in_(self._peer_printer_ids()),
+                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                    )
+                )
+                for p in result.scalars().all():
+                    if p.param_value and p.param_value.isdigit():
+                        return int(p.param_value)
+        except Exception as e:
+            logger.debug(
+                f"Could not read bambuddy_spool_id for spool {filaman_spool_id}: {e}"
+            )
+        return None
+
+    async def _upsert_spool_bambu_idx(self, filaman_spool_id: int, code: str) -> bool:
+        """Setzt spool_printer_params.bambu_idx für ALLE Peer-Drucker dieser URL.
+
+        Returns True wenn ein Wert neu geschrieben/geändert wurde.
+        """
+        changed = False
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(SpoolPrinterParam).where(
+                    SpoolPrinterParam.spool_id == filaman_spool_id,
+                    SpoolPrinterParam.printer_id.in_(self._peer_printer_ids()),
+                    SpoolPrinterParam.param_key == "bambu_idx",
+                )
+            )
+            existing_by_pid = {p.printer_id: p for p in result.scalars().all()}
+            for pid in self._peer_printer_ids():
+                existing = existing_by_pid.get(pid)
+                if existing:
+                    if existing.param_value != code:
+                        existing.param_value = code
+                        changed = True
+                else:
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=filaman_spool_id,
+                            printer_id=pid,
+                            param_key="bambu_idx",
+                            param_value=code,
+                        )
+                    )
+                    changed = True
+            if changed:
+                await db.commit()
+        return changed
+
+    async def set_spool_profile(self, spool_id: int, code: str) -> dict[str, Any]:
+        """Setzt das Slicer-Profil einer Spule (FilaMan → Bambuddy).
+
+        Genau wie Bambuddys nativer Picker: schreibt `slicer_filament = code`
+        (setting_id für Cloud-Presets, GFxx für Builtins) auf die Bambuddy-Spool
+        und spiegelt den Wert nach spool_printer_params.bambu_idx in FilaMan.
+        """
+        if not spool_id or not code:
+            raise ValueError("spool_id and code are required")
+
+        # Lokalen Last-Write-Zeitstempel setzen (für LWW-Reflect-Guard)
+        self._local_profile_writes[int(spool_id)] = time.monotonic()
+
+        # FilaMan-Seite persistieren
+        await self._upsert_spool_bambu_idx(int(spool_id), code)
+
+        # Bambuddy-Seite patchen (falls die Spool dort schon existiert)
+        bb_id = await self._get_bambuddy_spool_id(int(spool_id))
+        name = await self.resolve_preset_name(code)
+        if bb_id is not None and self._client:
+            payload: dict[str, Any] = {"slicer_filament": code}
+            if name:
+                payload["slicer_filament_name"] = name
+            try:
+                await self._bb_patch(f"/api/v1/inventory/spools/{bb_id}", payload)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to push profile {code!r} to Bambuddy spool {bb_id}: {e}"
+                )
+        else:
+            # Noch nicht synchronisiert → nächster Sync übernimmt den Wert.
+            await self._debounced_sync()
+
+        logger.info(
+            f"set_spool_profile: FilaMan spool {spool_id} → {code!r} "
+            f"({name or 'unknown name'})"
+        )
+        return {"code": code, "name": name, "bambuddy_spool_id": bb_id}
+
+    async def set_filament_profile(
+        self,
+        filament_id: int,
+        code: str,
+        apply_to_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Setzt das Default-Slicer-Profil eines Filaments (FilaMan → Bambuddy).
+
+        Schreibt bambu_idx ins filament_printer_params für ALLE Peer-Drucker
+        dieser Bambuddy-URL. Neue Spulen dieses Filaments erben den Wert über
+        _map_spool. Mit apply_to_existing=True wird das Profil zusätzlich auf
+        alle aktiven Bestandsspulen dieses Filaments angewendet (und nach
+        Bambuddy gepusht).
+        """
+        if not filament_id or not code:
+            raise ValueError("filament_id and code are required")
+
+        async with async_session_maker() as db:
+            if await self._upsert_filament_bambu_idx(db, int(filament_id), code):
+                await db.commit()
+
+        name = await self.resolve_preset_name(code)
+        applied = 0
+        if apply_to_existing:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(Spool.id)
+                    .join(SpoolStatus)
+                    .where(
+                        Spool.filament_id == int(filament_id),
+                        SpoolStatus.key != "archived",
+                    )
+                )
+                spool_ids = [row[0] for row in result.all()]
+            for sid in spool_ids:
+                try:
+                    await self.set_spool_profile(sid, code)
+                    applied += 1
+                except Exception as e:
+                    logger.warning(
+                        f"apply_to_existing: failed for spool {sid}: {e}"
+                    )
+        else:
+            await self._debounced_sync()
+
+        logger.info(
+            f"set_filament_profile: filament {filament_id} → {code!r} "
+            f"({name or 'unknown'}); applied_to_existing={applied}"
+        )
+        return {
+            "code": code,
+            "name": name,
+            "applied_to_existing": applied,
+        }
+
     async def _upsert_filament_bambu_idx(
         self, db: Any, filament_id: int, tray_info_idx: str
     ) -> bool:
@@ -1157,9 +1420,19 @@ class Driver(BaseDriver):
                 or pp.get("bambu_tray_idx")
             )
             if raw_slicer:
-                code = _resolve_slicer_id(raw_slicer, payload["material"])
+                # Cloud-Preset-Setting-IDs (PFUS…) werden – wie in Bambuddys
+                # nativem Picker – direkt als slicer_filament durchgereicht und
+                # NICHT auf einen generischen Basis-Code aufgelöst.
+                if raw_slicer.startswith("PFUS") or (
+                    raw_slicer in self._cloud_presets_by_code
+                ):
+                    code = raw_slicer
+                else:
+                    code = _resolve_slicer_id(raw_slicer, payload["material"])
                 payload["slicer_filament"] = code
-                name = self._cloud_idmap_forward.get(code)
+                name = self._cloud_idmap_forward.get(code) or (
+                    self._cloud_presets_by_code.get(code, {}).get("name")
+                )
                 if name:
                     payload["slicer_filament_name"] = name
 
@@ -1263,6 +1536,12 @@ class Driver(BaseDriver):
                 except Exception as e:
                     logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
 
+                # Bambuddy → FilaMan: gesetztes Profil zurückspiegeln (LWW).
+                if existing is not None:
+                    await self._reflect_spool_profile(
+                        fm_id, existing.get("slicer_filament")
+                    )
+
             # 4. Veraltete Bambuddy-Spulen entfernen
             for note_key, bb_spool in note_index.items():
                 try:
@@ -1297,6 +1576,42 @@ class Driver(BaseDriver):
             logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
         finally:
             self._syncing = False
+
+    async def _reflect_spool_profile(
+        self, filaman_spool_id: int, existing_slicer: str | None
+    ) -> None:
+        """Spiegelt das in Bambuddy gesetzte Profil zurück nach FilaMan (LWW).
+
+        Schreibt das von Bambuddy gemeldete `slicer_filament` in
+        spool_printer_params.bambu_idx, sodass beide Systeme dasselbe Profil
+        zeigen. Guards:
+          - generische/leere Codes werden ignoriert
+          - laufende Zuweisung (pending) pausiert das Reflect
+          - Last-Writer-Wins: eine kürzliche lokale Änderung gewinnt
+        """
+        if not existing_slicer or existing_slicer in _GENERIC_SLICER_ID_SET:
+            return
+        if self._pending_spool_id == filaman_spool_id:
+            return
+        last = self._local_profile_writes.get(filaman_spool_id)
+        if last is not None and (time.monotonic() - last) < 300.0:
+            return  # FilaMan war der jüngere Writer
+        try:
+            changed = await self._upsert_spool_bambu_idx(
+                filaman_spool_id, existing_slicer
+            )
+            if changed:
+                logger.info(
+                    f"Reflected Bambuddy profile {existing_slicer!r} → "
+                    f"FilaMan spool {filaman_spool_id}"
+                )
+            else:
+                # Bereits synchron → Marker aufräumen.
+                self._local_profile_writes.pop(filaman_spool_id, None)
+        except Exception as e:
+            logger.debug(
+                f"Could not reflect profile for spool {filaman_spool_id}: {e}"
+            )
 
     async def _reconcile_cloud_presets(self, fm_spools: list[Spool]) -> None:
         """Löst gesetzte Bambu-Cloud-Presets auf und persistiert sie am Filament.
@@ -1580,6 +1895,11 @@ class Driver(BaseDriver):
             data = event.get("data", {})
             if data.get("printer_id") == self._bambuddy_printer_id:
                 await self._handle_print_complete(data)
+
+        elif event_type == "inventory_changed":
+            # Refresh-on-save: ein Profil-/Inventory-Wechsel in Bambuddy stößt
+            # einen (debounced) Sync an, damit FilaMan zeitnah nachzieht.
+            await self._debounced_sync()
 
     async def _handle_print_complete(self, data: dict) -> None:
         """Meldet Filament-Verbrauch nach Druckende an FilaMan.
