@@ -1034,6 +1034,42 @@ class Driver(BaseDriver):
                 await db.commit()
         return changed
 
+    async def _upsert_spool_slicer_custom_fields(
+        self, filaman_spool_id: int, code: str, name: str | None
+    ) -> None:
+        """Spiegelt das Slicer-Profil in die Spool-custom_fields (Spoolman-Sicht).
+
+        Bambuddys Spoolman-Sync liest ``bambu_slicer_filament[_name]`` aus den
+        Spool-extra-Feldern (in FilaMan = ``Spool.custom_fields``). Fehlen diese
+        Felder, fällt Bambuddy auf den Filamentnamen zurück und zeigt ein kurzes
+        Ersatzlabel statt des echten Profilnamens. Wir schreiben sie daher beim
+        Setzen des Profils, damit beide Sync-Pfade (Treiber-PATCH und
+        Spoolman-Sync) denselben vollständigen Namen liefern.
+        """
+        if not filaman_spool_id or not code:
+            return
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if spool is None:
+                    return
+                cf = dict(spool.custom_fields or {})
+                changed = False
+                if cf.get("bambu_slicer_filament") != code:
+                    cf["bambu_slicer_filament"] = code
+                    changed = True
+                if name and cf.get("bambu_slicer_filament_name") != name:
+                    cf["bambu_slicer_filament_name"] = name
+                    changed = True
+                if changed:
+                    spool.custom_fields = cf
+                    await db.commit()
+        except Exception as e:
+            logger.debug(
+                f"Could not store slicer custom_fields for spool "
+                f"{filaman_spool_id}: {e}"
+            )
+
     async def set_spool_profile(self, spool_id: int, code: str) -> dict[str, Any]:
         """Setzt das Slicer-Profil einer Spule (FilaMan → Bambuddy).
 
@@ -1047,12 +1083,16 @@ class Driver(BaseDriver):
         # Lokalen Last-Write-Zeitstempel setzen (für LWW-Reflect-Guard)
         self._local_profile_writes[int(spool_id)] = time.monotonic()
 
-        # FilaMan-Seite persistieren
+        name = await self.resolve_preset_name(code)
+
+        # FilaMan-Seite persistieren: bambu_idx (Treiber-Sicht) + custom_fields
+        # (Spoolman-Sicht), damit Bambuddy über beide Sync-Pfade den vollen
+        # Profilnamen erhält statt auf den Filamentnamen zurückzufallen.
         await self._upsert_spool_bambu_idx(int(spool_id), code)
+        await self._upsert_spool_slicer_custom_fields(int(spool_id), code, name)
 
         # Bambuddy-Seite patchen (falls die Spool dort schon existiert)
         bb_id = await self._get_bambuddy_spool_id(int(spool_id))
-        name = await self.resolve_preset_name(code)
         if bb_id is not None and self._client:
             payload: dict[str, Any] = {"slicer_filament": code}
             if name:
@@ -1541,6 +1581,26 @@ class Driver(BaseDriver):
                     await self._reflect_spool_profile(
                         fm_id, existing.get("slicer_filament")
                     )
+
+                # Effektives Profil (Bambuddy-Wert oder vererbtes bambu_idx) in die
+                # Spool-custom_fields spiegeln, damit Bambuddys Spoolman-Sync den
+                # vollen Profilnamen sieht – auch für neue/vererbte Spulen, die nie
+                # explizit über set_spool_profile gesetzt wurden. Generische
+                # Fallback-Codes werden ausgelassen; ein kürzlich lokal gesetztes
+                # Profil gewinnt (Last-Writer-Wins, wie beim Reflect).
+                eff_code = payload.get("slicer_filament")
+                if eff_code and eff_code not in _GENERIC_SLICER_ID_SET:
+                    last = self._local_profile_writes.get(fm_id)
+                    recent_local = (
+                        last is not None and (time.monotonic() - last) < 300.0
+                    )
+                    if not recent_local:
+                        eff_name = payload.get(
+                            "slicer_filament_name"
+                        ) or await self.resolve_preset_name(eff_code)
+                        await self._upsert_spool_slicer_custom_fields(
+                            fm_id, eff_code, eff_name
+                        )
 
             # 4. Veraltete Bambuddy-Spulen entfernen
             for note_key, bb_spool in note_index.items():
