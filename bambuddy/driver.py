@@ -304,7 +304,9 @@ class Driver(BaseDriver):
         self._pending_spool_id: int | None = None
         self._pending_filament_data: dict | None = None
         self._pending_rfid_hex: str | None = None
+        self._pending_slot_snapshot: dict[str, dict[str, Any]] | None = None
         self._pending_timer: asyncio.Task | None = None
+        self._pending_poll_task: asyncio.Task | None = None
 
         # -- Task Restart Management --
         self._ws_restart_count: int = 0
@@ -313,6 +315,11 @@ class Driver(BaseDriver):
         self._last_sync_restart: float = 0.0
         self._max_restart_attempts: int = 5
         self._restart_backoff_base: float = 2.0  # Exponential backoff base
+        # In-loop WebSocket reconnect backoff (separate from the task watchdog
+        # above, which never fires because _ws_loop catches its own errors and
+        # reconnects internally). Counts consecutive short-lived connections so
+        # a brief Bambuddy hiccup recovers in ~1s while a real outage backs off.
+        self._ws_reconnect_attempt: int = 0
 
         # -- Event Emission Tracking --
         self._last_status_emit: float = 0.0
@@ -994,6 +1001,103 @@ class Driver(BaseDriver):
         name = await self.resolve_preset_name(code)
         return {"code": code, "name": name or code}
 
+    def _is_full_preset(self, code: str | None) -> bool:
+        """True wenn ``code`` ein echtes (selektierbares) Slicer-Preset ist.
+
+        Volle Presets sind die setting_ids/Builtin-IDs aus dem Cloud-Katalog
+        (PFUS…/GFxx). Generische AMS-Codes (z.B. "SUN20010") sind NICHT enthalten
+        und gelten daher nicht als volles Preset.
+        """
+        if not code:
+            return False
+        return code.startswith("PFUS") or code in self._cloud_presets_by_code
+
+    async def backfill_setting_ids(self) -> dict[str, Any]:
+        """Einmaliger Backfill: kopiert volle Presets aus bambu_idx → bambu_slicer_setting_id.
+
+        Bestehende Profile, die als volles Preset (PFUS…/GFxx) in bambu_idx oder
+        in custom_fields.bambu_slicer_filament stehen, werden nach
+        bambu_slicer_setting_id übernommen, wenn dort noch kein Wert existiert.
+        Generische AMS-Codes werden
+        übersprungen (der Nutzer wählt deren volles Variant-Preset im Picker neu).
+        Idempotent.
+        """
+        await self._load_cloud_presets()
+        filaments = 0
+        spools = 0
+        async with async_session_maker() as db:
+            # Filament-Ebene
+            res = await db.execute(
+                select(FilamentPrinterParam).where(
+                    FilamentPrinterParam.printer_id.in_(self._peer_printer_ids()),
+                    FilamentPrinterParam.param_key.in_(
+                        ["bambu_idx", "bambu_slicer_setting_id"]
+                    ),
+                )
+            )
+            fparams = res.scalars().all()
+            have_setting: set[tuple[int, int]] = {
+                (p.filament_id, p.printer_id)
+                for p in fparams
+                if p.param_key == "bambu_slicer_setting_id"
+            }
+            for p in fparams:
+                if (
+                    p.param_key == "bambu_idx"
+                    and self._is_full_preset(p.param_value)
+                    and (p.filament_id, p.printer_id) not in have_setting
+                ):
+                    db.add(
+                        FilamentPrinterParam(
+                            filament_id=p.filament_id,
+                            printer_id=p.printer_id,
+                            param_key="bambu_slicer_setting_id",
+                            param_value=p.param_value,
+                        )
+                    )
+                    have_setting.add((p.filament_id, p.printer_id))
+                    filaments += 1
+
+            # Spool-Ebene (bambu_idx + custom_fields.bambu_slicer_filament)
+            res = await db.execute(
+                select(SpoolPrinterParam).where(
+                    SpoolPrinterParam.printer_id.in_(self._peer_printer_ids()),
+                    SpoolPrinterParam.param_key.in_(
+                        ["bambu_idx", "bambu_slicer_setting_id"]
+                    ),
+                )
+            )
+            sparams = res.scalars().all()
+            shave_setting: set[tuple[int, int]] = {
+                (p.spool_id, p.printer_id)
+                for p in sparams
+                if p.param_key == "bambu_slicer_setting_id"
+            }
+            for p in sparams:
+                if (
+                    p.param_key == "bambu_idx"
+                    and self._is_full_preset(p.param_value)
+                    and (p.spool_id, p.printer_id) not in shave_setting
+                ):
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=p.spool_id,
+                            printer_id=p.printer_id,
+                            param_key="bambu_slicer_setting_id",
+                            param_value=p.param_value,
+                        )
+                    )
+                    shave_setting.add((p.spool_id, p.printer_id))
+                    spools += 1
+
+            if filaments or spools:
+                await db.commit()
+        logger.info(
+            f"backfill_setting_ids: seeded {filaments} filament(s), "
+            f"{spools} spool(s) with full slicer presets"
+        )
+        return {"filaments": filaments, "spools": spools}
+
     async def _get_bambuddy_spool_id(self, filaman_spool_id: int) -> int | None:
         """Liest die in FilaMan gespeicherte Bambuddy-Spool-ID einer Spule."""
         try:
@@ -1041,6 +1145,46 @@ class Driver(BaseDriver):
                             spool_id=filaman_spool_id,
                             printer_id=pid,
                             param_key="bambu_idx",
+                            param_value=code,
+                        )
+                    )
+                    changed = True
+            if changed:
+                await db.commit()
+        return changed
+
+    async def _upsert_spool_bambu_slicer_setting_id(
+        self, filaman_spool_id: int, code: str
+    ) -> bool:
+        """Setzt spool_printer_params.bambu_slicer_setting_id für ALLE Peer-Drucker.
+
+        Das ist das VOLLE Slicer-Preset (z.B. "PFUS…@Bambu Lab P2S 0.4 nozzle"),
+        getrennt vom generischen AMS-Code in bambu_idx. Eigener Key (NICHT
+        bambu_setting_id), damit es NICHT in den AMS-configure-Call (setting_id)
+        einfließt. Returns True bei Änderung.
+        """
+        changed = False
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(SpoolPrinterParam).where(
+                    SpoolPrinterParam.spool_id == filaman_spool_id,
+                    SpoolPrinterParam.printer_id.in_(self._peer_printer_ids()),
+                    SpoolPrinterParam.param_key == "bambu_slicer_setting_id",
+                )
+            )
+            existing_by_pid = {p.printer_id: p for p in result.scalars().all()}
+            for pid in self._peer_printer_ids():
+                existing = existing_by_pid.get(pid)
+                if existing:
+                    if existing.param_value != code:
+                        existing.param_value = code
+                        changed = True
+                else:
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=filaman_spool_id,
+                            printer_id=pid,
+                            param_key="bambu_slicer_setting_id",
                             param_value=code,
                         )
                     )
@@ -1130,10 +1274,18 @@ class Driver(BaseDriver):
 
         name = await self.resolve_preset_name(code)
 
-        # FilaMan-Seite persistieren: bambu_idx (Treiber-Sicht) + custom_fields
-        # (Spoolman-Sicht), damit Bambuddy über beide Sync-Pfade den vollen
-        # Profilnamen erhält statt auf den Filamentnamen zurückzufallen.
-        await self._upsert_spool_bambu_idx(int(spool_id), code)
+        # FilaMan-Seite persistieren:
+        #  - bambu_slicer_setting_id: das VOLLE Slicer-Preset (PFUS…@…nozzle) —
+        #    der maßgebliche Slicer-Profil-Wert, der nach Bambuddy slicer_filament
+        #    synchronisiert wird. Eigener Key, damit er NICHT in den AMS-configure-
+        #    Call (setting_id) einfließt.
+        #  - bambu_idx: der GENERISCHE AMS-Code (z.B. SUN20010/GFxx) für die
+        #    physische AMS-Slot-Konfiguration. Aus dem vollen Preset aufgelöst,
+        #    damit die AMS-Logik unverändert weiterläuft.
+        #  - custom_fields (Spoolman-Sicht): voller Code + voller Name.
+        await self._upsert_spool_bambu_slicer_setting_id(int(spool_id), code)
+        generic = await self._resolve_cloud_preset(code) or code
+        await self._upsert_spool_bambu_idx(int(spool_id), generic)
         await self._upsert_spool_slicer_custom_fields(int(spool_id), code, name)
 
         # Bambuddy-Seite patchen (falls die Spool dort schon existiert)
@@ -1175,8 +1327,18 @@ class Driver(BaseDriver):
         if not filament_id or not code:
             raise ValueError("filament_id and code are required")
 
+        # bambu_slicer_setting_id = volles Slicer-Preset (maßgeblich, → Bambuddy);
+        # bambu_idx = generischer AMS-Code (physische AMS-Konfiguration).
+        generic = await self._resolve_cloud_preset(code) or code
         async with async_session_maker() as db:
-            if await self._upsert_filament_bambu_idx(db, int(filament_id), code):
+            changed = await self._upsert_filament_bambu_slicer_setting_id(
+                db, int(filament_id), code
+            )
+            changed = (
+                await self._upsert_filament_bambu_idx(db, int(filament_id), generic)
+                or changed
+            )
+            if changed:
                 await db.commit()
 
         name = await self.resolve_preset_name(code)
@@ -1251,6 +1413,44 @@ class Driver(BaseDriver):
                         printer_id=pid,
                         param_key="bambu_idx",
                         param_value=tray_info_idx,
+                    )
+                )
+                changed = True
+        return changed
+
+    async def _upsert_filament_bambu_slicer_setting_id(
+        self, db: Any, filament_id: int, code: str
+    ) -> bool:
+        """Setzt bambu_slicer_setting_id für ein Filament (in offener Session).
+
+        Das volle Slicer-Preset (PFUS…) als druckerunabhängiger Default; neue
+        Spulen erben es über _map_spool. Eigener Key (NICHT bambu_setting_id), damit
+        es NICHT in den AMS-configure-Call einfließt. Geschrieben für ALLE Peer-
+        Drucker dieser Bambuddy-URL. Returns True bei Änderung; Commit durch Aufrufer.
+        """
+        printer_ids = self._peer_printer_ids()
+        result = await db.execute(
+            select(FilamentPrinterParam).where(
+                FilamentPrinterParam.filament_id == filament_id,
+                FilamentPrinterParam.printer_id.in_(printer_ids),
+                FilamentPrinterParam.param_key == "bambu_slicer_setting_id",
+            )
+        )
+        existing_by_pid = {p.printer_id: p for p in result.scalars().all()}
+        changed = False
+        for pid in printer_ids:
+            existing = existing_by_pid.get(pid)
+            if existing:
+                if existing.param_value != code:
+                    existing.param_value = code
+                    changed = True
+            else:
+                db.add(
+                    FilamentPrinterParam(
+                        filament_id=filament_id,
+                        printer_id=pid,
+                        param_key="bambu_slicer_setting_id",
+                        param_value=code,
                     )
                 )
                 changed = True
@@ -1499,10 +1699,24 @@ class Driver(BaseDriver):
         # (Erst-Sync, bevor der Nutzer ein Preset gesetzt hat). Sonst würde jeder
         # Sync die Nutzerauswahl wieder auf den gelernten Basis-Code zurücksetzen
         # (z.B. spezifisches Preset → "SUN20013"), was das AMS falsch konfiguriert.
+        # Volles Slicer-Preset (PFUS…@…nozzle): Spool-Override schlägt Filament-
+        # Default. Dies ist der maßgebliche, vom Nutzer gewählte Slicer-Profil-
+        # Wert (getrennt vom generischen AMS-Code in bambu_idx).
+        full_setting_id = pp.get("bambu_slicer_setting_id") or fpp.get(
+            "bambu_slicer_setting_id"
+        )
+
         if existing_slicer:
             payload["slicer_filament"] = existing_slicer
             if existing_name:
                 payload["slicer_filament_name"] = existing_name
+        elif full_setting_id:
+            payload["slicer_filament"] = full_setting_id
+            name = self._cloud_presets_by_code.get(full_setting_id, {}).get(
+                "name"
+            ) or self._cloud_idmap_forward.get(full_setting_id)
+            if name:
+                payload["slicer_filament_name"] = name
         else:
             raw_slicer = (
                 fpp.get("bambu_idx")
@@ -1701,9 +1915,10 @@ class Driver(BaseDriver):
     ) -> None:
         """Spiegelt das in Bambuddy gesetzte Profil zurück nach FilaMan (LWW).
 
-        Schreibt das von Bambuddy gemeldete `slicer_filament` in
-        spool_printer_params.bambu_idx, sodass beide Systeme dasselbe Profil
-        zeigen. Guards:
+        Schreibt das von Bambuddy gemeldete (volle) `slicer_filament` in
+        spool_printer_params.bambu_slicer_setting_id und löst den generischen AMS-Code
+        zusätzlich nach bambu_idx auf, sodass beide Systeme dasselbe Profil zeigen
+        und die AMS-Konfiguration den generischen Code behält. Guards:
           - generische/leere Codes werden ignoriert
           - laufende Zuweisung (pending) pausiert das Reflect
           - Last-Writer-Wins: eine kürzliche lokale Änderung gewinnt
@@ -1716,9 +1931,13 @@ class Driver(BaseDriver):
         if last is not None and (time.monotonic() - last) < 300.0:
             return  # FilaMan war der jüngere Writer
         try:
-            changed = await self._upsert_spool_bambu_idx(
+            # Volles Preset als Slicer-Profil-Wert spiegeln …
+            changed = await self._upsert_spool_bambu_slicer_setting_id(
                 filaman_spool_id, existing_slicer
             )
+            # … und den generischen AMS-Code für die Slot-Konfiguration ableiten.
+            generic = await self._resolve_cloud_preset(existing_slicer) or existing_slicer
+            await self._upsert_spool_bambu_idx(filaman_spool_id, generic)
             if changed:
                 logger.info(
                     f"Reflected Bambuddy profile {existing_slicer!r} → "
@@ -1838,6 +2057,8 @@ class Driver(BaseDriver):
         """
         if self._pending_timer and not self._pending_timer.done():
             self._pending_timer.cancel()
+        if self._pending_poll_task and not self._pending_poll_task.done():
+            self._pending_poll_task.cancel()
 
         rfid_hex: str | None = None
         try:
@@ -1849,18 +2070,39 @@ class Driver(BaseDriver):
             logger.warning(f"Could not load rfid_uid for pending spool {spool_id}: {e}")
 
         self._pending_spool_id = spool_id
-        self._pending_filament_data = {**filament_data}
+        self._pending_filament_data = {**filament_data, "id": spool_id}
         self._pending_rfid_hex = rfid_hex
+        await self._capture_pending_snapshot()
 
         effective_timeout = timeout_seconds if timeout_seconds is not None else 300
         self._pending_timer = asyncio.create_task(
             self._pending_timeout(effective_timeout)
         )
         self._pending_timer.add_done_callback(self._on_task_done)
+        self._pending_poll_task = asyncio.create_task(self._pending_poll_loop())
+        self._pending_poll_task.add_done_callback(self._on_task_done)
         logger.info(
             f"Pending spool {spool_id} set for printer {self.printer_id} "
             f"(rfid={rfid_hex}, timeout={effective_timeout}s)"
         )
+
+    async def _pending_poll_loop(self) -> None:
+        """Poll AMS status while a spool is pending insertion.
+
+        Auto-assign previously relied solely on WebSocket slot events; missed
+        events during reconnects or Bambuddy stalls meant configure never ran.
+        """
+        try:
+            while self._running and self._pending_spool_id is not None:
+                try:
+                    await self._fetch_and_emit_status()
+                except Exception as e:
+                    logger.debug(f"Pending poll status fetch failed: {e}")
+                if self._pending_spool_id is None:
+                    break
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            pass
 
     async def _pending_timeout(self, timeout: int) -> None:
         await asyncio.sleep(timeout)
@@ -1872,16 +2114,24 @@ class Driver(BaseDriver):
         self._pending_spool_id = None
         self._pending_filament_data = None
         self._pending_rfid_hex = None
+        self._pending_slot_snapshot = None
         self._pending_timer = None
+        if self._pending_poll_task and not self._pending_poll_task.done():
+            self._pending_poll_task.cancel()
+        self._pending_poll_task = None
 
     def _clear_pending(self) -> None:
         """Clear pending spool state and cancel timeout."""
         if self._pending_timer and not self._pending_timer.done():
             self._pending_timer.cancel()
+        if self._pending_poll_task and not self._pending_poll_task.done():
+            self._pending_poll_task.cancel()
         self._pending_spool_id = None
         self._pending_filament_data = None
         self._pending_rfid_hex = None
+        self._pending_slot_snapshot = None
         self._pending_timer = None
+        self._pending_poll_task = None
 
     def _clear_pending_peers(self) -> None:
         """Clear pending state on this driver AND all peer drivers on the same
@@ -1942,6 +2192,7 @@ class Driver(BaseDriver):
                 # sending pings (so genuinely dead TCP connections are still
                 # detected and trigger a reconnect) but give the server a much
                 # more generous window to respond before tearing the socket down.
+                connected_at = 0.0
                 async with websockets.connect(
                     uri,
                     additional_headers={"X-API-Key": self._api_key},
@@ -1949,6 +2200,7 @@ class Driver(BaseDriver):
                     ping_timeout=90,
                 ) as ws:
                     self._ws_connected = True
+                    connected_at = time.monotonic()
                     logger.info(f"WebSocket connected: {uri}")
 
                     # Reset restart counter bei erfolgreicher Verbindung
@@ -1975,11 +2227,26 @@ class Driver(BaseDriver):
             except Exception as e:
                 self._ws_connected = False
                 if self._running:
+                    # Bambuddy closes idle-looking client sockets with 1011
+                    # ("keepalive ping timeout") whenever its own event loop
+                    # stalls — common during active prints (MQTT K-profile
+                    # polling, per-layer tray changes). A fixed 30s reconnect
+                    # turned every hiccup into a 30s blind window. Reconnect
+                    # fast after a stable session, but back off (1,2,4,…→cap)
+                    # if connections keep dropping immediately, so we don't
+                    # hammer Bambuddy while it is genuinely unavailable.
+                    if connected_at and (time.monotonic() - connected_at) >= 30:
+                        self._ws_reconnect_attempt = 0
+                    delay = min(
+                        2 ** self._ws_reconnect_attempt,
+                        self._reconnect_interval,
+                    )
+                    self._ws_reconnect_attempt += 1
                     logger.warning(
                         f"WebSocket disconnected ({e}). "
-                        f"Reconnecting in {self._reconnect_interval}s…"
+                        f"Reconnecting in {delay}s…"
                     )
-                    await asyncio.sleep(self._reconnect_interval)
+                    await asyncio.sleep(delay)
 
     async def _handle_ws_event(self, event: dict) -> None:
         """Verarbeitet eingehende Bambuddy WebSocket-Events."""
@@ -2111,20 +2378,11 @@ class Driver(BaseDriver):
 
         # -- Spoolman-Link: Vor Assignment alte Spoolman-Verknüpfung prüfen/entfernen --
         if filaman_spool_id:
-            try:
-                async with async_session_maker() as db:
-                    spool = await db.get(Spool, filaman_spool_id)
-                    original_loc = spool.location_id if spool else None
-                    self._spool_original_location[filaman_spool_id] = original_loc
-                    # Original-Location in DB persistieren (überlebt Plugin-Neustart)
-                    await self._store_original_location_db(
-                        filaman_spool_id, original_loc
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to cache original location for FilaMan spool "
-                    f"{filaman_spool_id}: {e}"
-                )
+            # Note: we intentionally do NOT record the spool's prior location as a
+            # "home" to restore to later. A spool that leaves a slot is set to *no*
+            # location (see _restore_spool_location). Remembering the prior location
+            # was buggy when that location was itself a slot (a spool moved slot→slot
+            # would be "restored" back into the stale slot instead of being freed).
             # Spoolman-Linking nur wenn Inventory-Sync DEAKTIVIERT ist
             # (Bei aktiviertem Sync nutzt Bambuddy sein eigenes Inventar, nicht Spoolman)
             # Funktion selbst prüft zusätzlich _spoolman_enabled (defensive Programmierung)
@@ -2225,45 +2483,57 @@ class Driver(BaseDriver):
         # printer params (durable, fed in via enrich_filament_data as bambu_idx).
         bambu_idx_hint = filament_data.get("bambu_idx") or filament_data.get("bambu_tray_idx")
 
-        # Priority 2: the cloud preset the user set on the spool in Bambuddy
-        # (stored in FilaMan custom_fields as "bambu_slicer_filament", e.g. "PFUS…").
-        # Resolve it live via Bambu cloud → AMS code (e.g. "SUN20013") and persist
-        # the result to the filament's bambu_idx so it survives custom_fields wipes
-        # and every future auto-assign is instant without another cloud call.
+        # Priority 2: full cloud preset (bambu_slicer_setting_id or custom_fields)
+        # → resolve to generic AMS code (e.g. "SUN20012").
         if not bambu_idx_hint:
             fm_spool_id = _int_or_none(filament_data.get("id"))
-            preset_id = await self._spool_cloud_preset(fm_spool_id)
+            preset_id = filament_data.get("bambu_slicer_setting_id")
+            if not preset_id and fm_spool_id:
+                preset_id = await self._spool_cloud_preset(fm_spool_id)
             if preset_id:
-                resolved = await self._resolve_cloud_preset(preset_id)
+                resolved = await self._resolve_cloud_preset(str(preset_id))
                 if resolved:
                     bambu_idx_hint = resolved
-                    await self._persist_filament_bambu_idx(fm_spool_id, resolved)
+                    if fm_spool_id:
+                        await self._persist_filament_bambu_idx(fm_spool_id, resolved)
                     logger.info(
                         f"Using cloud preset {preset_id!r} → {resolved!r} "
                         f"for slot {ams_id}/{tray_id}"
                     )
 
-        # Priority 3: the Bambuddy inventory spool's slicer_filament (legacy path).
+        # Priority 3: Bambuddy inventory spool's slicer_filament — also a cloud
+        # preset (PFUS…), must be resolved to an AMS code; never pass PFUS through
+        # to _resolve_slicer_id (mixed-case PFUS falls back to generic GFL99).
         if not bambu_idx_hint:
             bb_spool_id = _int_or_none(filament_data.get("bambuddy_spool_id"))
             if bb_spool_id and self._client:
                 try:
                     bb_spool = await self._bb_get(f"/api/v1/inventory/spools/{bb_spool_id}")
-                    bambu_idx_hint = bb_spool.get("slicer_filament") or None
-                    if bambu_idx_hint:
-                        logger.info(
-                            f"Using Bambuddy spool {bb_spool_id} slicer_filament "
-                            f"{bambu_idx_hint!r} for slot {ams_id}/{tray_id}"
-                        )
+                    preset = bb_spool.get("slicer_filament") or None
+                    if preset:
+                        resolved = await self._resolve_cloud_preset(str(preset))
+                        if resolved:
+                            bambu_idx_hint = resolved
+                            fm_spool_id = _int_or_none(filament_data.get("id"))
+                            if fm_spool_id:
+                                await self._persist_filament_bambu_idx(
+                                    fm_spool_id, resolved
+                                )
+                            logger.info(
+                                f"Using Bambuddy spool {bb_spool_id} preset "
+                                f"{preset!r} → {resolved!r} for slot {ams_id}/{tray_id}"
+                            )
                 except Exception as e:
                     logger.debug(f"Could not fetch Bambuddy spool {bb_spool_id}: {e}")
 
         slicer_filament = _resolve_slicer_id(bambu_idx_hint, material)
 
-        # tray_sub_brands: Filament-Anzeigename aus Lookup oder Fallback auf Material
+        # tray_sub_brands: human-readable filament name on the AMS slot
+        await self._get_cloud_idmap_reverse()
         tray_sub_brands = (
             filament_data.get("material_subgroup")
             or _FILAMENT_IDX_TO_NAME.get(slicer_filament)
+            or self._cloud_idmap_forward.get(slicer_filament)
             or material_raw
         )
 
@@ -2524,32 +2794,64 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"Spoolman linking failed for tray {ams_id}/{tray_id}: {e}")
 
-    async def _restore_spool_location(self, filaman_spool_id: int) -> None:
-        """Restores a spool's original FilaMan location when its AMS tray becomes empty."""
-        if filaman_spool_id not in self._spool_original_location:
-            return
+    async def _is_own_slot_location(self, db, location_id: int | None) -> bool:
+        """True if location_id is an AMS-slot location managed by THIS printer.
 
-        # Check if the spool is assigned to another tray (use list() to avoid dict modification during iteration)
+        Printer-scoped on purpose. Each driver tracks only its own
+        _slot_to_filaman_spool, so when a spool moves from printer A to printer B
+        the empty-slot cleanup on printer A must NOT clear the spool's freshly
+        created printer-B assignment. We only clear a spool whose location is one
+        of *our* slots.
+        """
+        if location_id is None:
+            return False
+        loc = await db.get(Location, location_id)
+        if not loc:
+            return False
+        cf = loc.custom_fields
+        if isinstance(cf, str):
+            try:
+                cf = json.loads(cf)
+            except Exception:
+                cf = {}
+        if not isinstance(cf, dict) or cf.get("managed_by") != "bambuddy_plugin":
+            return False
+        return str(cf.get("printer_id")) == str(self.printer_id)
+
+    async def _restore_spool_location(self, filaman_spool_id: int) -> None:
+        """Clears a spool's location when it leaves its AMS tray.
+
+        A spool that is displaced (another spool takes its slot) or physically
+        removed is set to *no* location — we do not send it back to wherever it
+        came from. Only locations this plugin manages (AMS slots) are cleared, so
+        a manually-set location is never stomped.
+        """
+        # Stale original-location bookkeeping is no longer used; drop any leftover.
+        self._spool_original_location.pop(filaman_spool_id, None)
+
+        # Still assigned to another slot → that assignment wins, clear nothing.
         if filaman_spool_id in list(self._slot_to_filaman_spool.values()):
             return
-
-        original_location_id = self._spool_original_location.pop(filaman_spool_id)
 
         try:
             async with async_session_maker() as db:
                 spool = await db.get(Spool, filaman_spool_id)
-                if spool and spool.location_id != original_location_id:
+                if (
+                    spool
+                    and spool.location_id is not None
+                    and await self._is_own_slot_location(db, spool.location_id)
+                ):
                     await SpoolService(db).move_location(
                         spool,
-                        original_location_id,  # None = clear location (spool came from storage)
+                        None,  # no location — the spool was removed from the AMS
                         datetime.now(timezone.utc),
                         source="driver",
-                        note="Restored from AMS tray",
+                        note="Removed from AMS tray",
                     )
-            # Persistierten Original-Location-Eintrag aufräumen
+            # Persistierten (jetzt ungenutzten) Original-Location-Eintrag aufräumen
             await self._delete_original_location_db(filaman_spool_id)
         except Exception as e:
-            logger.warning(f"Failed to restore spool {filaman_spool_id} location: {e}")
+            logger.warning(f"Failed to clear spool {filaman_spool_id} location: {e}")
 
     async def _reconfigure_slot_with_profile(
         self, ams_id: int, tray_id: int, tray_info_idx: str, tray: dict
@@ -2793,6 +3095,142 @@ class Driver(BaseDriver):
 
     # -- Slot-Verarbeitung (AMS-Status → FilaMan Slots) ----------------------
 
+    # -- Slot-Verarbeitung (AMS-Status → FilaMan Slots) ----------------------
+
+    @staticmethod
+    def _tray_is_loaded(tray: dict) -> bool:
+        """True when Bambuddy/AMS reports a spool present in this tray."""
+        if tray.get("tray_type"):
+            return True
+        state = tray.get("state")
+        return state in (11, 12)
+
+    @staticmethod
+    def _tray_snapshot(tray: dict) -> dict[str, Any]:
+        """Compact tray state for pending-insert detection."""
+        return {
+            "present": Driver._tray_is_loaded(tray),
+            "tray_type": tray.get("tray_type") or "",
+            "tray_color": tray.get("tray_color") or "",
+            "state": tray.get("state"),
+            "tag_uid": (tray.get("tag_uid") or "").upper(),
+        }
+
+    async def _capture_pending_snapshot(self) -> None:
+        """Record AMS tray state at scan time (baseline for insert detection)."""
+        if not self._client or not self._bambuddy_printer_id:
+            self._pending_slot_snapshot = {
+                s["slot_index"]: {
+                    "present": s.get("present", False),
+                    "tray_type": s.get("tray_type") or "",
+                    "tray_color": s.get("tray_color") or "",
+                    "state": None,
+                    "tag_uid": "",
+                }
+                for s in self._current_slots
+            }
+            return
+        try:
+            r = await self._client.get(
+                f"{self._bambuddy_url}/api/v1/printers/{self._bambuddy_printer_id}/status"
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"status HTTP {r.status_code}")
+            status = r.json()
+            snap: dict[str, dict[str, Any]] = {}
+            for ams_unit in status.get("ams") or []:
+                ams_id = int(ams_unit.get("id", 0))
+                for tray in ams_unit.get("tray") or []:
+                    tray_id = int(tray.get("id", 0))
+                    snap[f"{ams_id}-{tray_id}"] = self._tray_snapshot(tray)
+            for vt in status.get("vt_tray") or []:
+                vt_id = int(vt.get("id", 254))
+                snap[f"255-{vt_id}"] = self._tray_snapshot(vt)
+            self._pending_slot_snapshot = snap
+            logger.info(
+                f"Pending snapshot captured for printer {self.printer_id}: "
+                f"{sum(1 for v in snap.values() if v.get('present'))} loaded slot(s)"
+            )
+        except Exception as e:
+            logger.debug(f"Could not capture pending slot snapshot: {e}")
+            self._pending_slot_snapshot = {
+                s["slot_index"]: {
+                    "present": s.get("present", False),
+                    "tray_type": s.get("tray_type") or "",
+                    "tray_color": s.get("tray_color") or "",
+                    "state": None,
+                    "tag_uid": "",
+                }
+                for s in self._current_slots
+            }
+
+    def _try_match_pending_tray(
+        self, slot_index: str, tray: dict
+    ) -> tuple[bool, str]:
+        """Return (matched, reason) if this tray was inserted since scan."""
+        if self._pending_spool_id is None:
+            return False, ""
+        if not self._tray_is_loaded(tray):
+            return False, ""
+
+        tray_tag_uid = (tray.get("tag_uid") or "").upper()
+        baseline = (self._pending_slot_snapshot or {}).get(slot_index)
+        prev_slot = next(
+            (s for s in self._current_slots if s["slot_index"] == slot_index),
+            None,
+        )
+        ref = baseline if baseline is not None else (
+            {
+                "present": prev_slot.get("present", False) if prev_slot else False,
+                "tray_type": (prev_slot or {}).get("tray_type") or "",
+                "tray_color": (prev_slot or {}).get("tray_color") or "",
+                "state": None,
+                "tag_uid": "",
+            }
+            if prev_slot
+            else None
+        )
+
+        rfid_matched = bool(
+            tray_tag_uid
+            and self._pending_rfid_hex
+            and tray_tag_uid == self._pending_rfid_hex
+        )
+        if rfid_matched:
+            return True, "rfid"
+
+        was_empty = ref is None or not ref.get("present", False)
+        ref_state = ref.get("state") if ref else None
+        now_state = tray.get("state")
+        state_loaded = now_state in (11, 12) and ref_state in (9, 0, None, "") and was_empty
+
+        tray_type = tray.get("tray_type") or ""
+        tray_color = tray.get("tray_color") or ""
+        prev_tray_type = (ref.get("tray_type") or "") if ref else ""
+        prev_tray_color = (ref.get("tray_color") or "") if ref else ""
+        content_changed = (
+            not was_empty
+            and ref is not None
+            and ref.get("present", False)
+            and (tray_type != prev_tray_type or tray_color != prev_tray_color)
+        )
+
+        if was_empty or state_loaded:
+            return True, "slot-appeared"
+        if content_changed:
+            return True, "direct-swap"
+        return False, ""
+
+    def _fire_pending_assignment(self, ams_id: int, tray_id: int, reason: str) -> None:
+        logger.info(
+            f"Pending spool {self._pending_spool_id} matched "
+            f"AMS {ams_id}/{tray_id} ({reason})"
+        )
+        self.send_filament_to_tray(
+            ams_id, tray_id, {**(self._pending_filament_data or {})}
+        )
+        self._clear_pending_peers()
+
     def _process_slots(self, printer_status: dict) -> None:
         """AMS-Daten aus Bambuddy printer_status verarbeiten und slots_update emittieren."""
         ams_list = printer_status.get("ams", [])
@@ -2878,52 +3316,9 @@ class Driver(BaseDriver):
                 )
 
                 # Pending spool: fire send_filament_to_tray when a spool is inserted.
-                #
-                # Two strategies in priority order:
-                # 1. RFID match — tray tag_uid equals pending spool's rfid_uid.
-                #    Works for genuine Bambu spools whose NFC the AMS can read.
-                # 2. Slot-appeared match — slot transitioned empty → occupied.
-                #    Works for all third-party spools (tag_uid stays null because
-                #    the AMS cannot read external RFID stickers; only the scale can).
-                if self._pending_spool_id is not None and tray_type:
-                    tray_tag_uid = (tray.get("tag_uid") or "").upper()
-                    prev_slot = next(
-                        (s for s in self._current_slots if s["slot_index"] == slot_index),
-                        None,
-                    )
-                    slot_was_empty = prev_slot is None or not prev_slot.get("present", False)
-
-                    rfid_matched = bool(
-                        tray_tag_uid
-                        and self._pending_rfid_hex
-                        and tray_tag_uid == self._pending_rfid_hex
-                    )
-                    # For third-party spools tag_uid is null; fall back to slot transition.
-                    # Also detect direct swaps: if Bambuddy collapses occupied→empty→occupied
-                    # into a single occupied→occupied snapshot, slot_was_empty is False even
-                    # though a physical spool swap happened. Treat content changes (type or
-                    # color differing from previous snapshot) as a swap trigger.
-                    prev_tray_type = (prev_slot.get("tray_type") or "") if prev_slot else ""
-                    prev_tray_color = (prev_slot.get("tray_color") or "") if prev_slot else ""
-                    content_changed = (
-                        not slot_was_empty
-                        and prev_slot is not None
-                        and prev_slot.get("present", False)
-                        and not tray_tag_uid
-                        and (tray_type != prev_tray_type or tray_color != prev_tray_color)
-                    )
-                    slot_matched = (slot_was_empty or content_changed) and not tray_tag_uid
-
-                    if rfid_matched or slot_matched:
-                        reason = "rfid" if rfid_matched else ("direct-swap" if content_changed else "slot-appeared")
-                        logger.info(
-                            f"Pending spool {self._pending_spool_id} matched "
-                            f"AMS {ams_id}/tray {tray_id} ({reason})"
-                        )
-                        self.send_filament_to_tray(
-                            ams_id, tray_id, {**self._pending_filament_data}
-                        )
-                        self._clear_pending_peers()
+                matched, reason = self._try_match_pending_tray(slot_index, tray)
+                if matched:
+                    self._fire_pending_assignment(ams_id, tray_id, reason)
 
                 # Specific (non-generic) profile on a known slot: learn it.
                 # Captures the AMS code Bambuddy resolved when the user manually
@@ -3016,33 +3411,10 @@ class Driver(BaseDriver):
                 }
             )
 
-            # Pending spool matching for external/bypass tray — same logic as AMS trays
-            if self._pending_spool_id is not None and vt_type:
-                vt_tag_uid = (vt.get("tag_uid") or "").upper()
-                prev_vt = next(
-                    (s for s in self._current_slots if s["slot_index"] == vt_idx),
-                    None,
-                )
-                vt_was_empty = prev_vt is None or not prev_vt.get("present", False)
-
-                rfid_matched = bool(
-                    vt_tag_uid
-                    and self._pending_rfid_hex
-                    and vt_tag_uid == self._pending_rfid_hex
-                )
-                slot_matched = vt_was_empty and not vt_tag_uid
-
-                if rfid_matched or slot_matched:
-                    reason = "rfid" if rfid_matched else "slot-appeared"
-                    ams_id_ext, tray_id_ext = 255, vt_id
-                    logger.info(
-                        f"Pending spool {self._pending_spool_id} matched "
-                        f"external tray {ams_id_ext}/{tray_id_ext} ({reason})"
-                    )
-                    self.send_filament_to_tray(
-                        ams_id_ext, tray_id_ext, {**self._pending_filament_data}
-                    )
-                    self._clear_pending_peers()
+            # Pending spool matching for external/bypass tray
+            matched, reason = self._try_match_pending_tray(vt_idx, vt)
+            if matched:
+                self._fire_pending_assignment(255, vt_id, reason)
 
             # Late-NFC reconfigure for external tray
             if (
