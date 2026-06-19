@@ -1934,11 +1934,19 @@ class Driver(BaseDriver):
                 except Exception as e:
                     logger.warning(f"Could not mint ws-token (will try without): {e}")
 
+                # Keepalive tuning: Bambuddy's event loop periodically stalls for
+                # several seconds while it polls the printer / rebuilds inventory,
+                # so it occasionally fails to answer a keepalive ping within a
+                # short window. A 10s ping_timeout caused frequent false
+                # disconnects ("sent 1011 keepalive ping timeout"). We keep
+                # sending pings (so genuinely dead TCP connections are still
+                # detected and trigger a reconnect) but give the server a much
+                # more generous window to respond before tearing the socket down.
                 async with websockets.connect(
                     uri,
                     additional_headers={"X-API-Key": self._api_key},
                     ping_interval=30,
-                    ping_timeout=10,
+                    ping_timeout=90,
                 ) as ws:
                     self._ws_connected = True
                     logger.info(f"WebSocket connected: {uri}")
