@@ -979,6 +979,21 @@ class Driver(BaseDriver):
             return entry.get("name") or entry.get("displayName")
         return None
 
+    async def resolve_preset_label(self, code: str | None = None) -> dict[str, Any]:
+        """Public action: resolves a stored code to its display name for the UI.
+
+        The FilaMan picker only loads the selectable cloud-preset catalog
+        (cloud/filaments + builtins). Codes reflected from the printer's AMS
+        (e.g. "SUN20010") live in the separate filament-id-map and are therefore
+        absent from that catalog, so the picker would otherwise show the raw
+        code. This lets the UI look up the readable name without polluting the
+        selectable list. Returns {"code": code, "name": <resolved or code>}.
+        """
+        if not code:
+            return {"code": "", "name": ""}
+        name = await self.resolve_preset_name(code)
+        return {"code": code, "name": name or code}
+
     async def _get_bambuddy_spool_id(self, filaman_spool_id: int) -> int | None:
         """Liest die in FilaMan gespeicherte Bambuddy-Spool-ID einer Spule."""
         try:
@@ -1067,6 +1082,36 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.debug(
                 f"Could not store slicer custom_fields for spool "
+                f"{filaman_spool_id}: {e}"
+            )
+
+    async def _upsert_spool_color_custom_field(
+        self, filaman_spool_id: int, color_name: str | None
+    ) -> None:
+        """Spiegelt den Hersteller-Farbnamen in die Spool-custom_fields.
+
+        Bambuddys Spoolman-Sync liest ``bambu_color_name`` aus den Spool-extra-
+        Feldern (in FilaMan = ``Spool.custom_fields``). Fehlt das Feld, synthetisiert
+        Bambuddy den Farbnamen aus dem Subtyp (Material-losen Designation-Rest) und
+        zeigt z.B. "Matte" statt des echten Hersteller-Farbnamens. Wir schreiben den
+        FilaMan-Farbnamen daher hierher, damit die Bambuddy-Inventarliste den
+        korrekten Namen anzeigt. FilaMan ist maßgeblich (Filament-Eigenschaft).
+        """
+        if not filaman_spool_id or not color_name:
+            return
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, filaman_spool_id)
+                if spool is None:
+                    return
+                cf = dict(spool.custom_fields or {})
+                if cf.get("bambu_color_name") != color_name:
+                    cf["bambu_color_name"] = color_name
+                    spool.custom_fields = cf
+                    await db.commit()
+        except Exception as e:
+            logger.debug(
+                f"Could not store color custom_field for spool "
                 f"{filaman_spool_id}: {e}"
             )
 
@@ -1384,6 +1429,7 @@ class Driver(BaseDriver):
           filament.material_type                    → material
           filament.manufacturer.name                → brand
           filament.filament_colors[0].color.hex_code→ rgba (8-stellig RRGGBBAA)
+          filament.manufacturer_color_name          → color_name
           initial_total_weight_g                    → label_weight
           initial - remaining                       → weight_used
           rfid_uid                                  → tag_uid
@@ -1438,6 +1484,11 @@ class Driver(BaseDriver):
             "weight_locked": False,
             "note": f"filaman:{spool.id}",
         }
+
+        # Hersteller-Farbname (FilaMan) → Bambuddy color_name (Inventar-Feld).
+        # FilaMan ist maßgeblich für den Farbnamen (Filament-Eigenschaft).
+        if fil and fil.manufacturer_color_name:
+            payload["color_name"] = fil.manufacturer_color_name
 
         if spool.rfid_uid:
             payload["tag_uid"] = self._to_hex_tag(spool.rfid_uid)
@@ -1601,6 +1652,14 @@ class Driver(BaseDriver):
                         await self._upsert_spool_slicer_custom_fields(
                             fm_id, eff_code, eff_name
                         )
+
+                # Hersteller-Farbname in custom_fields spiegeln, damit Bambuddys
+                # Spoolman-Sync ihn als bambu_color_name liest und in der Inventar-
+                # liste anzeigt (statt den synthetisierten Subtyp). Backfillt auch
+                # bestehende Spulen beim nächsten Sync.
+                await self._upsert_spool_color_custom_field(
+                    fm_id, payload.get("color_name")
+                )
 
             # 4. Veraltete Bambuddy-Spulen entfernen
             for note_key, bb_spool in note_index.items():
