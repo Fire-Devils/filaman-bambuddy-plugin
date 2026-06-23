@@ -233,6 +233,9 @@ class Driver(BaseDriver):
     _url_sync_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     _url_instances: ClassVar[dict[str, list["Driver"]]] = {}
     _url_last_sync: ClassVar[dict[str, float]] = {}
+    # Differential-sync cache: last payload successfully sent to Bambuddy per spool.
+    # Keyed by bambuddy_url → {fm_spool_id → payload_dict}. Skips PATCH when unchanged.
+    _url_last_payloads: ClassVar[dict[str, dict[int, dict]]] = {}
     # After any debounce-triggered sync, block further debounce syncs for this
     # long. Longer than the WS reconnect interval (~5-10 min) so each reconnect
     # burst of inventory_changed events only triggers one sync at most.
@@ -1830,27 +1833,36 @@ class Driver(BaseDriver):
                 try:
                     if existing is not None:
                         bb_id = existing["id"]
-                        await self._bb_patch(
-                            f"/api/v1/inventory/spools/{bb_id}", payload
-                        )
-                        # Sicherstellen, dass bambuddy_spool_id auch bei bestehenden
-                        # Spulen in der FilaMan-DB vorhanden ist (idempotentes UPSERT).
+                        # Differential sync: only PATCH when payload actually changed.
+                        last_payload = self._url_last_payloads.get(
+                            self._bambuddy_url, {}
+                        ).get(fm_id)
+                        if payload != last_payload:
+                            await self._bb_patch(
+                                f"/api/v1/inventory/spools/{bb_id}", payload
+                            )
+                            self._url_last_payloads.setdefault(
+                                self._bambuddy_url, {}
+                            )[fm_id] = payload
+                            # Throttle only for actual API calls.
+                            await asyncio.sleep(0.05)
+                        # Always keep FilaMan's bambuddy_spool_id in sync (idempotent).
                         await self._store_bambuddy_id_db(fm_id, bb_id)
                     else:
                         response = await self._bb_post(
                             "/api/v1/inventory/spools", payload
                         )
                         bb_id = response["id"]
-                        # Bambuddy-Spool-ID direkt in FilaMan-DB speichern
                         await self._store_bambuddy_id_db(fm_id, bb_id)
+                        self._url_last_payloads.setdefault(
+                            self._bambuddy_url, {}
+                        )[fm_id] = payload
                         logger.info(
                             f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
                         )
+                        await asyncio.sleep(0.05)
+                    # Must add unconditionally — orphan-deletion uses this set.
                     synced_fm_ids.add(fm_id)
-                    # Throttle: yield control between PATCHes so Bambuddy's event
-                    # loop can service UI/WebSocket requests during the sync.
-                    # 50ms × 50 spools ≈ 2.5s total spread instead of a burst.
-                    await asyncio.sleep(0.05)
                 except Exception as e:
                     logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
 
@@ -2048,7 +2060,10 @@ class Driver(BaseDriver):
                     )
                 )
                 await db.commit()
-            # 3. Neu synchronisieren (Lock bereits gehalten, direkt _do_sync_inner aufrufen)
+            # 3. Differential-sync cache leeren, damit der erzwungene Resync alle
+            #    Spulen neu zu Bambuddy schickt (kein Skip durch alten Cache-Stand).
+            self._url_last_payloads.pop(self._bambuddy_url, None)
+            # 4. Neu synchronisieren (Lock bereits gehalten, direkt _do_sync_inner aufrufen)
             await self._do_sync_inner()
             self._url_last_sync[self._bambuddy_url] = time.monotonic()
             logger.info(f"Full resync complete for URL {self._bambuddy_url}")
