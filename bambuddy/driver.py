@@ -233,7 +233,11 @@ class Driver(BaseDriver):
     _url_sync_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     _url_instances: ClassVar[dict[str, list["Driver"]]] = {}
     _url_last_sync: ClassVar[dict[str, float]] = {}
-    _SYNC_COOLDOWN: ClassVar[float] = 5.0  # Sekunden
+    # After any debounce-triggered sync, block further debounce syncs for this
+    # long. Longer than the WS reconnect interval (~5-10 min) so each reconnect
+    # burst of inventory_changed events only triggers one sync at most.
+    # User-initiated changes (schedule_sync / _on_session_commit) bypass this.
+    _SYNC_COOLDOWN: ClassVar[float] = 60.0  # Sekunden
 
     def __init__(
         self,
@@ -320,6 +324,11 @@ class Driver(BaseDriver):
         # reconnects internally). Counts consecutive short-lived connections so
         # a brief Bambuddy hiccup recovers in ~1s while a real outage backs off.
         self._ws_reconnect_attempt: int = 0
+        # Timestamp of the last successful WS connect. Used to suppress
+        # inventory_changed sync triggers for a grace period after reconnect
+        # (the startup fetch already pushed current state; hammering Bambuddy
+        # with a full 50-spool PATCH storm on every reconnect freezes its UI).
+        self._ws_last_connected_at: float = 0.0
 
         # -- Event Emission Tracking --
         self._last_status_emit: float = 0.0
@@ -1838,6 +1847,10 @@ class Driver(BaseDriver):
                             f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
                         )
                     synced_fm_ids.add(fm_id)
+                    # Throttle: yield control between PATCHes so Bambuddy's event
+                    # loop can service UI/WebSocket requests during the sync.
+                    # 50ms × 50 spools ≈ 2.5s total spread instead of a burst.
+                    await asyncio.sleep(0.05)
                 except Exception as e:
                     logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
 
@@ -2201,6 +2214,7 @@ class Driver(BaseDriver):
                 ) as ws:
                     self._ws_connected = True
                     connected_at = time.monotonic()
+                    self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
                     # Reset restart counter bei erfolgreicher Verbindung
@@ -2293,7 +2307,18 @@ class Driver(BaseDriver):
         elif event_type == "inventory_changed":
             # Refresh-on-save: ein Profil-/Inventory-Wechsel in Bambuddy stößt
             # einen (debounced) Sync an, damit FilaMan zeitnah nachzieht.
-            await self._debounced_sync()
+            # Grace period: skip for 120s after a WS reconnect. Bambuddy fires
+            # a burst of inventory_changed events to every new WS client; acting
+            # on them triggers a 50-spool PATCH storm that freezes Bambuddy's UI.
+            # The startup _fetch_and_emit_status already got current state.
+            since_connect = time.monotonic() - self._ws_last_connected_at
+            if since_connect < 120.0:
+                logger.debug(
+                    f"Skipping inventory_changed sync: {since_connect:.0f}s since "
+                    f"WS reconnect (grace window 120s)"
+                )
+            else:
+                await self._debounced_sync()
 
     async def _handle_print_complete(self, data: dict) -> None:
         """Meldet Filament-Verbrauch nach Druckende an FilaMan.
