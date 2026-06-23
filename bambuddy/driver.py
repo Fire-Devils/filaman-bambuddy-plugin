@@ -1843,7 +1843,7 @@ class Driver(BaseDriver):
                             )
                             self._url_last_payloads.setdefault(
                                 self._bambuddy_url, {}
-                            )[fm_id] = payload
+                            )[fm_id] = dict(payload)
                             # Throttle only for actual API calls.
                             await asyncio.sleep(0.05)
                         # Always keep FilaMan's bambuddy_spool_id in sync (idempotent).
@@ -1856,7 +1856,7 @@ class Driver(BaseDriver):
                         await self._store_bambuddy_id_db(fm_id, bb_id)
                         self._url_last_payloads.setdefault(
                             self._bambuddy_url, {}
-                        )[fm_id] = payload
+                        )[fm_id] = dict(payload)
                         logger.info(
                             f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
                         )
