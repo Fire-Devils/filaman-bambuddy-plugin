@@ -3,7 +3,7 @@
   "name": "Bambuddy",
   "driver_key": "bambuddy",
   "plugin_type": "driver",
-  "version": "1.1.20",
+  "version": "1.3.4",
   "description": "Connects to printers managed by Bambuddy. Receives real-time AMS slot data via WebSocket and supports manual and automatic spool assignment.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
@@ -48,6 +48,20 @@
         "default": 3600,
         "minimum": 60,
         "maximum": 86400
+      },
+      "per_model_profiles": {
+        "type": "string",
+        "title": "Per-Model Slicer Profiles",
+        "description": "When enabled, cloud profiles are stored per printer model (P2S, H2C, etc.) with automatic nozzle resolution. Disable to fall back to single-profile behavior.",
+        "enum": ["enabled", "disabled"],
+        "default": "enabled"
+      },
+      "per_printer_profiles": {
+        "type": "string",
+        "title": "Per-Printer Slicer Profiles (legacy alias)",
+        "description": "Deprecated alias for per_model_profiles. When enabled, picking a cloud profile resolves and stores a separate printer/nozzle-specific variant (PFUS) per printer model, and the AMS configure call sends the correct profile as setting_id.",
+        "enum": ["enabled", "disabled"],
+        "default": "enabled"
       }
     },
     "required": ["bambuddy_url", "api_key", "printer_id"]
@@ -69,6 +83,7 @@
       {"key": "bambu_bed_temp", "label": "Bed Temperature", "field_type": "number"},
       {"key": "bambu_nozzle_temp_min", "label": "Nozzle Temp Min", "field_type": "number"},
       {"key": "bambu_nozzle_temp_max", "label": "Nozzle Temp Max", "field_type": "number"},
+      {"key": "bambu_default_nozzle_mm", "label": "Default Nozzle Diameter (mm)", "field_type": "number", "description": "Only used when Bambuddy does not report the installed nozzle size. Update when you swap nozzles."},
       {"key": "bambu_max_volumetric_speed", "label": "Max Volumetric Speed", "field_type": "number"},
       {"key": "bambuddy_spool_id", "label": "Bambuddy Spool ID", "field_type": "text", "system": true, "target_type": "spool_printer_param"}
     ],
