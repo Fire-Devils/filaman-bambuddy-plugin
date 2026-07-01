@@ -4874,6 +4874,7 @@ class Driver(BaseDriver):
         """
         try:
             slot_location_name = self._generate_slot_location_name(ams_id, tray_id)
+            slot_key = f"{ams_id}-{tray_id}"
 
             async with async_session_maker() as db:
                 # 1. Location suchen (case-insensitive)
@@ -4897,6 +4898,34 @@ class Driver(BaseDriver):
                     db.add(location)
                     await db.flush()  # Für location.id
                     logger.info(f"Created location: {slot_location_name}")
+
+                # 2b. Stale occupant(s) aus DB evakuieren, bevor die neue Spule
+                # zugewiesen wird. Die In-Memory-Map (_slot_to_filaman_spool)
+                # überlebt keinen Driver-/Container-Neustart, daher darf sich die
+                # Eviction NICHT allein auf sie verlassen — sonst bleiben alte
+                # Spulen an einem AMS-Slot "kleben" und mehrere Spulen zeigen auf
+                # dieselbe Location (nur eine Spule kann physisch in einem Slot
+                # stecken). Die DB ist hier die verlässliche Quelle der Wahrheit.
+                stale_result = await db.execute(
+                    select(Spool).where(
+                        Spool.location_id == location.id,
+                        Spool.id != filaman_spool_id,
+                    )
+                )
+                for stale_spool in stale_result.scalars().all():
+                    await SpoolService(db).move_location(
+                        stale_spool,
+                        None,
+                        datetime.now(timezone.utc),
+                        source="driver",
+                        note="Removed from AMS tray (replaced)",
+                    )
+                    logger.info(
+                        f"Evicted stale spool {stale_spool.id} from location "
+                        f"'{slot_location_name}' (replaced by spool "
+                        f"{filaman_spool_id})"
+                    )
+                    self._slot_to_filaman_spool.pop(slot_key, None)
 
                 # 3. Spule zur Location bewegen (wenn nicht bereits dort)
                 spool = await db.get(Spool, filaman_spool_id)
