@@ -1772,6 +1772,19 @@ class Driver(BaseDriver):
         live_nozzle = ctx.get("nozzle_mm")
         fm_spool_id = _int_or_none(filament_data.get("id"))
         filament_id = _int_or_none(filament_data.get("filament_id"))
+        # Callers don't always include filament_id (older backends / third-party
+        # plugins) — resolve it from the spool so the filament-level profile
+        # fallbacks below actually fire.
+        if filament_id is None and fm_spool_id:
+            try:
+                async with async_session_maker() as db:
+                    spool = await db.get(Spool, fm_spool_id)
+                    if spool:
+                        filament_id = spool.filament_id
+            except Exception as e:
+                logger.debug(
+                    f"Could not resolve filament_id for spool {fm_spool_id}: {e}"
+                )
         if live_nozzle is None:
             live_nozzle = await self._get_default_nozzle_mm(
                 self.printer_id, spool_id=fm_spool_id, filament_id=filament_id
