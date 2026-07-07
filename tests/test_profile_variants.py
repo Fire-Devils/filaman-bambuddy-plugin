@@ -5,11 +5,15 @@ from profile_variants import (
     build_variant_groups_from_index,
     build_variant_index_from_presets,
     canonical_printer_model_token,
+    compute_profile_backfill_diff,
     expected_cloud_preset_name,
     extract_profile_base_name,
+    extract_profile_overrides,
     filter_grouped_presets_for_model,
     group_presets_by_base_name,
     infer_preset_models,
+    is_override_profile_source,
+    normalize_profiles_for_filament_copy,
     parse_cloud_preset_name,
     preset_applies_to_model,
     resolve_cloud_variant_detailed,
@@ -300,3 +304,68 @@ def test_group_presets_by_base_name_filters_model() -> None:
     assert len(grouped) == 1
     assert grouped[0]["baseName"] == "SUNLU PLA PLUS GEN2"
     assert grouped[0]["displayName"] == "SUNLU PLA PLUS GEN2"
+
+
+def test_is_override_profile_source() -> None:
+    assert is_override_profile_source("override")
+    assert is_override_profile_source("manual")
+    assert not is_override_profile_source("linked")
+    assert not is_override_profile_source(None)
+
+
+def test_normalize_profiles_for_filament_copy() -> None:
+    raw = {
+        "P2S": {"base_name": "Generic PLA", "source": "manual"},
+        "X1C": {"base_name": "Generic PLA", "source": "linked"},
+    }
+    out = normalize_profiles_for_filament_copy(raw)
+    assert out["P2S"]["source"] == "override"
+    assert out["X1C"]["source"] == "linked"
+
+
+def test_extract_profile_overrides_any_connected_model() -> None:
+    profiles = {
+        "A1MINI": {"base_name": "Sunlu ABS", "source": "override"},
+        "P1S": {"base_name": "Sunlu ABS", "source": "linked"},
+    }
+    assert extract_profile_overrides(profiles) == {"A1MINI": "Sunlu ABS"}
+
+
+def test_compute_profile_backfill_diff_uses_connected_models() -> None:
+    connected = ["P2S", "H2C", "X1C"]
+    source_profiles = {
+        "P2S": {"base_name": "Sunlu ABS", "source": "linked"},
+        "H2C": {"base_name": "Sunlu ABS Pro", "source": "override"},
+        "X1C": {"base_name": "Sunlu ABS", "source": "linked"},
+    }
+    target_profiles = {
+        "P2S": {"base_name": "Generic PLA", "source": "linked"},
+    }
+    diff = compute_profile_backfill_diff(
+        connected_models=connected,
+        source_default="Sunlu ABS",
+        source_profiles=source_profiles,
+        target_default="Generic PLA",
+        target_profiles=target_profiles,
+    )
+    assert diff["default_changes"] is True
+    assert diff["filament_already_matches"] is False
+    models = {c["model"] for c in diff["model_changes"]}
+    assert models == {"P2S", "H2C", "X1C"}
+
+
+def test_compute_profile_backfill_diff_already_matches() -> None:
+    connected = ["P2S", "A1"]
+    profiles = {
+        "P2S": {"base_name": "Sunlu PETG", "source": "linked"},
+        "A1": {"base_name": "Sunlu PETG Special", "source": "override"},
+    }
+    diff = compute_profile_backfill_diff(
+        connected_models=connected,
+        source_default="Sunlu PETG",
+        source_profiles=profiles,
+        target_default="Sunlu PETG",
+        target_profiles=profiles,
+    )
+    assert diff["filament_already_matches"] is True
+    assert diff["model_changes"] == []

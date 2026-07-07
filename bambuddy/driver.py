@@ -56,6 +56,10 @@ from .profile_variants import (
     resolve_cloud_variant_detailed,
     resolve_cloud_variant_from_index,
     uniform_variant_code,
+    compute_profile_backfill_diff,
+    extract_profile_overrides,
+    is_override_profile_source,
+    normalize_profiles_for_filament_copy,
 )
 
 logger = logging.getLogger(__name__)
@@ -2725,6 +2729,210 @@ class Driver(BaseDriver):
             "profiles_by_model": profiles,
             "coverage": coverage,
             "variants": variants_by_model,
+        }
+
+    async def _load_spool_backfill_source(self, spool_id: int) -> dict[str, Any]:
+        """Read persisted spool profile data for backfill (not inherited filament rows)."""
+        async with async_session_maker() as db:
+            spool = await db.get(Spool, int(spool_id))
+            if not spool:
+                raise ValueError(f"Spool {spool_id} not found")
+            if not spool.filament_id:
+                raise ValueError("Spool has no filament")
+            filament_id = int(spool.filament_id)
+
+        default_base = await self._read_spool_default_base_name(int(spool_id))
+        profiles = await self._read_spool_profiles_by_model(int(spool_id))
+        connected_models = sorted((await self._model_printer_map()).keys())
+
+        if not default_base and not profiles:
+            return {
+                "can_backfill": False,
+                "reason": "no_spool_profiles",
+                "spool_id": int(spool_id),
+                "filament_id": filament_id,
+                "connected_models": connected_models,
+            }
+
+        if not default_base:
+            default_base = self._infer_default_base_name(profiles, "")
+
+        effective_profiles = normalize_profiles_for_filament_copy(profiles)
+        if default_base:
+            effective_profiles = await self._link_default_to_models(
+                effective_profiles,
+                default_base,
+                spool_id=int(spool_id),
+                filament_id=filament_id,
+            )
+
+        return {
+            "can_backfill": True,
+            "spool_id": int(spool_id),
+            "filament_id": filament_id,
+            "default_base_name": default_base,
+            "profiles_by_model": profiles,
+            "effective_profiles": effective_profiles,
+            "connected_models": connected_models,
+            "overrides": extract_profile_overrides(profiles),
+        }
+
+    async def preview_backfill_spool_profiles_to_filament(
+        self, spool_id: int
+    ) -> dict[str, Any]:
+        """Read-only preview: spool profiles → parent filament (+ diff vs connected models)."""
+        source = await self._load_spool_backfill_source(int(spool_id))
+        if not source.get("can_backfill"):
+            return source
+
+        filament_id = int(source["filament_id"])
+        target_default = await self._read_filament_default_base_name(filament_id)
+        target_profiles = await self._read_filament_profiles_by_model(filament_id)
+        if not target_default:
+            target_default = self._infer_default_base_name(target_profiles, "")
+
+        effective_target = normalize_profiles_for_filament_copy(target_profiles)
+        if target_default:
+            effective_target = await self._link_default_to_models(
+                effective_target,
+                target_default,
+                filament_id=filament_id,
+            )
+
+        changes = compute_profile_backfill_diff(
+            connected_models=source["connected_models"],
+            source_default=source["default_base_name"],
+            source_profiles=source["effective_profiles"],
+            target_default=target_default,
+            target_profiles=effective_target,
+        )
+        coverage = await self._resolve_model_coverage_map(
+            source["effective_profiles"],
+            spool_id=int(spool_id),
+            filament_id=filament_id,
+        )
+
+        return {
+            "can_backfill": True,
+            "spool_id": int(spool_id),
+            "filament_id": filament_id,
+            "connected_models": source["connected_models"],
+            "source": {
+                "default_base_name": source["default_base_name"],
+                "profiles_by_model": source["effective_profiles"],
+                "overrides": source["overrides"],
+            },
+            "current_filament": {
+                "default_base_name": target_default,
+                "profiles_by_model": effective_target,
+                "overrides": extract_profile_overrides(target_profiles),
+            },
+            "changes": changes,
+            "filament_already_matches": changes.get("filament_already_matches", False),
+            "coverage": coverage,
+        }
+
+    async def _apply_profiles_to_sibling_spools(
+        self,
+        filament_id: int,
+        profiles: dict[str, dict[str, str]],
+        default_base: str,
+        variants_by_model: dict[str, str],
+        rep_code: str | None,
+    ) -> int:
+        """Push profile map to all non-archived spools on a filament."""
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(Spool.id)
+                .join(SpoolStatus)
+                .where(
+                    Spool.filament_id == int(filament_id),
+                    SpoolStatus.key != "archived",
+                )
+            )
+            spool_ids = [row[0] for row in result.all()]
+
+        applied = 0
+        for sid in spool_ids:
+            try:
+                await self._write_spool_profiles_by_model(sid, dict(profiles))
+                await self._mirror_pfus_by_model(
+                    variants_by_model, spool_id=sid, spool=True
+                )
+                await self._upsert_spool_profile_base_name(sid, default_base)
+                await self._mirror_spool_generic_indices_from_variants(
+                    sid, variants_by_model
+                )
+                if rep_code:
+                    await self._sync_spool_inventory_display(sid, variants_by_model)
+                applied += 1
+            except Exception as e:
+                logger.warning(
+                    f"backfill sibling apply failed for spool {sid}: {e}"
+                )
+        return applied
+
+    async def backfill_spool_profiles_to_filament(
+        self,
+        spool_id: int,
+        *,
+        apply_to_sibling_spools: bool = False,
+    ) -> dict[str, Any]:
+        """Copy spool default + per-model profiles to parent filament (optional sibling push)."""
+        source = await self._load_spool_backfill_source(int(spool_id))
+        if not source.get("can_backfill"):
+            raise ValueError(source.get("reason") or "cannot backfill")
+
+        filament_id = int(source["filament_id"])
+        default_base = source["default_base_name"]
+        profiles = normalize_profiles_for_filament_copy(source["profiles_by_model"])
+        profiles = await self._link_default_to_models(
+            profiles,
+            default_base,
+            filament_id=filament_id,
+        )
+
+        await self._write_filament_profiles_by_model(filament_id, profiles)
+        await self._upsert_filament_profile_base_name(filament_id, default_base)
+        variants_by_model, _ = await self._resolve_and_mirror_profiles(
+            profiles, filament_id=filament_id, spool=False
+        )
+        coverage = await self._resolve_model_coverage_map(
+            profiles, filament_id=filament_id
+        )
+
+        rep_code = _uniform_variant_code(variants_by_model)
+        if rep_code:
+            async with async_session_maker() as db:
+                changed = await self._upsert_filament_bambu_idx(
+                    db,
+                    filament_id,
+                    await self._resolve_cloud_preset(rep_code) or rep_code,
+                )
+                if changed:
+                    await db.commit()
+
+        applied = 0
+        if apply_to_sibling_spools and variants_by_model:
+            applied = await self._apply_profiles_to_sibling_spools(
+                filament_id,
+                profiles,
+                default_base,
+                variants_by_model,
+                rep_code,
+            )
+        else:
+            await self._debounced_sync()
+
+        return {
+            "spool_id": int(spool_id),
+            "filament_id": filament_id,
+            "default_base_name": default_base,
+            "profiles_by_model": profiles,
+            "coverage": coverage,
+            "variants": variants_by_model,
+            "applied_to_spools": applied,
+            "connected_models": source["connected_models"],
         }
 
     async def set_default_filament_profile(

@@ -432,3 +432,103 @@ def expected_cloud_preset_name(
             f"(stock presets on any model may use @BBL {model_token} only)"
         )
     return f"{base_name} @BBL {model_token} {nozzle:g} nozzle"
+
+
+def is_override_profile_source(source: str | None) -> bool:
+    """True when a per-model row is an explicit override (not linked to default)."""
+    return (source or "").strip().lower() in ("override", "manual")
+
+
+def normalize_profile_source_for_filament(source: str | None) -> str:
+    """Map spool/filament profile sources to filament storage conventions."""
+    return "override" if is_override_profile_source(source) else "linked"
+
+
+def normalize_profiles_for_filament_copy(
+    profiles: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    """Copy profile map for filament storage, normalizing override/manual sources."""
+    out: dict[str, dict[str, str]] = {}
+    for model, entry in profiles.items():
+        base = (entry.get("base_name") or "").strip()
+        if not base:
+            continue
+        model_key = str(model).strip().upper()
+        out[model_key] = {
+            "base_name": base,
+            "source": normalize_profile_source_for_filament(entry.get("source")),
+        }
+    return out
+
+
+def extract_profile_overrides(
+    profiles: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Per-model override base names keyed by canonical model token."""
+    return {
+        str(model).strip().upper(): str(entry["base_name"]).strip()
+        for model, entry in profiles.items()
+        if is_override_profile_source(entry.get("source"))
+        and (entry.get("base_name") or "").strip()
+    }
+
+
+def effective_profile_base_for_model(
+    profiles: dict[str, dict[str, str]],
+    model: str,
+    default_base: str,
+) -> tuple[str, str]:
+    """Return ``(base_name, kind)`` for one connected model token."""
+    model_key = model.strip().upper()
+    entry = profiles.get(model_key) or {}
+    base = (entry.get("base_name") or "").strip()
+    source = (entry.get("source") or "").strip()
+    if is_override_profile_source(source) and base:
+        return base, "override"
+    if base:
+        return base, "linked" if source != "legacy" else "linked"
+    if default_base:
+        return default_base.strip(), "linked"
+    return "", "none"
+
+
+def compute_profile_backfill_diff(
+    *,
+    connected_models: list[str],
+    source_default: str,
+    source_profiles: dict[str, dict[str, str]],
+    target_default: str,
+    target_profiles: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Compare spool source vs filament target across all connected printer models."""
+    src_default = (source_default or "").strip()
+    tgt_default = (target_default or "").strip()
+    default_changes = bool(src_default and src_default != tgt_default)
+
+    model_changes: list[dict[str, str]] = []
+    for model in sorted({m.strip().upper() for m in connected_models if m}):
+        src_base, src_kind = effective_profile_base_for_model(
+            source_profiles, model, src_default
+        )
+        tgt_base, tgt_kind = effective_profile_base_for_model(
+            target_profiles, model, tgt_default
+        )
+        if not src_base:
+            continue
+        if src_base != tgt_base or src_kind != tgt_kind:
+            model_changes.append(
+                {
+                    "model": model,
+                    "from_base": tgt_base,
+                    "from_kind": tgt_kind,
+                    "to_base": src_base,
+                    "to_kind": src_kind,
+                }
+            )
+
+    filament_already_matches = not default_changes and not model_changes
+    return {
+        "default_changes": default_changes,
+        "model_changes": model_changes,
+        "filament_already_matches": filament_already_matches,
+    }
