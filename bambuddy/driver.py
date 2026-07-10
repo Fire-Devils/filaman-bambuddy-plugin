@@ -541,9 +541,10 @@ class Driver(BaseDriver):
             except Exception as e:
                 logger.warning(f"Failed to cleanup old bambuddy_spool_id entries: {e}")
 
-        if self._sync_enabled:
-            # Instanz registrieren (VOR erstem Sync, damit Peer-Erkennung funktioniert)
-            self._register()
+        # Always register for URL peer discovery. Per-model profile UI
+        # (connected-models / profile-coverage) needs every Bambuddy driver on
+        # this URL, even when inventory sync is disabled.
+        self._register()
 
         # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
@@ -603,24 +604,23 @@ class Driver(BaseDriver):
             await self._client.aclose()
             self._client = None
 
-        if self._sync_enabled:
-            # Instanz abmelden und ggf. Koordinator-Rolle delegieren
-            self._unregister()
-            if was_coordinator:
-                peers = self._url_instances.get(self._bambuddy_url, [])
-                if peers:
-                    new_coord = peers[0]
-                    if new_coord._running and (
-                        not new_coord._sync_task or new_coord._sync_task.done()
-                    ):
-                        new_coord._sync_task = asyncio.create_task(
-                            new_coord._sync_inventory_loop()
-                        )
-                        new_coord._sync_task.add_done_callback(new_coord._on_task_done)
-                        logger.info(
-                            f"Sync coordinator delegated to printer {new_coord.printer_id} "
-                            f"for {self._bambuddy_url}"
-                        )
+        # Always unregister from URL peer map (registered regardless of sync).
+        self._unregister()
+        if self._sync_enabled and was_coordinator:
+            peers = self._url_instances.get(self._bambuddy_url, [])
+            if peers:
+                new_coord = peers[0]
+                if new_coord._running and (
+                    not new_coord._sync_task or new_coord._sync_task.done()
+                ):
+                    new_coord._sync_task = asyncio.create_task(
+                        new_coord._sync_inventory_loop()
+                    )
+                    new_coord._sync_task.add_done_callback(new_coord._on_task_done)
+                    logger.info(
+                        f"Sync coordinator delegated to printer {new_coord.printer_id} "
+                        f"for {self._bambuddy_url}"
+                    )
 
         logger.info(f"Bambuddy driver stopped for printer {self.printer_id}")
 
