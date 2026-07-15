@@ -267,6 +267,28 @@ def _extract_bambu_idx(preset_id: str) -> str:
     return preset_id.split("_", 1)[1] if "_" in preset_id else preset_id
 
 
+def _is_known_ams_slicer_code(code: str) -> bool:
+    """True when *code* is already a tray-capable AMS/slicer identifier.
+
+    Builtin GFxx codes (GFA00, GFC00, …) and vendor SUN… codes are valid AMS
+    tray identifiers but are absent from the tiny cloud filament-id-map, so they
+    must not trigger filament-info lookups on every sync.
+    """
+    if not code:
+        return False
+    if code in _FILAMENT_IDX_TO_NAME:
+        return True
+    if code in _GENERIC_SLICER_ID_SET:
+        return True
+    if code in _BAMBU_BRAND_SLICER_IDS.values():
+        return True
+    upper = code.upper()
+    if len(upper) >= 4 and upper.isalnum() and upper == code.upper():
+        if upper.startswith(("GF", "SUN")):
+            return True
+    return False
+
+
 class Driver(BaseDriver):
     """Bambuddy-Driver mit bidirektionaler FilaMan↔Bambuddy Synchronisation.
 
@@ -406,7 +428,10 @@ class Driver(BaseDriver):
         self._cloud_idmap_ts: float = 0.0
         self._cloud_idmap_ttl: float = 3600.0  # 1h Cache
         # preset_id (PFUS…) → AMS-Code, einmal aufgelöst, dann gecached.
-        self._cloud_preset_cache: dict[str, str] = {}
+        # None = definitive miss (name found, not in id-map); expires after miss TTL.
+        self._cloud_preset_cache: dict[str, str | None] = {}
+        self._cloud_preset_miss_ts: dict[str, float] = {}
+        self._cloud_preset_miss_ttl: float = 86400.0  # 24h — retry definitive misses
 
         # -- Cloud-Profil-Picker (Option A) --
         # Gemergte Preset-Liste (cloud/filaments + builtin) für die FilaMan-UI.
@@ -886,64 +911,105 @@ class Driver(BaseDriver):
             idmap = await self._bb_get("/api/v1/cloud/filament-id-map")
             if isinstance(idmap, dict) and idmap and "detail" not in idmap:
                 # code → name  ⇒  name → code
-                self._cloud_idmap_reverse = {
-                    name: code for code, name in idmap.items()
-                }
-                self._cloud_idmap_forward = dict(idmap)
+                new_forward = dict(idmap)
+                new_reverse = {name: code for code, name in idmap.items()}
+                # Drop preset resolve cache when the id-map actually changes so
+                # previously unresolvable PFUS… codes can retry against new entries.
+                if new_forward != self._cloud_idmap_forward:
+                    self._cloud_preset_cache.clear()
+                    self._cloud_preset_miss_ts.clear()
+                self._cloud_idmap_reverse = new_reverse
+                self._cloud_idmap_forward = new_forward
                 self._cloud_idmap_ts = now
         except Exception as e:
             logger.debug(f"Could not load cloud filament-id-map: {e}")
         return self._cloud_idmap_reverse
 
+    def _cache_cloud_preset_result(
+        self, preset_id: str, code: str | None
+    ) -> str | None:
+        """Cache a resolve result (including TTL'd negative None) and return it."""
+        self._cloud_preset_cache[preset_id] = code
+        if code is None:
+            self._cloud_preset_miss_ts[preset_id] = time.monotonic()
+        else:
+            self._cloud_preset_miss_ts.pop(preset_id, None)
+        return code
+
+    def _get_cached_cloud_preset(self, preset_id: str) -> tuple[bool, str | None]:
+        """Return (hit, code). Negative hits expire after ``_cloud_preset_miss_ttl``."""
+        if preset_id not in self._cloud_preset_cache:
+            return False, None
+        code = self._cloud_preset_cache[preset_id]
+        if code is not None:
+            return True, code
+        miss_ts = self._cloud_preset_miss_ts.get(preset_id)
+        if miss_ts is None or (
+            time.monotonic() - miss_ts
+        ) >= self._cloud_preset_miss_ttl:
+            self._cloud_preset_cache.pop(preset_id, None)
+            self._cloud_preset_miss_ts.pop(preset_id, None)
+            return False, None
+        return True, None
+
     async def _resolve_cloud_preset(self, preset_id: str) -> str | None:
         """Löst einen Bambu-Cloud-Preset (z.B. "PFUS…") zum AMS-Code auf.
 
         Ablauf:
-          1. Ist es bereits ein bekannter AMS-Code (in der id-map)? → direkt zurück.
+          1. Ist es bereits ein bekannter AMS-Code (id-map, builtin GFxx/SUN…)? → direkt.
           2. filament-info(preset_id) → Anzeigename (z.B. "SUNLU PLA PLUS GEN2
              @Bambu Lab P2S 0.4 nozzle"); "@…"-Suffix entfernen → Basisname.
           3. Reverse-Lookup in der id-map: Basisname → AMS-Code (z.B. "SUN20013").
 
-        Ergebnisse werden gecached. Gibt None zurück wenn nicht auflösbar
-        (z.B. Cloud nicht verbunden oder unbekannter Custom-Preset).
+        Positive Treffer bleiben gecached bis die id-map sich ändert. Definitive
+        Misses (Name gefunden, nicht in id-map) werden 24h negativ gecached.
+        Transient failures werden nicht gecached.
         """
         if not preset_id:
             return None
-        if preset_id in self._cloud_preset_cache:
-            return self._cloud_preset_cache[preset_id]
+        if preset_id.startswith("builtin_"):
+            preset_id = _extract_bambu_idx(preset_id)
+        hit, cached = self._get_cached_cloud_preset(preset_id)
+        if hit:
+            return cached
 
         reverse = await self._get_cloud_idmap_reverse()
-        # 1. Schon ein gültiger AMS-Code? (id-map-Werte sind Namen, Keys sind Codes)
-        forward_codes = set(reverse.values())
-        if preset_id in forward_codes:
-            self._cloud_preset_cache[preset_id] = preset_id
-            return preset_id
+        # Cache may have been cleared by an id-map reload above.
+        hit, cached = self._get_cached_cloud_preset(preset_id)
+        if hit:
+            return cached
+        # 1. Schon ein gültiger AMS-Code? (id-map keys = AMS codes)
+        if preset_id in self._cloud_idmap_forward or _is_known_ams_slicer_code(
+            preset_id
+        ):
+            return self._cache_cloud_preset_result(preset_id, preset_id)
 
         # 2. + 3. filament-info → Name → Basisname → reverse-Lookup
         try:
             info = await self._bb_post("/api/v1/cloud/filament-info", [preset_id])
         except Exception as e:
             logger.debug(f"cloud/filament-info failed for {preset_id}: {e}")
+            # Transient failure — do not negative-cache; retry on next sync.
             return None
         if not isinstance(info, dict):
             return None
         entry = info.get(preset_id) or {}
         name = (entry.get("name") or "").strip()
         if not name:
+            # Empty/missing name may be transient; allow retry.
             return None
         base_name = name.split(" @", 1)[0].strip()
         code = reverse.get(base_name) or reverse.get(name)
         if code:
-            self._cloud_preset_cache[preset_id] = code
             logger.info(
                 f"Resolved Bambu cloud preset {preset_id!r} "
                 f"({base_name!r}) → AMS code {code!r}"
             )
-            return code
+            return self._cache_cloud_preset_result(preset_id, code)
         logger.debug(
             f"Cloud preset {preset_id!r} name {base_name!r} not found in id-map"
         )
-        return None
+        return self._cache_cloud_preset_result(preset_id, None)
 
     async def _spool_cloud_preset(self, filaman_spool_id: int | None) -> str | None:
         """Liest den vom Nutzer in Bambuddy gesetzten Cloud-Preset einer Spule.
