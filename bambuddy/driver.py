@@ -5486,6 +5486,7 @@ class Driver(BaseDriver):
                         Spool.id != filaman_spool_id,
                     )
                 )
+                evicted_stale = False
                 for stale_spool in stale_result.scalars().all():
                     await SpoolService(db).move_location(
                         stale_spool,
@@ -5500,6 +5501,7 @@ class Driver(BaseDriver):
                         f"{filaman_spool_id})"
                     )
                     self._slot_to_filaman_spool.pop(slot_key, None)
+                    evicted_stale = True
 
                 # 3. Spule zur Location bewegen (wenn nicht bereits dort)
                 spool = await db.get(Spool, filaman_spool_id)
@@ -5509,11 +5511,14 @@ class Driver(BaseDriver):
                     )
                     return
 
-                if spool.location_id == location.id:
+                # Already at this slot without replacing anyone: no-op (sticky /
+                # reconfigure). If we just evicted a stale occupant, still emit
+                # "Assigned to …" even when location_id was pre-set (e.g. duplicate
+                # copied an AMS location) so the spool log reflects the real place.
+                if spool.location_id == location.id and not evicted_stale:
                     logger.debug(
                         f"Spool {filaman_spool_id} already at location '{slot_location_name}'"
                     )
-                    # Nur ggf. neu erstellte Location persistieren (kein Move nötig)
                     await db.commit()
                     return
 
