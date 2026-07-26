@@ -22,6 +22,7 @@ import pathlib
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, ClassVar
+from urllib.parse import urlencode
 
 import httpx
 from sqlalchemy import delete, event, func, select
@@ -627,6 +628,44 @@ class Driver(BaseDriver):
         r = await self._client.delete(f"{self._bambuddy_url}{path}")
         r.raise_for_status()
 
+    async def _get_ws_connection_params(self) -> tuple[str, dict[str, str]]:
+        """Build WebSocket URI and authentication headers.
+
+        Current Bambuddy versions require a short-lived token from
+        POST /api/v1/auth/ws-token and expect it as ``?token=...``.
+        Older versions accepted the API key directly during the WebSocket
+        handshake. A 404 therefore falls back to the legacy behaviour.
+        """
+        uri = (
+            self._bambuddy_url.rstrip("/")
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+        ) + "/api/v1/ws"
+
+        if not self._client:
+            raise RuntimeError("HTTP client not initialized")
+
+        response = await self._client.post(
+            f"{self._bambuddy_url}/api/v1/auth/ws-token"
+        )
+
+        # Backward compatibility with Bambuddy versions without ws-token.
+        if response.status_code == 404:
+            logger.debug(
+                "Bambuddy ws-token endpoint not available; "
+                "using legacy WebSocket API-key authentication"
+            )
+            return uri, {"X-API-Key": self._api_key}
+
+        response.raise_for_status()
+        token = response.json().get("token")
+        if not token:
+            raise RuntimeError(
+                "Bambuddy ws-token response did not contain a token"
+            )
+
+        return f"{uri}?{urlencode({'token': token})}", {}
+
     # -- FilaMan DB-Helfer (direkte SQLAlchemy-Zugriffe, kein HTTP) ----------
 
     async def _fetch_fm_spools(self) -> list[Spool]:
@@ -1021,15 +1060,11 @@ class Driver(BaseDriver):
             return
 
         while self._running:
-            uri = (
-                self._bambuddy_url.rstrip("/")
-                .replace("https://", "wss://")
-                .replace("http://", "ws://")
-            ) + "/api/v1/ws"
             try:
+                uri, ws_headers = await self._get_ws_connection_params()
                 async with websockets.connect(
                     uri,
-                    additional_headers={"X-API-Key": self._api_key},
+                    additional_headers=ws_headers,
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
