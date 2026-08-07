@@ -40,6 +40,20 @@ def _float_or_none(v: Any) -> float | None:
         return None
 
 
+def _split_trailing_model_token(name: str) -> tuple[str, str]:
+    """Split custom names like ``Mads TPU95 P2S`` (no ``@Bambu Lab`` suffix)."""
+    stripped = (name or "").strip()
+    if not stripped or " @" in stripped:
+        return stripped, ""
+    base, _, tail = stripped.rpartition(" ")
+    if not base or not tail:
+        return stripped, ""
+    token = canonical_printer_model_token(tail)
+    if not token or token.upper() != tail.strip().upper():
+        return stripped, ""
+    return base.strip(), token
+
+
 def extract_profile_base_name(code_or_name: str | None) -> str:
     """Strip `` @Bambu Lab/BBL …`` suffix from a cloud preset name or code label."""
     if not code_or_name:
@@ -47,7 +61,8 @@ def extract_profile_base_name(code_or_name: str | None) -> str:
     name = str(code_or_name).strip()
     if " @" in name:
         return name.split(" @", 1)[0].strip()
-    return name
+    base, _model = _split_trailing_model_token(name)
+    return base
 
 
 def canonical_printer_model_token(raw: str | None) -> str:
@@ -93,6 +108,9 @@ def parse_cloud_preset_name(name: str) -> tuple[str, str, float | None]:
     if m2:
         model_token = canonical_printer_model_token(m2.group(1))
         return base, model_token, None
+    trailing_base, trailing_model = _split_trailing_model_token(stripped)
+    if trailing_model:
+        return trailing_base, trailing_model, None
     return base, "", None
 
 

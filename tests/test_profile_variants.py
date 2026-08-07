@@ -293,6 +293,32 @@ def test_parse_cloud_preset_name() -> None:
     assert nozzle == 0.4
 
 
+def test_trailing_model_token_custom_preset_name() -> None:
+    """Custom cloud presets may embed model without @Bambu Lab suffix."""
+    preset = {
+        "code": "PFUSb064508e73b480",
+        "name": "Mads TPU95 P2S",
+        "displayName": "Mads TPU95 P2S (Custom)",
+        "isCustom": True,
+    }
+    base, model, nozzle = parse_cloud_preset_name(preset["name"])
+    assert base == "Mads TPU95"
+    assert model == "P2S"
+    assert nozzle is None
+    assert infer_preset_models(preset) == {"P2S"}
+
+    grouped = group_presets_by_base_name([preset], model_token="P2S")
+    assert len(grouped) == 1
+    assert grouped[0]["baseName"] == "Mads TPU95"
+
+    index = build_variant_index_from_presets([preset])
+    assert index[("MADS TPU95", "P2S", None)] == "PFUSb064508e73b480"
+    groups = build_variant_groups_from_index(index)
+    filtered = filter_grouped_presets_for_model(grouped, groups, "P2S")
+    assert len(filtered) == 1
+    assert filtered[0]["baseName"] == "Mads TPU95"
+
+
 def test_uniform_variant_code() -> None:
     assert uniform_variant_code({"P2S": "A", "H2C": "A"}) == "A"
     assert uniform_variant_code({"P2S": "A", "H2C": "B"}) is None
