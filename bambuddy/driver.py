@@ -455,6 +455,14 @@ class Driver(BaseDriver):
         self._sticky_reassert_ts: dict[str, float] = {}
         self._STICKY_REASSERT_COOLDOWN: float = 5.0
         self._sticky_reconcile_task: asyncio.Task | None = None
+        # In-flight sticky reassert tasks (cancelled when a newer assign wins the slot).
+        self._sticky_tasks: dict[str, asyncio.Task] = {}
+        # Per-slot generation: bumped on intentional assign/configure so a late
+        # sticky MQTT for the previous occupant cannot overwrite the new one.
+        self._slot_configure_gen: dict[str, int] = {}
+        # Brief settle window so empty→reinsert / pending assign can bump gen
+        # before a sticky reassert POSTs the old spool to Bambuddy.
+        self._STICKY_REASSERT_SETTLE: float = 0.75
         # Slot-Key ("ams_id-tray_id") → Bambu tray_uuid (für Spoolman-Link)
         self._slot_to_tray_uuid: dict[str, str] = {}
         # Drucker-Seriennummer (für Spoolman Fallback-Tag-Berechnung)
@@ -713,6 +721,8 @@ class Driver(BaseDriver):
             except Exception:
                 pass
         self._running = False
+        for slot_key in list(self._sticky_tasks.keys()):
+            self._cancel_sticky_task(slot_key)
         for task in (
             self._ws_task,
             self._sync_task,
@@ -5060,6 +5070,12 @@ class Driver(BaseDriver):
         filaman_spool_id = _int_or_none(filament_data.get("id"))
         slot_key = f"{ams_id}-{tray_id}"
 
+        # Win the slot immediately: cancel any sticky reassert of the previous
+        # occupant and bump the configure generation so a late SUN*/GF* MQTT
+        # from that reassert cannot overwrite this assign.
+        self._cancel_sticky_task(slot_key)
+        assign_gen = self._bump_slot_configure_gen(slot_key)
+
         # -- Alte Spule aus Standort entfernen wenn Slot überschrieben wird --
         old_filaman_spool_id = self._slot_to_filaman_spool.get(slot_key)
         if old_filaman_spool_id and old_filaman_spool_id != filaman_spool_id:
@@ -5133,7 +5149,15 @@ class Driver(BaseDriver):
                 )
 
         # Immer configure-Call ausführen um tray_info_idx via MQTT zu setzen
-        await self._send_assignment(ams_id, tray_id, filament_data)
+        if not self._slot_configure_gen_matches(slot_key, assign_gen):
+            logger.info(
+                f"Skip configure for AMS {ams_id}/{tray_id}: assign superseded "
+                f"before MQTT (gen {assign_gen})"
+            )
+            return
+        await self._send_assignment(
+            ams_id, tray_id, filament_data, expected_gen=assign_gen
+        )
 
         if filaman_spool_id:
             await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
@@ -5145,7 +5169,12 @@ class Driver(BaseDriver):
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
     async def _send_assignment(
-        self, ams_id: int, tray_id: int, filament_data: dict
+        self,
+        ams_id: int,
+        tray_id: int,
+        filament_data: dict,
+        *,
+        expected_gen: int | None = None,
     ) -> None:
         """Konfiguriert einen AMS-Slot direkt über Bambuddys configure-Endpunkt.
 
@@ -5159,9 +5188,25 @@ class Driver(BaseDriver):
         - material_subgroup → tray_sub_brands
         - bambu_k_value → k_value (0.0 = skip)
         - bambu_cali_idx, bambu_setting_id → cali_idx, setting_id
+
+        ``expected_gen``: when set, abort if another assign bumped the slot's
+        configure generation (prevents stale sticky MQTT from winning a swap).
         """
         if not self._client:
             logger.error("Cannot send assignment: HTTP client not initialized")
+            return
+
+        slot_key = f"{ams_id}-{tray_id}"
+        if expected_gen is None:
+            # Callers that don't pass a gen (late-NFC, manual) still claim the
+            # slot so a concurrent sticky cannot overwrite them mid-flight.
+            expected_gen = self._bump_slot_configure_gen(slot_key)
+        elif not self._slot_configure_gen_matches(slot_key, expected_gen):
+            logger.info(
+                f"Skip configure AMS {ams_id}/{tray_id}: stale gen "
+                f"(have={self._slot_configure_gen.get(slot_key, 0)} "
+                f"expected={expected_gen})"
+            )
             return
 
         # -- Farbe normalisieren: Bambuddy erwartet 8-stelliges RRGGBBAA --
@@ -5179,7 +5224,6 @@ class Driver(BaseDriver):
         # Policy: never clear a known PFUS/PFCN on the slot. Recover from spool
         # params / slot cache when resolve returns empty so Studio keeps the
         # custom ABS/ASA profile instead of falling back to tray_info_idx alone.
-        slot_key = f"{ams_id}-{tray_id}"
         cached_slot = self._slot_params_cache.get(slot_key, {})
         prior_setting = (
             (filament_data.get("bambu_slicer_setting_id") or "").strip()
@@ -5372,6 +5416,15 @@ class Driver(BaseDriver):
             "kprofile_setting_id": setting_id,
             "k_value": k_value,  # 0.0 = skip
         }
+
+        # Final race check after awaits (cloud resolve / Bambuddy GET): a newer
+        # assign or sticky cancel may have claimed the slot while we were resolving.
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            logger.info(
+                f"Skip configure POST AMS {ams_id}/{tray_id}: superseded after "
+                f"resolve (tray_info_idx={slicer_filament!r}, gen={expected_gen})"
+            )
+            return
 
         try:
             # Neue Konfiguration setzen
@@ -5668,8 +5721,113 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"Failed to clear spool {filaman_spool_id} location: {e}")
 
+    def _bump_slot_configure_gen(self, slot_key: str) -> int:
+        """Invalidate in-flight sticky/late configures for this slot."""
+        nxt = self._slot_configure_gen.get(slot_key, 0) + 1
+        self._slot_configure_gen[slot_key] = nxt
+        return nxt
+
+    def _slot_configure_gen_matches(self, slot_key: str, expected_gen: int) -> bool:
+        return self._slot_configure_gen.get(slot_key, 0) == expected_gen
+
+    def _cancel_sticky_task(self, slot_key: str) -> None:
+        task = self._sticky_tasks.pop(slot_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    @staticmethod
+    def _norm_tray_color(color: str | None) -> str:
+        c = (color or "").strip().lstrip("#").upper()
+        if len(c) == 8:
+            return c[:6]
+        if len(c) == 6:
+            return c
+        return c
+
+    @staticmethod
+    def _norm_material(material: str | None) -> str:
+        return (material or "").strip().upper().replace(" ", "")
+
+    async def _sticky_still_matches_tray(
+        self, fm_id: int, tray: dict[str, Any] | None
+    ) -> bool:
+        """True if the sticky spool plausibly matches the live tray (RFID/color/type).
+
+        Used to abort sticky configure when a *different* spool was inserted into
+        a slot that still had the previous sticky owner in memory.
+        """
+        if not tray:
+            return True  # empty-path reassert; no tray content to compare
+
+        tray_tag = (tray.get("tag_uid") or "").strip().upper().replace(":", "")
+        if tray_tag in ("", "0000000000000000"):
+            tray_tag = ""
+        tray_uuid = (tray.get("tray_uuid") or "").strip().upper()
+        if tray_uuid in ("", "00000000000000000000000000000000"):
+            tray_uuid = ""
+        tray_type = self._norm_material(tray.get("tray_type"))
+        tray_color = self._norm_tray_color(tray.get("tray_color"))
+
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(Spool)
+                    .where(Spool.id == fm_id)
+                    .options(
+                        selectinload(Spool.filament)
+                        .selectinload(Filament.filament_colors)
+                        .selectinload(FilamentColor.color),
+                    )
+                )
+                spool = result.scalar_one_or_none()
+        except Exception as e:
+            logger.debug(f"Sticky match check failed for FM#{fm_id}: {e}")
+            return True  # fail open — preserve sticky recovery
+
+        if not spool:
+            return False
+
+        spool_tag = ""
+        if spool.rfid_uid:
+            spool_tag = self._to_hex_tag(spool.rfid_uid).upper().replace(":", "")
+        if tray_tag and spool_tag:
+            return tray_tag == spool_tag
+        # Bambu RFID uuid path when tag_uid absent
+        if tray_uuid and spool_tag and len(tray_uuid) >= 16:
+            # Can't reliably map uuid↔FilaMan rfid without Bambuddy; fall through
+            # to color/type.
+            pass
+
+        fil = spool.filament
+        if not fil:
+            return True
+        spool_type = self._norm_material(fil.material_type)
+        spool_color = ""
+        colors = sorted(fil.filament_colors or [], key=lambda fc: fc.position)
+        if colors and colors[0].color and colors[0].color.hex_code:
+            spool_color = self._norm_tray_color(colors[0].color.hex_code)
+
+        if tray_type and spool_type and tray_type != spool_type:
+            # PLA vs PLA+ often differ only by subgroup — treat base family match
+            # as ok when one contains the other (PLA+ / PLA).
+            if not (
+                tray_type.startswith(spool_type)
+                or spool_type.startswith(tray_type)
+                or tray_type.replace("+", "") == spool_type.replace("+", "")
+            ):
+                return False
+        if tray_color and spool_color and tray_color != spool_color:
+            return False
+        return True
+
     async def _reassert_sticky_assignment(
-        self, ams_id: int, tray_id: int, *, configure: bool = False
+        self,
+        ams_id: int,
+        tray_id: int,
+        *,
+        configure: bool = False,
+        expected_gen: int | None = None,
+        tray: dict[str, Any] | None = None,
     ) -> None:
         """Re-POST Bambuddy assignment (and optionally configure) for a sticky slot.
 
@@ -5677,8 +5835,50 @@ class Driver(BaseDriver):
         flaps. Sticky mode keeps FilaMan ownership and reasserts the inventory
         link so usage tracking and the Bambuddy UI stay aligned until a scanned
         or explicit assign replaces the occupant.
+
+        A pending RFID scan, a newer slot configure generation, or a tray that
+        no longer matches the sticky spool aborts this path — that is the
+        swap race where the previous occupant's SUN*/GF* MQTT was winning.
         """
         slot_key = f"{ams_id}-{tray_id}"
+        if expected_gen is None:
+            expected_gen = self._slot_configure_gen.get(slot_key, 0)
+
+        # Let concurrent pending-assign / RFID paths bump gen first.
+        try:
+            await asyncio.sleep(self._STICKY_REASSERT_SETTLE)
+        except asyncio.CancelledError:
+            raise
+
+        if self._pending_spool_id is not None:
+            logger.info(
+                f"Skip sticky reassert AMS {ams_id}/{tray_id}: pending scan "
+                f"FM#{self._pending_spool_id} active"
+            )
+            return
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            logger.info(
+                f"Skip sticky reassert AMS {ams_id}/{tray_id}: superseded by "
+                f"newer configure gen "
+                f"(have={self._slot_configure_gen.get(slot_key, 0)} "
+                f"expected={expected_gen})"
+            )
+            return
+
+        # Empty-path reassert: if the tray is occupied again after settle, a
+        # swap is in progress — do not re-POST the previous occupant.
+        if not configure:
+            cur = next(
+                (s for s in self._current_slots if s["slot_index"] == slot_key),
+                None,
+            )
+            if cur and cur.get("present"):
+                logger.info(
+                    f"Skip sticky empty-reassert AMS {ams_id}/{tray_id}: "
+                    f"slot occupied again during settle (swap in progress)"
+                )
+                return
+
         now = time.monotonic()
         last = self._sticky_reassert_ts.get(slot_key, 0.0)
         if (now - last) < self._STICKY_REASSERT_COOLDOWN:
@@ -5689,7 +5889,41 @@ class Driver(BaseDriver):
         if not fm_id:
             return
 
+        if configure:
+            # Prefer live tray from the latest status if caller didn't pass one
+            # (empty→present path always passes tray).
+            live_tray = tray
+            if live_tray is None:
+                prev = next(
+                    (s for s in self._current_slots if s["slot_index"] == slot_key),
+                    None,
+                )
+                if prev and prev.get("present"):
+                    live_tray = {
+                        "tray_type": prev.get("tray_type"),
+                        "tray_color": prev.get("tray_color"),
+                        "tag_uid": prev.get("tag_uid"),
+                        "tray_uuid": prev.get("tray_uuid"),
+                    }
+            if not await self._sticky_still_matches_tray(fm_id, live_tray):
+                logger.info(
+                    f"Clearing sticky FM#{fm_id} on AMS {ams_id}/{tray_id}: "
+                    f"live tray no longer matches previous occupant "
+                    f"(avoid stale ams_filament_setting)"
+                )
+                self._slot_to_filaman_spool.pop(slot_key, None)
+                self._sticky_reassert_ts.pop(slot_key, None)
+                return
+
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            return
+
         bb_spool_id = await self._get_bambuddy_spool_id(fm_id)
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            return
+        if self._pending_spool_id is not None:
+            return
+
         if bb_spool_id and self._client and self._sync_enabled:
             try:
                 response = await self._bb_post(
@@ -5715,6 +5949,14 @@ class Driver(BaseDriver):
 
         if not configure:
             return
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            logger.info(
+                f"Skip sticky configure AMS {ams_id}/{tray_id}: gen superseded "
+                f"after assignment POST"
+            )
+            return
+        if self._pending_spool_id is not None:
+            return
 
         try:
             from app.plugins.manager import plugin_manager
@@ -5722,7 +5964,13 @@ class Driver(BaseDriver):
             filament_data = await plugin_manager.enrich_filament_data(
                 fm_id, self.printer_id, {"id": fm_id}
             )
-            await self._send_assignment(ams_id, tray_id, filament_data)
+            if not self._slot_configure_gen_matches(slot_key, expected_gen):
+                return
+            await self._send_assignment(
+                ams_id, tray_id, filament_data, expected_gen=expected_gen
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(
                 f"Sticky configure reassert failed for FM#{fm_id} "
@@ -5730,11 +5978,38 @@ class Driver(BaseDriver):
             )
 
     def _schedule_sticky_reassert(
-        self, ams_id: int, tray_id: int, *, configure: bool
+        self,
+        ams_id: int,
+        tray_id: int,
+        *,
+        configure: bool,
+        tray: dict[str, Any] | None = None,
     ) -> None:
-        _t = asyncio.create_task(
-            self._reassert_sticky_assignment(ams_id, tray_id, configure=configure)
-        )
+        slot_key = f"{ams_id}-{tray_id}"
+        if self._pending_spool_id is not None:
+            logger.info(
+                f"Skip scheduling sticky reassert AMS {ams_id}/{tray_id}: "
+                f"pending scan FM#{self._pending_spool_id}"
+            )
+            return
+        self._cancel_sticky_task(slot_key)
+        expected_gen = self._slot_configure_gen.get(slot_key, 0)
+
+        async def _run() -> None:
+            try:
+                await self._reassert_sticky_assignment(
+                    ams_id,
+                    tray_id,
+                    configure=configure,
+                    expected_gen=expected_gen,
+                    tray=tray,
+                )
+            finally:
+                if self._sticky_tasks.get(slot_key) is asyncio.current_task():
+                    self._sticky_tasks.pop(slot_key, None)
+
+        _t = asyncio.create_task(_run())
+        self._sticky_tasks[slot_key] = _t
         _t.add_done_callback(self._on_task_done)
 
     async def _reconcile_sticky_slot_map(self) -> None:
@@ -6397,15 +6672,37 @@ class Driver(BaseDriver):
 
                 # Sticky assignments: physical empty does NOT clear FilaMan location
                 # or slot ownership. Bambuddy may auto-unlink — reassert the link.
+                # Never reassert while a pending RFID scan is active (swap race:
+                # old occupant SUN*/GF* MQTT was overwriting the new assign).
                 if not now_present:
-                    if sticky_fm_id and was_present:
+                    if (
+                        sticky_fm_id
+                        and was_present
+                        and self._pending_spool_id is None
+                    ):
                         self._schedule_sticky_reassert(
                             ams_id, tray_id, configure=False
                         )
                 else:
                     # Pending scan wins over sticky.
                     matched, reason = self._try_match_pending_tray(slot_index, tray)
+                    matched_spool_id: int | None = None
                     if matched:
+                        matched_spool_id = self._pending_spool_id
+                        # Claim the slot synchronously so a concurrent sticky
+                        # reassert cannot re-bind the previous occupant.
+                        if matched_spool_id is not None:
+                            prev_owner = self._slot_to_filaman_spool.get(slot_index)
+                            self._cancel_sticky_task(slot_index)
+                            self._bump_slot_configure_gen(slot_index)
+                            if prev_owner and prev_owner != matched_spool_id:
+                                self._slot_to_filaman_spool.pop(slot_index, None)
+                                _rt = asyncio.create_task(
+                                    self._restore_spool_location(prev_owner)
+                                )
+                                _rt.add_done_callback(self._on_task_done)
+                            self._slot_to_filaman_spool[slot_index] = matched_spool_id
+                            sticky_fm_id = matched_spool_id
                         self._fire_pending_assignment(ams_id, tray_id, reason)
                     elif (
                         sticky_fm_id
@@ -6413,8 +6710,10 @@ class Driver(BaseDriver):
                         and not was_present
                     ):
                         # Unscanned reinsert only — not mid-tray content flaps.
+                        # Pass live tray so mismatch vs previous occupant clears
+                        # sticky instead of pushing the old spool's profile.
                         self._schedule_sticky_reassert(
-                            ams_id, tray_id, configure=True
+                            ams_id, tray_id, configure=True, tray=tray
                         )
 
                 ams_slots.append(
@@ -6450,6 +6749,12 @@ class Driver(BaseDriver):
                         "remain": tray.get("remain", 0),
                         "present": now_present,
                         "sticky_spool_id": sticky_fm_id,
+                        # Plugin manager persists PrinterSlotAssignment.spool_id
+                        # from this field — without it the UI shows an unlinked
+                        # slot even when Bambuddy/sticky ownership is known.
+                        "spool_id": sticky_fm_id if now_present else None,
+                        "tag_uid": tray.get("tag_uid") or "",
+                        "tray_uuid": tray_uuid or "",
                     }
                 )
 
@@ -6527,18 +6832,37 @@ class Driver(BaseDriver):
             sticky_vt_id = self._slot_to_filaman_spool.get(vt_idx)
 
             if not vt_now_present:
-                if sticky_vt_id and vt_was_present:
+                if (
+                    sticky_vt_id
+                    and vt_was_present
+                    and self._pending_spool_id is None
+                ):
                     self._schedule_sticky_reassert(255, vt_id, configure=False)
             else:
                 matched, reason = self._try_match_pending_tray(vt_idx, vt)
                 if matched:
+                    matched_spool_id = self._pending_spool_id
+                    if matched_spool_id is not None:
+                        prev_owner = self._slot_to_filaman_spool.get(vt_idx)
+                        self._cancel_sticky_task(vt_idx)
+                        self._bump_slot_configure_gen(vt_idx)
+                        if prev_owner and prev_owner != matched_spool_id:
+                            self._slot_to_filaman_spool.pop(vt_idx, None)
+                            _rt = asyncio.create_task(
+                                self._restore_spool_location(prev_owner)
+                            )
+                            _rt.add_done_callback(self._on_task_done)
+                        self._slot_to_filaman_spool[vt_idx] = matched_spool_id
+                        sticky_vt_id = matched_spool_id
                     self._fire_pending_assignment(255, vt_id, reason)
                 elif (
                     sticky_vt_id
                     and self._pending_spool_id is None
                     and not vt_was_present
                 ):
-                    self._schedule_sticky_reassert(255, vt_id, configure=True)
+                    self._schedule_sticky_reassert(
+                        255, vt_id, configure=True, tray=vt
+                    )
 
             ext_slots.append(
                 {
@@ -6573,6 +6897,9 @@ class Driver(BaseDriver):
                     "remain": vt.get("remain", 0),
                     "present": vt_now_present,
                     "sticky_spool_id": sticky_vt_id,
+                    "spool_id": sticky_vt_id if vt_now_present else None,
+                    "tag_uid": vt.get("tag_uid") or "",
+                    "tray_uuid": vt.get("tray_uuid") or "",
                 }
             )
 
