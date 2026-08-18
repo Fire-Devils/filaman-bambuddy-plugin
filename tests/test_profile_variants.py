@@ -80,6 +80,24 @@ def test_coerce_profile_base_name_never_returns_pfus() -> None:
     assert coerce_profile_base_name("Generic PLA", "PFUSx") == "Generic PLA"
 
 
+def test_catalog_miss_does_not_write_pfus_into_profiles_by_model() -> None:
+    """extract(name or code) stored PFUS as a display base on catalog miss.
+
+    Assign/reflect/legacy infer now coerce; an empty result must skip the
+    profiles_by_model write so the picker never shows a cloud setting id.
+    """
+    pfus = "PFUSf831763192866d"
+    assert extract_profile_base_name(pfus) == pfus
+    assert extract_profile_base_name(None) == ""
+    base = coerce_profile_base_name(None, pfus)
+    assert base == ""
+    profiles: dict[str, dict[str, str]] = {}
+    if base:
+        profiles["P2S"] = {"base_name": base, "source": "reflect"}
+    assert profiles == {}
+    assert infer_default_base_name(profiles, pfus) == ""
+
+
 def test_infer_default_base_name_ignores_stored_pfus() -> None:
     profiles = {
         "P2S": {"base_name": "SUNLU PLA HS MATTE GEN2", "source": "reflect"},
@@ -89,6 +107,11 @@ def test_infer_default_base_name_ignores_stored_pfus() -> None:
         == "SUNLU PLA HS MATTE GEN2"
     )
     assert infer_default_base_name(profiles, "SUNLU PETG") == "SUNLU PETG"
+
+
+def test_infer_skips_pfus_in_per_model_rows() -> None:
+    profiles = {"P2S": {"base_name": "PFUSabc", "source": "reflect"}}
+    assert infer_default_base_name(profiles, "") == ""
 
 
 def test_canonical_printer_model_token_exact() -> None:

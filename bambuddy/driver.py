@@ -1494,6 +1494,42 @@ class Driver(BaseDriver):
                 (filament.custom_fields or {}).get("bambu_profile_base_name") or ""
             ).strip()
 
+    async def _has_stored_cloud_setting_id(
+        self, *, spool_id: int | None = None, filament_id: int | None = None
+    ) -> bool:
+        """True when a PFUS/PFCN is stored but may not have a human display name yet."""
+        try:
+            async with async_session_maker() as db:
+                if spool_id:
+                    spool = await db.get(Spool, int(spool_id))
+                    cf = dict((spool.custom_fields or {}) if spool else {})
+                    if is_cloud_setting_id(cf.get("bambu_slicer_filament")):
+                        return True
+                    res = await db.execute(
+                        select(SpoolPrinterParam.param_value).where(
+                            SpoolPrinterParam.spool_id == int(spool_id),
+                            SpoolPrinterParam.param_key == "bambu_slicer_setting_id",
+                        )
+                    )
+                    if any(is_cloud_setting_id(v) for v in res.scalars().all()):
+                        return True
+                if filament_id:
+                    filament = await db.get(Filament, int(filament_id))
+                    cf = dict((filament.custom_fields or {}) if filament else {})
+                    if is_cloud_setting_id(cf.get("bambu_slicer_filament")):
+                        return True
+                    res = await db.execute(
+                        select(FilamentPrinterParam.param_value).where(
+                            FilamentPrinterParam.filament_id == int(filament_id),
+                            FilamentPrinterParam.param_key == "bambu_slicer_setting_id",
+                        )
+                    )
+                    if any(is_cloud_setting_id(v) for v in res.scalars().all()):
+                        return True
+        except Exception as e:
+            logger.debug(f"Could not check stored cloud setting id: {e}")
+        return False
+
     @staticmethod
     def _infer_default_base_name(
         profiles: dict[str, dict[str, str]], stored_default: str = ""
@@ -1895,12 +1931,18 @@ class Driver(BaseDriver):
             stored_default = await self._read_spool_default_base_name(int(spool_id))
         elif filament_id:
             stored_default = await self._read_filament_default_base_name(int(filament_id))
+        default_base_name = self._infer_default_base_name(profiles, stored_default)
+        pending_display_name = False
+        if not default_base_name:
+            pending_display_name = await self._has_stored_cloud_setting_id(
+                spool_id=int(spool_id) if spool_id else None,
+                filament_id=int(filament_id) if filament_id else None,
+            )
         return {
             "spool_id": int(spool_id) if spool_id else None,
             "filament_id": int(filament_id) if filament_id else None,
-            "default_base_name": self._infer_default_base_name(
-                profiles, stored_default
-            ),
+            "default_base_name": default_base_name,
+            "pending_display_name": pending_display_name,
             "profiles_by_model": profiles,
             "per_model_profiles_enabled": self._per_printer_profiles,
             "coverage": coverage,
@@ -2100,8 +2142,8 @@ class Driver(BaseDriver):
                 base_source = "filament"
                 used_default_base_fallback = True
         if not base_name and pfus:
-            preset_name = await self.resolve_preset_name(pfus) or pfus
-            base_name = _extract_profile_base_name(preset_name)
+            preset_name = await self.resolve_preset_name(pfus)
+            base_name = coerce_profile_base_name(preset_name, pfus)
 
         if base_name and model:
             detail = await self._resolve_model_variant_detail(
@@ -2448,12 +2490,9 @@ class Driver(BaseDriver):
                 if not base_name:
                     codes = set(per_pid.values())
                     if len(codes) == 1:
-                        preset_name = await self.resolve_preset_name(
-                            next(iter(codes))
-                        )
-                        base_name = _extract_profile_base_name(
-                            preset_name or next(iter(codes))
-                        )
+                        raw_code = next(iter(codes))
+                        preset_name = await self.resolve_preset_name(raw_code)
+                        base_name = coerce_profile_base_name(preset_name, raw_code)
                 if not base_name:
                     continue
                 profiles: dict[str, dict[str, str]] = {}
@@ -4482,11 +4521,9 @@ class Driver(BaseDriver):
             return  # FilaMan war der jüngere Writer
         try:
             if self._per_printer_profiles:
-                preset_name = (
-                    await self.resolve_preset_name(existing_slicer) or existing_slicer
-                )
-                base_name = _extract_profile_base_name(preset_name)
-                _, parsed_model, _ = _parse_cloud_preset_name(preset_name)
+                preset_name = await self.resolve_preset_name(existing_slicer)
+                base_name = coerce_profile_base_name(preset_name, existing_slicer)
+                _, parsed_model, _ = _parse_cloud_preset_name(preset_name or "")
                 by_model = await self._model_printer_map()
                 peers = self._peer_printer_ids()
                 peer_set = set(peers)
