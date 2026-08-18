@@ -65,6 +65,57 @@ def extract_profile_base_name(code_or_name: str | None) -> str:
     return base
 
 
+def is_cloud_setting_id(code: str | None) -> bool:
+    """True for Bambu cloud slicer setting ids (PFUS/PFCN), not human base names."""
+    if not code:
+        return False
+    upper = str(code).strip().upper()
+    return upper.startswith(("PFUS", "PFCN"))
+
+
+def coerce_profile_base_name(name: str | None, code: str | None = None) -> str:
+    """Return a human profile base name for storage/display; never a PFUS/PFCN id."""
+    if name:
+        base = extract_profile_base_name(name)
+        if base and not is_cloud_setting_id(base):
+            return base
+    if code and not is_cloud_setting_id(code):
+        base = extract_profile_base_name(code)
+        if base and not is_cloud_setting_id(base):
+            return base
+    return ""
+
+
+def infer_default_base_name(
+    profiles: dict[str, dict[str, str]], stored_default: str = ""
+) -> str:
+    """Pick the default profile base name shown in the UI.
+
+    Stored defaults that are raw cloud setting ids (PFUS/PFCN) are ignored so a
+    stale code cannot mask linked per-model human names.
+    """
+    stored = (stored_default or "").strip()
+    if stored and not is_cloud_setting_id(stored):
+        return stored
+    linked = [
+        e["base_name"]
+        for e in profiles.values()
+        if e.get("base_name")
+        and not is_cloud_setting_id(e.get("base_name"))
+        and e.get("source") != "override"
+    ]
+    if linked:
+        counts: dict[str, int] = {}
+        for name in linked:
+            counts[name] = counts.get(name, 0) + 1
+        return max(counts, key=counts.get)
+    for entry in profiles.values():
+        base = (entry.get("base_name") or "").strip()
+        if base and not is_cloud_setting_id(base):
+            return base
+    return ""
+
+
 def canonical_printer_model_token(raw: str | None) -> str:
     """Normalize a Bambuddy/machine string to an exact model token (e.g. P2S, H2C)."""
     if not raw:
