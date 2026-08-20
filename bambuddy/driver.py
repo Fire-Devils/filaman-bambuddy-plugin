@@ -18,6 +18,7 @@ Flows:
 import asyncio
 import json
 import logging
+import math
 import pathlib
 import re
 import time
@@ -458,6 +459,8 @@ class Driver(BaseDriver):
         self._unmatched_fallback_ts: float = 0.0
         # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
         self._slot_to_filaman_spool: dict[str, int] = {}
+        self._modern_usage_event_ids: set[str] = set()
+        self._legacy_consumption_tasks: dict[str, asyncio.Task] = {}
         # Sticky AMS: throttle reassert POSTs after empty trays / unscanned reinserts.
         self._sticky_reassert_ts: dict[str, float] = {}
         self._STICKY_REASSERT_COOLDOWN: float = 5.0
@@ -4152,7 +4155,7 @@ class Driver(BaseDriver):
             )
 
     async def _report_consumption_db(
-        self, filaman_spool_id: int, delta_g: float
+        self, filaman_spool_id: int, delta_g: float, *, source_event_key: str | None = None
     ) -> None:
         """Meldet Verbrauch direkt über SpoolService in FilaMan-DB."""
         async with async_session_maker() as db:
@@ -4169,7 +4172,8 @@ class Driver(BaseDriver):
                 event_at=datetime.now(timezone.utc),
                 principal=None,
                 source="bambuddy",
-            )
+                source_event_key=source_event_key,
+            
             logger.info(
                 f"Recorded {delta_g:.1f}g consumption for FilaMan spool {filaman_spool_id} "
                 f"(remaining: {remaining}g)"
@@ -5013,7 +5017,15 @@ class Driver(BaseDriver):
         elif event_type == "print_complete":
             data = event.get("data", {})
             if data.get("printer_id") == self._bambuddy_printer_id:
-                await self._handle_print_complete(data)
+                event_id = str(event.get("event_id") or data.get("event_id") or "")
+                task = asyncio.create_task(self._handle_print_complete(data, event_id=event_id))
+                if event_id:
+                    self._legacy_consumption_tasks[event_id] = task
+                task.add_done_callback(self._on_task_done)
+
+        elif event_type == "spool_usage_logged":
+            if event.get("printer_id") == self._bambuddy_printer_id:
+                await self._handle_spool_usage_logged(event)
 
         elif event_type == "inventory_changed":
             # Refresh-on-save: ein Profil-/Inventory-Wechsel in Bambuddy stößt
@@ -5031,48 +5043,83 @@ class Driver(BaseDriver):
             else:
                 await self._debounced_sync()
 
-    async def _handle_print_complete(self, data: dict) -> None:
-        """Meldet Filament-Verbrauch nach Druckende an FilaMan.
-
-        Das `weight_used`-Feld des Events kann sein:
-        - float  → Gesamtgewicht aller Filamente
-        - dict   → {"ams_id-tray_id": weight_g, ...} per Slot
-
-        Für die Zuordnung Slot → FilaMan-Spool-ID wird der in-memory Cache
-        `_slot_to_filaman_spool` genutzt, der bei jeder Tray-Zuweisung
-        (`send_filament_to_tray`) aktualisiert wird.
-        """
+    async def _handle_print_complete(self, data: dict, *, event_id: str = "") -> None:
+        """Compatibility path for older Bambuddy print_complete payloads."""
+        if event_id:
+            await asyncio.sleep(0.25)
+            if event_id in self._modern_usage_event_ids:
+                return
         weight_used = data.get("weight_used")
         if not weight_used:
             return
-
+        fallback_key = event_id or f"legacy:{self._bambuddy_printer_id}:{data.get('subtask_name') or data.get('filename') or 'unknown'}"
         if isinstance(weight_used, dict):
-            # Per-Slot: {"0-0": 12.5, "0-1": 8.3, ...}
-            for slot_key, weight_g in weight_used.items():
+            for slot_key, raw_weight in weight_used.items():
+                weight_g = _float_or_none(raw_weight)
+                if weight_g is None or not math.isfinite(weight_g) or weight_g <= 0:
+                    continue
                 filaman_spool_id = self._slot_to_filaman_spool.get(str(slot_key))
-                if filaman_spool_id and float(weight_g) > 0:
-                    await self._report_consumption(filaman_spool_id, float(weight_g))
-
-        elif isinstance(weight_used, (int, float)) and float(weight_used) > 0:
-            # Gesamtgewicht: nur melden wenn genau ein Slot aktiv
+                if filaman_spool_id:
+                    await self._report_consumption(filaman_spool_id, weight_g, source_event_key=f"\${fallback_key}:{slot_key}")
+        elif isinstance(weight_used, (int, float)) and math.isfinite(float(weight_used)) and float(weight_used) > 0:
             active_slots = list(self._slot_to_filaman_spool.items())
             if len(active_slots) == 1:
-                _, filaman_spool_id = active_slots[0]
-                await self._report_consumption(filaman_spool_id, float(weight_used))
+                await self._report_consumption(active_slots[0][1], float(weight_used), source_event_key=fallback_key)
             elif len(active_slots) > 1:
-                logger.debug(
-                    f"print_complete: total weight {weight_used}g but {len(active_slots)} "
-                    f"active slots — cannot split accurately, skipping consumption report"
-                )
+                logger.warning("legacy print_complete has multiple active slots; skipping ambiguous consumption")
 
-    async def _report_consumption(self, filaman_spool_id: int, delta_g: float) -> None:
-        """Meldet delta_g Verbrauch direkt über SpoolService in FilaMan-DB."""
+    async def _handle_spool_usage_logged(self, event: dict) -> None:
+        """Consume Bambuddy's already-calculated per-spool usage payload."""
+        event_id = str(event.get("event_id") or "").strip()
+        if event_id:
+            self._modern_usage_event_ids.add(event_id)
+            task = self._legacy_consumption_tasks.pop(event_id, None)
+            if task and not task.done():
+                task.cancel()
+        usage = event.get("usage")
+        if not isinstance(usage, list):
+            logger.warning("Ignoring malformed spool_usage_logged without usage list")
+            return
+        for item in usage:
+            if not isinstance(item, dict):
+                continue
+            weight = _float_or_none(item.get("weight_used"))
+            if weight is None or not math.isfinite(weight) or weight <= 0:
+                continue
+            bb_id = _int_or_none(item.get("spool_id"))
+            ams_id = _int_or_none(item.get("ams_id"))
+            tray_id = _int_or_none(item.get("tray_id"))
+            if bb_id is None:
+                logger.warning("Skipping usage item without Bambuddy spool_id (event=%s)", event_id)
+                continue
+            filaman_id = await self._resolve_bambuddy_spool_id(bb_id)
+            if filaman_id is None and ams_id is not None and tray_id is not None:
+                filaman_id = self._slot_to_filaman_spool.get(f"{ams_id}-{tray_id}")
+                if filaman_id:
+                    logger.warning("Using slot fallback for Bambuddy spool %s (event=%s)", bb_id, event_id)
+            if filaman_id is None:
+                logger.warning("Unknown Bambuddy spool %s; skipping usage (event=%s)", bb_id, event_id)
+                continue
+            key = f"\${event_id or 'legacy'}:{bb_id}:{ams_id if ams_id is not None else ''}:{tray_id if tray_id is not None else ''}"
+            await self._report_consumption(filaman_id, weight, source_event_key=key)
+
+    async def _resolve_bambuddy_spool_id(self, bambuddy_spool_id: int) -> int | None:
+        async with async_session_maker() as db:
+            result = await db.execute(select(SpoolPrinterParam).where(
+                SpoolPrinterParam.printer_id == self.printer_id,
+                SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                SpoolPrinterParam.param_value == str(bambuddy_spool_id),
+            ))
+            param = result.scalars().first()
+            return param.spool_id if param else None
+
+    async def _report_consumption(
+        self, filaman_spool_id: int, delta_g: float, *, source_event_key: str | None = None
+    ) -> None:
         try:
-            await self._report_consumption_db(filaman_spool_id, delta_g)
+            await self._report_consumption_db(filaman_spool_id, delta_g, source_event_key=source_event_key)
         except Exception as e:
-            logger.warning(
-                f"Failed to report consumption for FilaMan spool {filaman_spool_id}: {e}"
-            )
+            logger.warning(f"Failed to report consumption for FilaMan spool {filaman_spool_id}: {e}")
 
     # -- Tray-Konfiguration (FilaMan → Bambuddy) ------------------------------
 
