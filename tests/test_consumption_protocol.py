@@ -1,6 +1,6 @@
 import pytest
 
-from bambuddy.driver import Driver
+from app.plugins.bambuddy.driver import Driver
 
 
 @pytest.mark.asyncio
