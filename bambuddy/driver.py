@@ -459,8 +459,6 @@ class Driver(BaseDriver):
         self._unmatched_fallback_ts: float = 0.0
         # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
         self._slot_to_filaman_spool: dict[str, int] = {}
-        self._modern_usage_event_ids: set[str] = set()
-        self._legacy_consumption_tasks: dict[str, asyncio.Task] = {}
         # Sticky AMS: throttle reassert POSTs after empty trays / unscanned reinserts.
         self._sticky_reassert_ts: dict[str, float] = {}
         self._STICKY_REASSERT_COOLDOWN: float = 5.0
@@ -5018,10 +5016,7 @@ class Driver(BaseDriver):
             data = event.get("data", {})
             if data.get("printer_id") == self._bambuddy_printer_id:
                 event_id = str(event.get("event_id") or data.get("event_id") or "")
-                task = asyncio.create_task(self._handle_print_complete(data, event_id=event_id))
-                if event_id:
-                    self._legacy_consumption_tasks[event_id] = task
-                task.add_done_callback(self._on_task_done)
+                await self._handle_print_complete(data, event_id=event_id)
 
         elif event_type == "spool_usage_logged":
             if event.get("printer_id") == self._bambuddy_printer_id:
@@ -5047,10 +5042,9 @@ class Driver(BaseDriver):
         """Compatibility path for older Bambuddy print_complete payloads."""
         if self._spoolman_enabled:
             return
+        # A run_event_id marks modern Bambuddy; only spool_usage_logged may consume it.
         if event_id:
-            await asyncio.sleep(0.25)
-            if event_id in self._modern_usage_event_ids:
-                return
+            return
         weight_used = data.get("weight_used")
         if not weight_used:
             return
@@ -5076,11 +5070,6 @@ class Driver(BaseDriver):
             logger.info("Skipping internal consumption: Bambuddy Spoolman mode is enabled")
             return
         event_id = str(event.get("event_id") or "").strip()
-        if event_id:
-            self._modern_usage_event_ids.add(event_id)
-            task = self._legacy_consumption_tasks.pop(event_id, None)
-            if task and not task.done():
-                task.cancel()
         usage = event.get("usage")
         if not isinstance(usage, list):
             logger.warning("Ignoring malformed spool_usage_logged without usage list")
@@ -5094,10 +5083,7 @@ class Driver(BaseDriver):
             bb_id = _int_or_none(item.get("spool_id"))
             ams_id = _int_or_none(item.get("ams_id"))
             tray_id = _int_or_none(item.get("tray_id"))
-            if bb_id is None:
-                logger.warning("Skipping usage item without Bambuddy spool_id (event=%s)", event_id)
-                continue
-            filaman_id = await self._resolve_bambuddy_spool_id(bb_id)
+            filaman_id = await self._resolve_bambuddy_spool_id(bb_id) if bb_id is not None else None
             if filaman_id is None and ams_id is not None and tray_id is not None:
                 filaman_id = self._slot_to_filaman_spool.get(f"{ams_id}-{tray_id}")
                 if filaman_id:
