@@ -1,0 +1,35 @@
+name: Plugin CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/bambuddy-inventory-only
+    paths:
+      - "bambuddy/**"
+      - "tests/**"
+      - "bambuddy/plugin.json"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-asyncio httpx websockets sqlalchemy aiosqlite pydantic pydantic-settings fastapi
+
+      - name: Run plugin test suite
+        run: python -m pytest -q
