@@ -5070,6 +5070,9 @@ class Driver(BaseDriver):
 
     async def _handle_spool_usage_logged(self, event: dict) -> None:
         """Consume Bambuddy's already-calculated per-spool usage payload."""
+        if self._spoolman_enabled:
+            logger.info("Skipping internal consumption: Bambuddy Spoolman mode is enabled")
+            return
         event_id = str(event.get("event_id") or "").strip()
         if event_id:
             self._modern_usage_event_ids.add(event_id)
