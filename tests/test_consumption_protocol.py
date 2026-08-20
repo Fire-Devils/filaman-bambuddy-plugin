@@ -9,6 +9,7 @@ async def test_spool_usage_logged_maps_bambuddy_id_and_builds_idempotency_key():
     driver._bambuddy_printer_id = 3
     driver.printer_id = 7
     driver._spoolman_enabled = False
+    driver._spoolman_enabled = False
     driver._modern_usage_event_ids = set()
     driver._legacy_consumption_tasks = {}
     driver._slot_to_filaman_spool = {}
@@ -30,6 +31,7 @@ async def test_spool_usage_logged_maps_bambuddy_id_and_builds_idempotency_key():
 async def test_spool_usage_logged_ignores_invalid_weight_and_unsafe_mapping():
     driver = object.__new__(Driver)
     driver._bambuddy_printer_id = 3
+    driver._spoolman_enabled = False
     driver._modern_usage_event_ids = set()
     driver._legacy_consumption_tasks = {}
     driver._slot_to_filaman_spool = {}
