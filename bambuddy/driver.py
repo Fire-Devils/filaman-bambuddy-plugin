@@ -5045,6 +5045,8 @@ class Driver(BaseDriver):
 
     async def _handle_print_complete(self, data: dict, *, event_id: str = "") -> None:
         """Compatibility path for older Bambuddy print_complete payloads."""
+        if self._spoolman_enabled:
+            return
         if event_id:
             await asyncio.sleep(0.25)
             if event_id in self._modern_usage_event_ids:
