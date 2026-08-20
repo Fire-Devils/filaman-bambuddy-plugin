@@ -12,7 +12,7 @@ async def test_spool_usage_logged_maps_bambuddy_id_and_builds_idempotency_key():
     driver._spoolman_enabled = False
     driver._slot_to_filaman_spool = {}
     calls = []
-    driver._resolve_bambuddy_spool_id = lambda spool_id: _resolved(spool_id, 42)
+    driver._resolve_bambuddy_spool_id = lambda spool_id: _resolved(42, spool_id)
     driver._report_consumption = lambda spool, grams, **kw: _record(calls, spool, grams, kw)
 
     await driver._handle_spool_usage_logged({
