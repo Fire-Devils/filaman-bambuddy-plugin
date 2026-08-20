@@ -10,8 +10,6 @@ async def test_spool_usage_logged_maps_bambuddy_id_and_builds_idempotency_key():
     driver.printer_id = 7
     driver._spoolman_enabled = False
     driver._spoolman_enabled = False
-    driver._modern_usage_event_ids = set()
-    driver._legacy_consumption_tasks = {}
     driver._slot_to_filaman_spool = {}
     calls = []
     driver._resolve_bambuddy_spool_id = lambda spool_id: _resolved(spool_id, 42)
