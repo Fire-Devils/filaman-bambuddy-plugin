@@ -18,6 +18,14 @@
         "enum": ["enabled", "disabled"],
         "default": "enabled"
       },
+      "printer_write_mode": {
+        "type": "string",
+        "title": "Printer Write Mode",
+        "description": "Full applies filament and calibration settings to the printer; Inventory only keeps Bambuddy inventory and assignment state without printer material writes.",
+        "enum": ["full", "inventory_only"],
+        "enumNames": ["Full", "Inventory only"],
+        "default": "full"
+      },
       "bambuddy_url": {
         "type": "string",
         "title": "Bambuddy URL",

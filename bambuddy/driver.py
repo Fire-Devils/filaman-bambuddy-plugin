@@ -423,6 +423,10 @@ class Driver(BaseDriver):
             config.get("reconnect_interval_seconds", 30)
         )
         self._sync_enabled: bool = config.get("sync_enabled", "disabled") == "enabled"
+        self._printer_write_mode = config.get("printer_write_mode", "full")
+        if self._printer_write_mode not in {"full", "inventory_only"}:
+            self._printer_write_mode = "full"
+        self._apply_to_printer = self._printer_write_mode == "full"
         # Feature flag: per-model slicer-profile variants (PFUS) + setting_id on
         # AMS configure. Accepts per_model_profiles or legacy per_printer_profiles.
         _profile_flag = config.get("per_model_profiles") or config.get(
@@ -5149,6 +5153,7 @@ class Driver(BaseDriver):
                         "printer_id": self._bambuddy_printer_id,
                         "ams_id": ams_id,
                         "tray_id": tray_id,
+                        "apply_to_printer": self._apply_to_printer,
                     },
                 )
                 self.log_debug(
@@ -5180,9 +5185,10 @@ class Driver(BaseDriver):
                 f"before MQTT (gen {assign_gen})"
             )
             return
-        await self._send_assignment(
-            ams_id, tray_id, filament_data, expected_gen=assign_gen
-        )
+        if self._apply_to_printer:
+            await self._send_assignment(
+                ams_id, tray_id, filament_data, expected_gen=assign_gen
+            )
 
         if filaman_spool_id:
             await self._update_spool_location(filaman_spool_id, ams_id, tray_id)
@@ -5217,6 +5223,8 @@ class Driver(BaseDriver):
         ``expected_gen``: when set, abort if another assign bumped the slot's
         configure generation (prevents stale sticky MQTT from winning a swap).
         """
+        if not self._apply_to_printer:
+            return
         if not self._client:
             logger.error("Cannot send assignment: HTTP client not initialized")
             return
@@ -5958,6 +5966,7 @@ class Driver(BaseDriver):
                         "printer_id": self._bambuddy_printer_id,
                         "ams_id": ams_id,
                         "tray_id": tray_id,
+                        "apply_to_printer": self._apply_to_printer,
                     },
                 )
                 logger.info(
@@ -5972,7 +5981,7 @@ class Driver(BaseDriver):
                     f"AMS {ams_id}/{tray_id}: {e}"
                 )
 
-        if not configure:
+        if not self._apply_to_printer or not configure:
             return
         if not self._slot_configure_gen_matches(slot_key, expected_gen):
             logger.info(
@@ -6447,6 +6456,7 @@ class Driver(BaseDriver):
                         "printer_id": self._bambuddy_printer_id,
                         "ams_id": ams_id,
                         "tray_id": tray_id,
+                        "apply_to_printer": self._apply_to_printer,
                     },
                 )
                 self._slot_to_filaman_spool[f"{ams_id}-{tray_id}"] = fm_id
