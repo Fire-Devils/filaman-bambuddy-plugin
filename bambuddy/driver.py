@@ -5060,7 +5060,7 @@ class Driver(BaseDriver):
                     continue
                 filaman_spool_id = self._slot_to_filaman_spool.get(str(slot_key))
                 if filaman_spool_id:
-                    await self._report_consumption(filaman_spool_id, weight_g, source_event_key=f"${fallback_key}:{slot_key}")
+                    await self._report_consumption(filaman_spool_id, weight_g, source_event_key=f"{fallback_key}:{slot_key}")
         elif isinstance(weight_used, (int, float)) and math.isfinite(float(weight_used)) and float(weight_used) > 0:
             active_slots = list(self._slot_to_filaman_spool.items())
             if len(active_slots) == 1:
@@ -5100,7 +5100,7 @@ class Driver(BaseDriver):
             if filaman_id is None:
                 logger.warning("Unknown Bambuddy spool %s; skipping usage (event=%s)", bb_id, event_id)
                 continue
-            key = f"${event_id or 'legacy'}:{bb_id}:{ams_id if ams_id is not None else ''}:{tray_id if tray_id is not None else ''}"
+            key = f"{event_id or 'legacy'}:{bb_id}:{ams_id if ams_id is not None else ''}:{tray_id if tray_id is not None else ''}"
             await self._report_consumption(filaman_id, weight, source_event_key=key)
 
     async def _resolve_bambuddy_spool_id(self, bambuddy_spool_id: int) -> int | None:
