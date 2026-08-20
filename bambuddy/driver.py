@@ -4173,7 +4173,7 @@ class Driver(BaseDriver):
                 principal=None,
                 source="bambuddy",
                 source_event_key=source_event_key,
-            
+            )
             logger.info(
                 f"Recorded {delta_g:.1f}g consumption for FilaMan spool {filaman_spool_id} "
                 f"(remaining: {remaining}g)"
