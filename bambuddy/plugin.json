@@ -24,6 +24,11 @@
         "description": "Full applies filament and calibration settings to the printer; Inventory only keeps Bambuddy inventory and assignment state without printer material writes.",
         "enum": ["full", "inventory_only"],
         "enumNames": ["Full", "Inventory only"],
+        "enumNamesByLocale": {
+          "en": ["Full", "Inventory only"],
+          "ru": ["Полный режим", "Только инвентарь"],
+          "uk": ["Повний режим", "Лише інвентар"]
+        },
         "default": "full"
       },
       "bambuddy_url": {
