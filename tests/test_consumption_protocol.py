@@ -58,3 +58,33 @@ async def _resolved(value, _expected):
 
 async def _record(calls, spool, grams, kw):
     calls.append((spool, grams, kw))
+
+
+@pytest.mark.asyncio
+async def test_modern_print_complete_does_not_consume():
+    driver = object.__new__(Driver)
+    driver._spoolman_enabled = False
+    driver._slot_to_filaman_spool = {"0-0": 42}
+    driver._report_consumption = lambda *args, **kwargs: _record([], *args, **kwargs)
+
+    await driver._handle_print_complete({"weight_used": 12.4}, event_id="run-1")
+
+
+@pytest.mark.asyncio
+async def test_modern_usage_without_bambuddy_spool_id_uses_slot_fallback():
+    driver = object.__new__(Driver)
+    driver._spoolman_enabled = False
+    driver._modern_usage_event_ids = set()
+    driver._legacy_consumption_tasks = {}
+    driver._slot_to_filaman_spool = {"255-1": 99}
+    driver._resolve_bambuddy_spool_id = lambda _: _resolved(None, None)
+    calls = []
+    driver._report_consumption = lambda spool, grams, **kw: _record(calls, spool, grams, kw)
+
+    await driver._handle_spool_usage_logged({
+        "printer_id": 3,
+        "event_id": "run-2",
+        "usage": [{"weight_used": 3.2, "ams_id": 255, "tray_id": 1}],
+    })
+
+    assert calls == [(99, 3.2, {"source_event_key": "run-2:None:255:1"})]
