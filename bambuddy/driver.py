@@ -46,6 +46,8 @@ except ImportError:  # pragma: no cover
 
 from app.plugins.base import BaseDriver
 
+from .external_slots import canonical_external_tray_id, external_slot_index
+
 from .profile_variants import (
     build_variant_groups_from_index,
     build_variant_index_from_presets,
@@ -6888,7 +6890,8 @@ class Driver(BaseDriver):
             vt_id = int(vt.get("id", 254))
             vt_type = vt.get("tray_type", "")
             vt_color = vt.get("tray_color", "")
-            vt_idx = f"255-{vt_id}"
+            vt_tray_id = canonical_external_tray_id(vt_id)
+            vt_idx = external_slot_index(vt_id)
             vt_cached = self._slot_params_cache.get(vt_idx, {})
 
             vt_preset_id = vt.get("preset_id", "")
@@ -6910,7 +6913,7 @@ class Driver(BaseDriver):
                     and vt_was_present
                     and self._pending_spool_id is None
                 ):
-                    self._schedule_sticky_reassert(255, vt_id, configure=False)
+                    self._schedule_sticky_reassert(255, vt_tray_id, configure=False)
             else:
                 matched, reason = self._try_match_pending_tray(vt_idx, vt)
                 if matched:
@@ -6927,14 +6930,14 @@ class Driver(BaseDriver):
                             _rt.add_done_callback(self._on_task_done)
                         self._slot_to_filaman_spool[vt_idx] = matched_spool_id
                         sticky_vt_id = matched_spool_id
-                    self._fire_pending_assignment(255, vt_id, reason)
+                    self._fire_pending_assignment(255, vt_tray_id, reason)
                 elif (
                     sticky_vt_id
                     and self._pending_spool_id is None
                     and not vt_was_present
                 ):
                     self._schedule_sticky_reassert(
-                        255, vt_id, configure=True, tray=vt
+                        255, vt_tray_id, configure=True, tray=vt
                     )
 
             ext_slots.append(
@@ -6997,7 +7000,7 @@ class Driver(BaseDriver):
                     )
                     _t = asyncio.create_task(
                         self._reconfigure_slot_with_profile(
-                            255, vt_id, vt_tray_info_idx, vt
+                            255, vt_tray_id, vt_tray_info_idx, vt
                         )
                     )
                     _t.add_done_callback(self._on_task_done)
