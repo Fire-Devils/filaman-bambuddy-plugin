@@ -3,7 +3,7 @@
   "name": "Bambuddy",
   "driver_key": "bambuddy",
   "plugin_type": "driver",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "description": "Connects to printers managed by Bambuddy. Receives real-time AMS data and idempotent modern spool usage events via WebSocket, with legacy print completion compatibility.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
