@@ -29,8 +29,11 @@ _KNOWN_PRINTER_MODEL_TOKENS: tuple[str, ...] = (
     "P2",
 )
 
-# Multi-word names Bambu/Bambuddy use before canonical token matching.
-_SPACED_MODEL_ALIASES: dict[str, str] = {
+# Alternate names Bambu Studio / Bambuddy use for the same machine.
+# Stock filament presets use ``@BBL A1M``; printers/compatible_printers often
+# say ``A1 Mini``; FilaMan stores the canonical token ``A1MINI``.
+_MODEL_ALIASES: dict[str, str] = {
+    "A1M": "A1MINI",
     "A1 MINI": "A1MINI",
     "X1 CARBON": "X1C",
 }
@@ -138,10 +141,12 @@ def canonical_printer_model_token(raw: str | None) -> str:
         flags=re.IGNORECASE,
     ).strip()
     upper = s.upper()
-    if upper in _SPACED_MODEL_ALIASES:
-        return _SPACED_MODEL_ALIASES[upper]
+    if upper in _MODEL_ALIASES:
+        return _MODEL_ALIASES[upper]
     # Collapse spaces so "A1 Mini" → A1MINI before shorter tokens (e.g. A1) match.
     nospace = re.sub(r"\s+", "", upper)
+    if nospace in _MODEL_ALIASES:
+        return _MODEL_ALIASES[nospace]
     for token in sorted(_KNOWN_PRINTER_MODEL_TOKENS, key=len, reverse=True):
         if nospace == token.upper():
             return token
@@ -507,13 +512,17 @@ def expected_cloud_preset_name(
     base_name: str, model_token: str, nozzle_mm: float | None = None
 ) -> str:
     """Cloud preset name the user should create when a variant is missing."""
+    # Prefer the suffix Bambu Studio uses in stock/custom presets.
+    display_model = {
+        "A1MINI": "A1M",
+    }.get(model_token.strip().upper(), model_token)
     nozzle = nozzle_mm if nozzle_mm is not None else 0.4
     if nozzle == 0.4:
         return (
-            f"{base_name} @BBL {model_token} 0.4 nozzle "
-            f"(stock presets on any model may use @BBL {model_token} only)"
+            f"{base_name} @BBL {display_model} 0.4 nozzle "
+            f"(stock presets on any model may use @BBL {display_model} only)"
         )
-    return f"{base_name} @BBL {model_token} {nozzle:g} nozzle"
+    return f"{base_name} @BBL {display_model} {nozzle:g} nozzle"
 
 
 def is_override_profile_source(source: str | None) -> bool:

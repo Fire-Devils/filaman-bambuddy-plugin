@@ -124,6 +124,8 @@ def test_canonical_printer_model_token_a1_mini_not_a1() -> None:
     assert canonical_printer_model_token("A1 Mini") == "A1MINI"
     assert canonical_printer_model_token("A1 mini") == "A1MINI"
     assert canonical_printer_model_token("A1MINI") == "A1MINI"
+    assert canonical_printer_model_token("A1Mini") == "A1MINI"
+    assert canonical_printer_model_token("A1M") == "A1MINI"
     assert canonical_printer_model_token("Bambu Lab A1 Mini") == "A1MINI"
     assert canonical_printer_model_token("Bambu Lab A1 Mini 0.4 nozzle") == "A1MINI"
     assert canonical_printer_model_token("A1") == "A1"
@@ -135,8 +137,48 @@ def test_parse_cloud_preset_name_a1_mini() -> None:
     assert base == "Sunlu PLA"
     assert model == "A1MINI"
     assert nozzle == 0.4
+    base_m, model_m, nozzle_m = parse_cloud_preset_name(
+        "Bambu PLA Basic @BBL A1M"
+    )
+    assert base_m == "Bambu PLA Basic"
+    assert model_m == "A1MINI"
+    assert nozzle_m is None
+    base_mn, model_mn, nozzle_mn = parse_cloud_preset_name(
+        "SUNLU PETG @BBL A1M 0.4 nozzle"
+    )
+    assert model_mn == "A1MINI"
+    assert nozzle_mn == 0.4
     base2, model2, _ = parse_cloud_preset_name("Sunlu PLA @BBL A1 0.4 nozzle")
     assert model2 == "A1"
+
+
+def test_a1m_stock_presets_index_under_a1mini() -> None:
+    """Bambu Studio stock A1 Mini presets use @BBL A1M in the name."""
+    presets = [
+        {
+            "code": "GFSA00_02",
+            "name": "Bambu PLA Basic @BBL A1M",
+            "compatible_printers": ["Bambu Lab A1 mini 0.4 nozzle"],
+        },
+        {
+            "code": "PFUS_CUSTOM",
+            "name": "SUNLU PETG Orange @BBL A1 Mini 0.4 nozzle",
+        },
+        {
+            "code": "PFUS_A1MINI_NOSPACE",
+            "name": "SUNLU PETG Orange @BBL A1Mini 0.4 nozzle",
+        },
+    ]
+    index = build_variant_index_from_presets(presets)
+    groups = build_variant_groups_from_index(index)
+    grouped = group_presets_by_base_name(presets, model_token="A1MINI")
+    filtered = filter_grouped_presets_for_model(grouped, groups, "A1MINI")
+    bases = {p["baseName"] for p in filtered}
+    assert "Bambu PLA Basic" in bases
+    assert "SUNLU PETG Orange" in bases
+    assert resolve_cloud_variant_from_index(
+        index, "Bambu PLA Basic", "A1MINI", 0.4, groups=groups
+    ) == "GFSA00_02"
 
 
 def test_canonical_printer_model_token_x1_carbon() -> None:
