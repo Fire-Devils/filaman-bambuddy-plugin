@@ -29,6 +29,12 @@ _KNOWN_PRINTER_MODEL_TOKENS: tuple[str, ...] = (
     "P2",
 )
 
+# Multi-word names Bambu/Bambuddy use before canonical token matching.
+_SPACED_MODEL_ALIASES: dict[str, str] = {
+    "A1 MINI": "A1MINI",
+    "X1 CARBON": "X1C",
+}
+
 STANDARD_NOZZLE_MM: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
 _STOCK_DEFAULT_NOZZLE_MM = 0.4
 
@@ -132,6 +138,13 @@ def canonical_printer_model_token(raw: str | None) -> str:
         flags=re.IGNORECASE,
     ).strip()
     upper = s.upper()
+    if upper in _SPACED_MODEL_ALIASES:
+        return _SPACED_MODEL_ALIASES[upper]
+    # Collapse spaces so "A1 Mini" → A1MINI before shorter tokens (e.g. A1) match.
+    nospace = re.sub(r"\s+", "", upper)
+    for token in sorted(_KNOWN_PRINTER_MODEL_TOKENS, key=len, reverse=True):
+        if nospace == token.upper():
+            return token
     known = {t.upper() for t in _KNOWN_PRINTER_MODEL_TOKENS}
     for token in sorted(_KNOWN_PRINTER_MODEL_TOKENS, key=len, reverse=True):
         if upper == token:

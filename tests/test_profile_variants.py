@@ -120,6 +120,32 @@ def test_canonical_printer_model_token_exact() -> None:
     assert canonical_printer_model_token("P2") == "P2"
 
 
+def test_canonical_printer_model_token_a1_mini_not_a1() -> None:
+    assert canonical_printer_model_token("A1 Mini") == "A1MINI"
+    assert canonical_printer_model_token("A1 mini") == "A1MINI"
+    assert canonical_printer_model_token("A1MINI") == "A1MINI"
+    assert canonical_printer_model_token("Bambu Lab A1 Mini") == "A1MINI"
+    assert canonical_printer_model_token("Bambu Lab A1 Mini 0.4 nozzle") == "A1MINI"
+    assert canonical_printer_model_token("A1") == "A1"
+    assert canonical_printer_model_token("Bambu Lab A1") == "A1"
+
+
+def test_parse_cloud_preset_name_a1_mini() -> None:
+    base, model, nozzle = parse_cloud_preset_name("Sunlu PLA @BBL A1 Mini 0.4 nozzle")
+    assert base == "Sunlu PLA"
+    assert model == "A1MINI"
+    assert nozzle == 0.4
+    base2, model2, _ = parse_cloud_preset_name("Sunlu PLA @BBL A1 0.4 nozzle")
+    assert model2 == "A1"
+
+
+def test_canonical_printer_model_token_x1_carbon() -> None:
+    assert canonical_printer_model_token("X1 Carbon") == "X1C"
+    assert canonical_printer_model_token("Bambu Lab X1 Carbon") == "X1C"
+    assert canonical_printer_model_token("X1C") == "X1C"
+    assert canonical_printer_model_token("X1") == "X1"
+
+
 def test_model_collision_p2_not_p2s() -> None:
     index, groups = _index_and_groups()
     base = "Generic PLA"
