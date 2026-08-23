@@ -1343,6 +1343,15 @@ class Driver(BaseDriver):
             self._variant_index = _build_variant_index_from_presets(merged)
             self._variant_groups = _build_variant_groups_from_index(self._variant_index)
             self._variant_index_ts = now
+            n_custom = sum(1 for p in merged if p.get("isCustom"))
+            n_pfus = sum(
+                1 for p in merged if str(p.get("code") or "").upper().startswith("PFUS")
+            )
+            logger.info(
+                f"Cloud preset catalog loaded: {len(merged)} total, "
+                f"{n_custom} custom, {n_pfus} PFUS "
+                f"(from Bambuddy {self._bambuddy_url})"
+            )
         return self._cloud_presets
 
     async def _ensure_variant_index(

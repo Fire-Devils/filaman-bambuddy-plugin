@@ -194,9 +194,38 @@ def test_parse_cloud_preset_name_real_user_a1_mini_variants() -> None:
         "SUNLU PETG Orange @BBL A1Mini 0.4 nozzle": (
             "SUNLU PETG Orange", "A1MINI", 0.4,
         ),
+        # Trailing junk / missing space before @
+        "SUNLU PETG Cherry Red @BBL A1M 0.4 nozzle-test": (
+            "SUNLU PETG Cherry Red", "A1MINI", 0.4,
+        ),
+        "Jayo PETG Olive Green@BBL A1M 0.4 nozzle": (
+            "Jayo PETG Olive Green", "A1MINI", 0.4,
+        ),
+        "Bambu TPU 95A @BBL A1M - Kopieren": (
+            "Bambu TPU 95A", "A1MINI", None,
+        ),
     }
     for name, expected in cases.items():
         assert parse_cloud_preset_name(name) == expected, name
+
+
+def test_group_presets_prefers_custom_over_stock_same_base() -> None:
+    presets = [
+        {
+            "code": "GFSNLS08_06",
+            "name": "SUNLU PETG @BBL A1M 0.2 nozzle",
+            "isCustom": False,
+        },
+        {
+            "code": "PFUScustom",
+            "name": "SUNLU PETG @BBL A1 Mini 0.4 nozzle",
+            "isCustom": True,
+        },
+    ]
+    grouped = group_presets_by_base_name(presets, model_token="A1MINI")
+    by_base = {p["baseName"]: p for p in grouped}
+    assert by_base["SUNLU PETG"]["code"] == "PFUScustom"
+    assert by_base["SUNLU PETG"]["isCustom"] is True
 
 
 def test_canonical_printer_model_token_x1_carbon() -> None:

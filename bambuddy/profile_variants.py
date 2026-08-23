@@ -7,13 +7,17 @@ from typing import Any
 
 # Stock/newer presets: ``BASE @BBL H2C 0.4 nozzle``
 # Custom/legacy presets: ``BASE @Bambu Lab P2S 0.4 nozzle``
-# ``\s*`` after the vendor tag tolerates typo'd names like ``@BBLA1M``.
+# Tolerances for real user names:
+#   - optional space before ``@`` (``Green@BBL …``)
+#   - optional space after vendor tag (``@BBLA1M``)
+#   - trailing junk after nozzle (``nozzle-test``, ``nozzle - Kopieren``)
+_CLOUD_VENDOR_AT = r"\s*@(?:Bambu Lab|BBL)\s*"
 _CLOUD_PRESET_SUFFIX_RE = re.compile(
-    r" @(?:Bambu Lab|BBL)\s*(.+?) (\d+(?:\.\d+)?) nozzle(?: .+)?$",
+    rf"{_CLOUD_VENDOR_AT}(.+?) (\d+(?:\.\d+)?)\s*nozzle\b.*$",
     re.IGNORECASE,
 )
 _CLOUD_PRESET_MODEL_RE = re.compile(
-    r" @(?:Bambu Lab|BBL)\s*(.+?)$",
+    rf"{_CLOUD_VENDOR_AT}(.+?)$",
     re.IGNORECASE,
 )
 
@@ -69,8 +73,9 @@ def extract_profile_base_name(code_or_name: str | None) -> str:
     if not code_or_name:
         return ""
     name = str(code_or_name).strip()
-    if " @" in name:
-        return name.split(" @", 1)[0].strip()
+    m = re.search(_CLOUD_VENDOR_AT, name, flags=re.IGNORECASE)
+    if m:
+        return name[: m.start()].strip()
     base, _model = _split_trailing_model_token(name)
     return base
 
@@ -171,17 +176,33 @@ def parse_cloud_preset_name(name: str) -> tuple[str, str, float | None]:
     stripped = name.strip()
     m = _CLOUD_PRESET_SUFFIX_RE.search(stripped)
     if m:
-        model_token = canonical_printer_model_token(m.group(1))
+        model_token = canonical_printer_model_token(_clean_model_fragment(m.group(1)))
         nozzle = _float_or_none(m.group(2))
         return base, model_token, nozzle
     m2 = _CLOUD_PRESET_MODEL_RE.search(stripped)
     if m2:
-        model_token = canonical_printer_model_token(m2.group(1))
+        model_token = canonical_printer_model_token(_clean_model_fragment(m2.group(1)))
         return base, model_token, None
     trailing_base, trailing_model = _split_trailing_model_token(stripped)
     if trailing_model:
         return trailing_base, trailing_model, None
     return base, "", None
+
+
+def _clean_model_fragment(raw: str) -> str:
+    """Strip copy/junk suffixes from a captured model fragment.
+
+    Examples: ``A1M - Kopieren`` → ``A1M``; ``A1 Mini 0.4 Spezial`` → ``A1 Mini``.
+    """
+    s = (raw or "").strip()
+    s = re.split(r"\s+[-–]\s+", s, maxsplit=1)[0].strip()
+    s = re.sub(
+        r"\s+\d+(?:\.\d+)?(?:\s*mm)?(?:\s*nozzle)?(?:\b.*)?$",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    return s
 
 
 def _known_model_tokens() -> set[str]:
@@ -276,11 +297,11 @@ def _preset_index_order(preset: dict[str, Any]) -> int:
 
 def _is_model_variant_code(code: str, name: str) -> bool:
     """True for per-model cloud entries (custom PFUS/GF or any @BBL/@Bambu Lab suffix)."""
-    if " @Bambu" in name or " @BBL" in name:
+    if re.search(r"@\s*(?:Bambu Lab|BBL)\b", name, flags=re.IGNORECASE):
         return True
     if code.startswith("PFUS"):
         return True
-    return code.startswith("GF") and " @" in name
+    return code.startswith("GF") and "@" in name
 
 
 def build_variant_index_from_presets(
@@ -473,7 +494,10 @@ def group_presets_by_base_name(
         else:
             dedupe_key = base.upper()
         if dedupe_key in seen:
-            continue
+            # Prefer a user custom over a stock GF* with the same base name so
+            # "SUNLU PETG" customs are not hidden by the official @BBL A1M preset.
+            if seen[dedupe_key].get("isCustom") or not preset.get("isCustom"):
+                continue
         seen[dedupe_key] = {
             "code": code,
             "name": name,
