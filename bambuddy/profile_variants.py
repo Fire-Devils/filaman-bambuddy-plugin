@@ -7,12 +7,13 @@ from typing import Any
 
 # Stock/newer presets: ``BASE @BBL H2C 0.4 nozzle``
 # Custom/legacy presets: ``BASE @Bambu Lab P2S 0.4 nozzle``
+# ``\s*`` after the vendor tag tolerates typo'd names like ``@BBLA1M``.
 _CLOUD_PRESET_SUFFIX_RE = re.compile(
-    r" @(?:Bambu Lab|BBL) (.+?) (\d+(?:\.\d+)?) nozzle(?: .+)?$",
+    r" @(?:Bambu Lab|BBL)\s*(.+?) (\d+(?:\.\d+)?) nozzle(?: .+)?$",
     re.IGNORECASE,
 )
 _CLOUD_PRESET_MODEL_RE = re.compile(
-    r" @(?:Bambu Lab|BBL) (.+?)$",
+    r" @(?:Bambu Lab|BBL)\s*(.+?)$",
     re.IGNORECASE,
 )
 

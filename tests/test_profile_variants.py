@@ -181,6 +181,24 @@ def test_a1m_stock_presets_index_under_a1mini() -> None:
     ) == "GFSA00_02"
 
 
+def test_parse_cloud_preset_name_real_user_a1_mini_variants() -> None:
+    """Real-world custom preset names seen on user installs."""
+    cases = {
+        "Stronghero3D PETG Translucent @Bambu Lab A1 mini 0.4 nozzle": (
+            "Stronghero3D PETG Translucent", "A1MINI", 0.4,
+        ),
+        # Typo'd vendor tag without a space after BBL
+        "Tecbears PETG Transparent Glas @BBLA1M 0.4 nozzle": (
+            "Tecbears PETG Transparent Glas", "A1MINI", 0.4,
+        ),
+        "SUNLU PETG Orange @BBL A1Mini 0.4 nozzle": (
+            "SUNLU PETG Orange", "A1MINI", 0.4,
+        ),
+    }
+    for name, expected in cases.items():
+        assert parse_cloud_preset_name(name) == expected, name
+
+
 def test_canonical_printer_model_token_x1_carbon() -> None:
     assert canonical_printer_model_token("X1 Carbon") == "X1C"
     assert canonical_printer_model_token("Bambu Lab X1 Carbon") == "X1C"
