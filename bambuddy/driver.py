@@ -1288,16 +1288,20 @@ class Driver(BaseDriver):
                         }
                     )
         except Exception as e:
-            logger.debug(f"Could not load cloud/builtin-filaments: {e}")
+            logger.warning(f"Could not load cloud/builtin-filaments: {e}")
 
         # 2. Cloud-Presets (setting_id), inkl. Drucker-/Düsen-Varianten
+        skipped_no_id = 0
         try:
             cloud = await self._bb_get("/api/v1/cloud/filaments")
             if isinstance(cloud, list):
                 for c in cloud:
                     code = (c.get("setting_id") or "").strip()
                     name = (c.get("name") or "").strip()
-                    if not code or code in seen:
+                    if not code:
+                        skipped_no_id += 1
+                        continue
+                    if code in seen:
                         continue
                     seen.add(code)
                     is_custom = bool(c.get("is_custom"))
@@ -1318,8 +1322,20 @@ class Driver(BaseDriver):
                         entry["compatible_printers"] = compat
                     merged.append(entry)
         except Exception as e:
-            logger.debug(f"Could not load cloud/filaments: {e}")
+            logger.warning(f"Could not load cloud/filaments: {e}")
 
+        if skipped_no_id:
+            logger.warning(
+                f"Cloud preset catalog: skipped {skipped_no_id} entr(y/ies) from "
+                f"Bambuddy /api/v1/cloud/filaments without a setting_id — those "
+                f"cannot appear in the slicer profile picker."
+            )
+        if not merged:
+            logger.warning(
+                "Cloud preset catalog is empty — Bambuddy returned no usable "
+                "presets (check Bambuddy cloud sync / API auth). The slicer "
+                "profile picker will show 'no presets found'."
+            )
         if merged:
             self._cloud_presets = merged
             self._cloud_presets_by_code = {p["code"]: p for p in merged}
@@ -1327,6 +1343,15 @@ class Driver(BaseDriver):
             self._variant_index = _build_variant_index_from_presets(merged)
             self._variant_groups = _build_variant_groups_from_index(self._variant_index)
             self._variant_index_ts = now
+            n_custom = sum(1 for p in merged if p.get("isCustom"))
+            n_pfus = sum(
+                1 for p in merged if str(p.get("code") or "").upper().startswith("PFUS")
+            )
+            logger.info(
+                f"Cloud preset catalog loaded: {len(merged)} total, "
+                f"{n_custom} custom, {n_pfus} PFUS "
+                f"(from Bambuddy {self._bambuddy_url})"
+            )
         return self._cloud_presets
 
     async def _ensure_variant_index(

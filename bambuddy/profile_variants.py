@@ -7,12 +7,17 @@ from typing import Any
 
 # Stock/newer presets: ``BASE @BBL H2C 0.4 nozzle``
 # Custom/legacy presets: ``BASE @Bambu Lab P2S 0.4 nozzle``
+# Tolerances for real user names:
+#   - optional space before ``@`` (``Green@BBL …``)
+#   - optional space after vendor tag (``@BBLA1M``)
+#   - trailing junk after nozzle (``nozzle-test``, ``nozzle - Kopieren``)
+_CLOUD_VENDOR_AT = r"\s*@(?:Bambu Lab|BBL)\s*"
 _CLOUD_PRESET_SUFFIX_RE = re.compile(
-    r" @(?:Bambu Lab|BBL) (.+?) (\d+(?:\.\d+)?) nozzle(?: .+)?$",
+    rf"{_CLOUD_VENDOR_AT}(.+?) (\d+(?:\.\d+)?)\s*nozzle\b.*$",
     re.IGNORECASE,
 )
 _CLOUD_PRESET_MODEL_RE = re.compile(
-    r" @(?:Bambu Lab|BBL) (.+?)$",
+    rf"{_CLOUD_VENDOR_AT}(.+?)$",
     re.IGNORECASE,
 )
 
@@ -28,6 +33,15 @@ _KNOWN_PRINTER_MODEL_TOKENS: tuple[str, ...] = (
     "P1",
     "P2",
 )
+
+# Alternate names Bambu Studio / Bambuddy use for the same machine.
+# Stock filament presets use ``@BBL A1M``; printers/compatible_printers often
+# say ``A1 Mini``; FilaMan stores the canonical token ``A1MINI``.
+_MODEL_ALIASES: dict[str, str] = {
+    "A1M": "A1MINI",
+    "A1 MINI": "A1MINI",
+    "X1 CARBON": "X1C",
+}
 
 STANDARD_NOZZLE_MM: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
 _STOCK_DEFAULT_NOZZLE_MM = 0.4
@@ -59,8 +73,9 @@ def extract_profile_base_name(code_or_name: str | None) -> str:
     if not code_or_name:
         return ""
     name = str(code_or_name).strip()
-    if " @" in name:
-        return name.split(" @", 1)[0].strip()
+    m = re.search(_CLOUD_VENDOR_AT, name, flags=re.IGNORECASE)
+    if m:
+        return name[: m.start()].strip()
     base, _model = _split_trailing_model_token(name)
     return base
 
@@ -132,6 +147,15 @@ def canonical_printer_model_token(raw: str | None) -> str:
         flags=re.IGNORECASE,
     ).strip()
     upper = s.upper()
+    if upper in _MODEL_ALIASES:
+        return _MODEL_ALIASES[upper]
+    # Collapse spaces so "A1 Mini" → A1MINI before shorter tokens (e.g. A1) match.
+    nospace = re.sub(r"\s+", "", upper)
+    if nospace in _MODEL_ALIASES:
+        return _MODEL_ALIASES[nospace]
+    for token in sorted(_KNOWN_PRINTER_MODEL_TOKENS, key=len, reverse=True):
+        if nospace == token.upper():
+            return token
     known = {t.upper() for t in _KNOWN_PRINTER_MODEL_TOKENS}
     for token in sorted(_KNOWN_PRINTER_MODEL_TOKENS, key=len, reverse=True):
         if upper == token:
@@ -152,17 +176,33 @@ def parse_cloud_preset_name(name: str) -> tuple[str, str, float | None]:
     stripped = name.strip()
     m = _CLOUD_PRESET_SUFFIX_RE.search(stripped)
     if m:
-        model_token = canonical_printer_model_token(m.group(1))
+        model_token = canonical_printer_model_token(_clean_model_fragment(m.group(1)))
         nozzle = _float_or_none(m.group(2))
         return base, model_token, nozzle
     m2 = _CLOUD_PRESET_MODEL_RE.search(stripped)
     if m2:
-        model_token = canonical_printer_model_token(m2.group(1))
+        model_token = canonical_printer_model_token(_clean_model_fragment(m2.group(1)))
         return base, model_token, None
     trailing_base, trailing_model = _split_trailing_model_token(stripped)
     if trailing_model:
         return trailing_base, trailing_model, None
     return base, "", None
+
+
+def _clean_model_fragment(raw: str) -> str:
+    """Strip copy/junk suffixes from a captured model fragment.
+
+    Examples: ``A1M - Kopieren`` → ``A1M``; ``A1 Mini 0.4 Spezial`` → ``A1 Mini``.
+    """
+    s = (raw or "").strip()
+    s = re.split(r"\s+[-–]\s+", s, maxsplit=1)[0].strip()
+    s = re.sub(
+        r"\s+\d+(?:\.\d+)?(?:\s*mm)?(?:\s*nozzle)?(?:\b.*)?$",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    return s
 
 
 def _known_model_tokens() -> set[str]:
@@ -257,11 +297,11 @@ def _preset_index_order(preset: dict[str, Any]) -> int:
 
 def _is_model_variant_code(code: str, name: str) -> bool:
     """True for per-model cloud entries (custom PFUS/GF or any @BBL/@Bambu Lab suffix)."""
-    if " @Bambu" in name or " @BBL" in name:
+    if re.search(r"@\s*(?:Bambu Lab|BBL)\b", name, flags=re.IGNORECASE):
         return True
     if code.startswith("PFUS"):
         return True
-    return code.startswith("GF") and " @" in name
+    return code.startswith("GF") and "@" in name
 
 
 def build_variant_index_from_presets(
@@ -454,7 +494,10 @@ def group_presets_by_base_name(
         else:
             dedupe_key = base.upper()
         if dedupe_key in seen:
-            continue
+            # Prefer a user custom over a stock GF* with the same base name so
+            # "SUNLU PETG" customs are not hidden by the official @BBL A1M preset.
+            if seen[dedupe_key].get("isCustom") or not preset.get("isCustom"):
+                continue
         seen[dedupe_key] = {
             "code": code,
             "name": name,
@@ -494,13 +537,17 @@ def expected_cloud_preset_name(
     base_name: str, model_token: str, nozzle_mm: float | None = None
 ) -> str:
     """Cloud preset name the user should create when a variant is missing."""
+    # Prefer the suffix Bambu Studio uses in stock/custom presets.
+    display_model = {
+        "A1MINI": "A1M",
+    }.get(model_token.strip().upper(), model_token)
     nozzle = nozzle_mm if nozzle_mm is not None else 0.4
     if nozzle == 0.4:
         return (
-            f"{base_name} @BBL {model_token} 0.4 nozzle "
-            f"(stock presets on any model may use @BBL {model_token} only)"
+            f"{base_name} @BBL {display_model} 0.4 nozzle "
+            f"(stock presets on any model may use @BBL {display_model} only)"
         )
-    return f"{base_name} @BBL {model_token} {nozzle:g} nozzle"
+    return f"{base_name} @BBL {display_model} {nozzle:g} nozzle"
 
 
 def is_override_profile_source(source: str | None) -> bool:
