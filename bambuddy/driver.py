@@ -473,6 +473,9 @@ class Driver(BaseDriver):
         # Brief settle window so empty→reinsert / pending assign can bump gen
         # before a sticky reassert POSTs the old spool to Bambuddy.
         self._STICKY_REASSERT_SETTLE: float = 0.75
+        # In-flight learn dedup: two MQTT events in the same second spawned two
+        # identical learns whose concurrent INSERTs hit the UNIQUE constraint.
+        self._learn_inflight: set[tuple[int, str]] = set()
         # Slot-Key ("ams_id-tray_id") → Bambu tray_uuid (für Spoolman-Link)
         self._slot_to_tray_uuid: dict[str, str] = {}
         # Drucker-Seriennummer (für Spoolman Fallback-Tag-Berechnung)
@@ -4090,6 +4093,10 @@ class Driver(BaseDriver):
                 f"not a tray code (spool {filaman_spool_id})"
             )
             return
+        learn_key = (filaman_spool_id, tray_info_idx)
+        if learn_key in self._learn_inflight:
+            return  # identical learn already running (burst of MQTT events)
+        self._learn_inflight.add(learn_key)
         try:
             async with async_session_maker() as db:
                 spool = await db.get(Spool, filaman_spool_id)
@@ -4160,6 +4167,8 @@ class Driver(BaseDriver):
             logger.warning(
                 f"Failed to learn slot profile for spool {filaman_spool_id}: {e}"
             )
+        finally:
+            self._learn_inflight.discard(learn_key)
 
     async def _delete_original_location_db(self, filaman_spool_id: int) -> None:
         """Entfernt den persistierten Original-Location-Eintrag nach Restore."""
@@ -5261,6 +5270,71 @@ class Driver(BaseDriver):
 
         _t = asyncio.create_task(_delayed_refetch())
         _t.add_done_callback(self._on_task_done)
+
+        # One-shot verification: Bambuddy arms a deferred "configure on
+        # insert" when an assignment is POSTed for an empty tray (sticky
+        # empty-reassert of the previous occupant does exactly that). That
+        # callback can fire milliseconds AFTER this assign's configure and
+        # revert the tray to the old spool's colour/profile. Verify and
+        # re-push once if the tray no longer reflects what we sent.
+        if self._apply_to_printer and self._slot_configure_gen_matches(
+            slot_key, assign_gen
+        ):
+            _vt = asyncio.create_task(
+                self._verify_assign_configure(
+                    ams_id, tray_id, dict(filament_data), assign_gen
+                )
+            )
+            _vt.add_done_callback(self._on_task_done)
+
+    async def _verify_assign_configure(
+        self,
+        ams_id: int,
+        tray_id: int,
+        filament_data: dict,
+        assign_gen: int,
+        delay: float = 6.0,
+    ) -> None:
+        """Re-push configure once if a stale deferred config overwrote ours.
+
+        When the previous occupant's assignment is reasserted while a tray is
+        empty (sticky empty-reassert), Bambuddy stores it as "pre-configured:
+        will configure on insert". Inserting the NEXT spool then fires that
+        stale callback milliseconds after the new spool's own configure,
+        reverting the tray to the old spool's colour/profile. Check the live
+        tray against what we sent and re-send once if it was overwritten.
+        """
+        await asyncio.sleep(delay)
+        slot_key = f"{ams_id}-{tray_id}"
+        if not self._slot_configure_gen_matches(slot_key, assign_gen):
+            return  # a newer assign/configure owns the slot
+        fm_id = _int_or_none(filament_data.get("id"))
+        if fm_id and self._slot_to_filaman_spool.get(slot_key) != fm_id:
+            return  # slot ownership changed
+        slot = next(
+            (s for s in self._current_slots if s["slot_index"] == slot_key),
+            None,
+        )
+        if not slot or not slot.get("present"):
+            return
+        sent_color = self._norm_tray_color(filament_data.get("color"))
+        live_color = self._norm_tray_color(slot.get("tray_color"))
+        if not sent_color or not live_color or live_color == sent_color:
+            return
+        logger.warning(
+            f"AMS {ams_id}/{tray_id} tray overwritten after assign of "
+            f"spool {fm_id} (live colour {live_color!r} != sent "
+            f"{sent_color!r}, likely a stale deferred configure) — "
+            f"re-sending configure"
+        )
+        try:
+            await self._send_assignment(
+                ams_id, tray_id, filament_data, expected_gen=assign_gen
+            )
+        except Exception as e:
+            logger.warning(
+                f"Configure re-push failed for AMS {ams_id}/{tray_id}: {e}"
+            )
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
