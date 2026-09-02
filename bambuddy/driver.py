@@ -456,6 +456,14 @@ class Driver(BaseDriver):
         self._current_ams_units: list[dict[str, Any]] = []
         # Cache für Bambu-Parameter (nozzle temps, k_value etc.) pro Slot
         self._slot_params_cache: dict[str, dict] = {}
+        # Last configure actually sent per slot: {code, setting_id, color, ts}.
+        # Lets a later tray report be judged against our own intent, instead of
+        # trusting whatever the AMS currently holds.
+        self._slot_last_sent: dict[str, dict] = {}
+        # Window in which the AMS is still expected to converge on our configure.
+        # A differing tray code inside it means "not applied / overwritten", not
+        # "the user picked something else in Bambuddy".
+        self._SENT_CONVERGE_WINDOW: float = 90.0
         # Cache für die globale "unmatched profile fallback"-Einstellung
         self._unmatched_fallback_cache: str | None = None
         self._unmatched_fallback_ts: float = 0.0
@@ -5185,6 +5193,12 @@ class Driver(BaseDriver):
             # Slot SOFORT freigeben, damit der Restore-Task den Guard in
             # _restore_spool_location() nicht als "noch aktiv" interpretiert
             del self._slot_to_filaman_spool[slot_key]
+            # Drop the previous occupant's cached params. They exist to
+            # recover a PFUS for the *same* spool; carrying them across a
+            # swap lets a later rebuild (late-NFC, sticky) push the old
+            # spool's profile onto the new one.
+            self._slot_params_cache.pop(slot_key, None)
+            self._slot_last_sent.pop(slot_key, None)
             _t = asyncio.create_task(self._restore_spool_location(old_filaman_spool_id))
             _t.add_done_callback(self._on_task_done)
             logger.info(
@@ -5300,9 +5314,13 @@ class Driver(BaseDriver):
         When the previous occupant's assignment is reasserted while a tray is
         empty (sticky empty-reassert), Bambuddy stores it as "pre-configured:
         will configure on insert". Inserting the NEXT spool then fires that
-        stale callback milliseconds after the new spool's own configure,
-        reverting the tray to the old spool's colour/profile. Check the live
-        tray against what we sent and re-send once if it was overwritten.
+        stale callback after the new spool's own configure, reverting the tray
+        to the old spool's profile.
+
+        Colour alone is not enough to detect this: two spools can share a colour
+        while carrying different profiles, and a swap can also revert only the
+        AMS material code. Compare the AMS code as well, since that is what
+        decides the profile Studio resolves.
         """
         await asyncio.sleep(delay)
         slot_key = f"{ams_id}-{tray_id}"
@@ -5317,15 +5335,27 @@ class Driver(BaseDriver):
         )
         if not slot or not slot.get("present"):
             return
-        sent_color = self._norm_tray_color(filament_data.get("color"))
+
+        sent = self._slot_last_sent.get(slot_key) or {}
+        sent_color = self._norm_tray_color(
+            sent.get("color") or filament_data.get("color")
+        )
         live_color = self._norm_tray_color(slot.get("tray_color"))
-        if not sent_color or not live_color or live_color == sent_color:
+        sent_code = _ams_tray_code(sent.get("code"))
+        live_code = _ams_tray_code(slot.get("tray_info_idx"))
+
+        drift: list[str] = []
+        if sent_color and live_color and live_color != sent_color:
+            drift.append(f"colour {live_color!r} != {sent_color!r}")
+        if sent_code and live_code and live_code != sent_code:
+            drift.append(f"AMS code {live_code!r} != {sent_code!r}")
+        if not drift:
             return
+
         logger.warning(
             f"AMS {ams_id}/{tray_id} tray overwritten after assign of "
-            f"spool {fm_id} (live colour {live_color!r} != sent "
-            f"{sent_color!r}, likely a stale deferred configure) — "
-            f"re-sending configure"
+            f"spool {fm_id} ({'; '.join(drift)}, likely a stale deferred "
+            f"configure) — re-sending configure"
         )
         try:
             await self._send_assignment(
@@ -5633,6 +5663,12 @@ class Driver(BaseDriver):
                     "bambu_max_volumetric_speed"
                 ),
             }
+            self._slot_last_sent[slot_key] = {
+                "code": slicer_filament or "",
+                "setting_id": setting_id or "",
+                "color": color,
+                "ts": time.monotonic(),
+            }
 
             logger.info(
                 f"Configured Bambuddy printer {self._bambuddy_printer_id} "
@@ -5901,6 +5937,28 @@ class Driver(BaseDriver):
 
     def _slot_configure_gen_matches(self, slot_key: str, expected_gen: int) -> bool:
         return self._slot_configure_gen.get(slot_key, 0) == expected_gen
+
+    def _tray_contradicts_recent_configure(
+        self, slot_key: str, tray_info_idx: str
+    ) -> bool:
+        """True while a tray still disagrees with the code we just configured.
+
+        Learning exists to capture a code the *user* set in Bambuddy. Right
+        after our own configure the AMS may still report the previous
+        occupant's code, or a stale deferred configure may have reverted it —
+        persisting that would teach the filament the wrong AMS code. Outside
+        the convergence window a difference is treated as a genuine manual
+        change and learned as before.
+        """
+        sent = self._slot_last_sent.get(slot_key)
+        if not sent:
+            return False
+        sent_code = _ams_tray_code(sent.get("code"))
+        live_code = _ams_tray_code(tray_info_idx)
+        if not sent_code or not live_code or sent_code == live_code:
+            return False
+        age = time.monotonic() - float(sent.get("ts") or 0.0)
+        return age < self._SENT_CONVERGE_WINDOW
 
     def _cancel_sticky_task(self, slot_key: str) -> None:
         task = self._sticky_tasks.pop(slot_key, None)
@@ -6943,12 +7001,21 @@ class Driver(BaseDriver):
                     and tray_info_idx not in _GENERIC_SLICER_ID_SET
                 ):
                     learn_spool_id = self._slot_to_filaman_spool[slot_index]
-                    _lt = asyncio.create_task(
-                        self._learn_slot_profile(
-                            learn_spool_id, tray_info_idx, ams_id, tray_id
+                    if self._tray_contradicts_recent_configure(
+                        slot_index, tray_info_idx
+                    ):
+                        logger.info(
+                            f"Skip learning {tray_info_idx!r} on slot "
+                            f"{slot_index}: contradicts the code just "
+                            f"configured for spool {learn_spool_id}"
                         )
-                    )
-                    _lt.add_done_callback(self._on_task_done)
+                    else:
+                        _lt = asyncio.create_task(
+                            self._learn_slot_profile(
+                                learn_spool_id, tray_info_idx, ams_id, tray_id
+                            )
+                        )
+                        _lt.add_done_callback(self._on_task_done)
 
                     # Late-NFC reconfigure: AMS finished reading NFC chip after our
                     # configure call. On generic/empty → specific transition, re-push.
