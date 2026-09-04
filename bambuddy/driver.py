@@ -5959,11 +5959,18 @@ class Driver(BaseDriver):
         if not spool:
             return False
 
-        spool_tag = ""
-        if spool.rfid_uid:
-            spool_tag = self._to_hex_tag(spool.rfid_uid).upper().replace(":", "")
-        if tray_tag and spool_tag:
-            return tray_tag == spool_tag
+        # FilaMan spools may carry two chips (one per side, spools.rfid_uid_2);
+        # the AMS reports whichever side faces the reader, so accept either.
+        # getattr keeps this working against a FilaMan without the column.
+        spool_tags = {
+            self._to_hex_tag(uid)
+            for uid in (spool.rfid_uid, getattr(spool, "rfid_uid_2", None))
+            if uid
+        }
+        spool_tags.discard("")
+        spool_tag = next(iter(spool_tags), "")
+        if tray_tag and spool_tags:
+            return tray_tag in spool_tags
         # Bambu RFID uuid path when tag_uid absent
         if tray_uuid and spool_tag and len(tray_uuid) >= 16:
             # Can't reliably map uuid↔FilaMan rfid without Bambuddy; fall through
