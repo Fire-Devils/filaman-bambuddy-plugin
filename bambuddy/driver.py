@@ -46,6 +46,11 @@ except ImportError:  # pragma: no cover
 
 from app.plugins.base import BaseDriver
 
+from .cloud_catalog import (
+    pick_vendor_tray_code,
+    preset_name_from_catalog,
+    should_replace_catalog,
+)
 from .external_slots import canonical_external_tray_id, external_slot_index
 
 from .profile_variants import (
@@ -564,6 +569,10 @@ class Driver(BaseDriver):
         self._cloud_presets_by_code: dict[str, dict[str, Any]] = {}
         self._cloud_presets_ts: float = 0.0
         self._cloud_presets_ttl: float = 600.0  # 10min Cache
+        # Last fetch attempt (success or not) — throttles offline retries.
+        self._cloud_presets_attempt_ts: float = 0.0
+        # True when the cached catalog lacks /cloud/filaments (builtins only).
+        self._cloud_presets_degraded: bool = False
         # Pre-indexed (base, model, nozzle) -> PFUS for per-model variant lookup.
         self._variant_index: dict[tuple[str, str, float | None], str] = {}
         self._variant_groups: dict[
@@ -1149,22 +1158,33 @@ class Driver(BaseDriver):
         #    vendor AMS code in the id-map: follow filament_id/base_id when the
         #    Bambuddy payload includes them, else derive GFB01 from GFSB01_xx /
         #    the material token in the display name.
+        entry: dict[str, Any] = {}
         try:
             info = await self._bb_post("/api/v1/cloud/filament-info", [preset_id])
+            if isinstance(info, dict) and isinstance(info.get(preset_id), dict):
+                entry = info[preset_id]
         except Exception as e:
             logger.debug(f"cloud/filament-info failed for {preset_id}: {e}")
-            # Transient failure — do not negative-cache; retry on next sync.
-            return None
-        if not isinstance(info, dict):
-            return None
-        entry = info.get(preset_id) or {}
-        if not isinstance(entry, dict):
-            entry = {}
         name = (entry.get("name") or "").strip()
         filament_id = (entry.get("filament_id") or "").strip()
         base_id = (entry.get("base_id") or "").strip()
+        if not name:
+            # filament-info failed or came back empty (Bambuddy cloud flapping).
+            # The cached catalog already knows this preset's display name — use
+            # it so the base-name → id-map lookup below still works offline.
+            if (
+                not self._cloud_presets_by_code
+                and time.monotonic() - self._cloud_presets_attempt_ts > 60.0
+            ):
+                await self._load_cloud_presets()
+            name = preset_name_from_catalog(self._cloud_presets_by_code, preset_id)
+            if name:
+                logger.debug(
+                    f"cloud/filament-info empty for {preset_id}; using cached "
+                    f"catalog name {name!r}"
+                )
         if not name and not filament_id and not base_id:
-            # Empty/missing payload may be transient; allow retry.
+            # Transient failure / empty payload — do not negative-cache; retry.
             return None
         if name:
             base_name = name.split(" @", 1)[0].strip()
@@ -1277,12 +1297,20 @@ class Driver(BaseDriver):
         Cloud-Verbindung wird eine leere Liste zurückgegeben (nie Exception).
         """
         now = time.monotonic()
+        # A degraded catalog (builtins only, /cloud/filaments failed on first
+        # load) is retried quickly instead of being pinned for the full TTL.
+        ttl = (
+            self._cloud_presets_ttl
+            if not self._cloud_presets_degraded
+            else min(self._cloud_presets_ttl, 60.0)
+        )
         if (
             not force
             and self._cloud_presets
-            and (now - self._cloud_presets_ts) < self._cloud_presets_ttl
+            and (now - self._cloud_presets_ts) < ttl
         ):
             return self._cloud_presets
+        self._cloud_presets_attempt_ts = now
 
         merged: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1310,9 +1338,11 @@ class Driver(BaseDriver):
 
         # 2. Cloud-Presets (setting_id), inkl. Drucker-/Düsen-Varianten
         skipped_no_id = 0
+        cloud_ok = False
         try:
             cloud = await self._bb_get("/api/v1/cloud/filaments")
             if isinstance(cloud, list):
+                cloud_ok = bool(cloud)
                 for c in cloud:
                     code = (c.get("setting_id") or "").strip()
                     name = (c.get("name") or "").strip()
@@ -1354,10 +1384,28 @@ class Driver(BaseDriver):
                 "presets (check Bambuddy cloud sync / API auth). The slicer "
                 "profile picker will show 'no presets found'."
             )
+        # Keep the last-good catalog when /cloud/filaments failed (HTTP 500,
+        # empty list). A builtins-only result must not replace ~1800 cloud
+        # presets — that would make every PFUS unresolvable until the next
+        # successful fetch and demote assigned slots to Generic codes.
+        if not should_replace_catalog(self._cloud_presets, merged, cloud_ok):
+            if self._cloud_presets:
+                logger.warning(
+                    f"Bambuddy /api/v1/cloud/filaments unavailable — keeping "
+                    f"last-good cloud preset catalog ({len(self._cloud_presets)} "
+                    f"entries); will retry on next refresh"
+                )
+            return self._cloud_presets
         if merged:
             self._cloud_presets = merged
             self._cloud_presets_by_code = {p["code"]: p for p in merged}
             self._cloud_presets_ts = now
+            self._cloud_presets_degraded = not cloud_ok
+            if not cloud_ok:
+                logger.warning(
+                    "Cloud preset catalog loaded without /cloud/filaments "
+                    "(builtins only) — PFUS presets unavailable; retrying in 60s"
+                )
             self._variant_index = _build_variant_index_from_presets(merged)
             self._variant_groups = _build_variant_groups_from_index(self._variant_index)
             self._variant_index_ts = now
@@ -5549,6 +5597,32 @@ class Driver(BaseDriver):
                             )
                 except Exception as e:
                     logger.debug(f"Could not fetch Bambuddy spool {bb_spool_id}: {e}")
+
+        # Priority 4: a real slicer preset is known (PFUS setting_id) but the
+        # live PFUS → AMS-code lookup missed (Bambuddy cloud API flapping).
+        # Without a hint, _resolve_slicer_id() would emit the Generic code
+        # (GFG99 → "Generic PETG") and the printer/Studio would show that
+        # instead of the vendor profile. Reuse a vendor tray code we already
+        # sent or stored for this spool/slot rather than demoting to Generic.
+        if not bambu_idx_hint and _is_cloud_setting_id(setting_id):
+            last_sent = self._slot_last_sent.get(slot_key) or {}
+            # Only trust the slot's previous tray code when it was sent for the
+            # same slicer preset — a swapped-in spool must not inherit it.
+            last_code = (
+                last_sent.get("code")
+                if (last_sent.get("setting_id") or "") == setting_id
+                else None
+            )
+            reuse = pick_vendor_tray_code(
+                (raw_idx, last_code), _GENERIC_SLICER_ID_SET
+            )
+            if reuse and _is_known_ams_slicer_code(reuse):
+                bambu_idx_hint = reuse
+                logger.info(
+                    f"Cloud lookup for {setting_id!r} unavailable; reusing "
+                    f"known AMS code {reuse!r} for slot {ams_id}/{tray_id} "
+                    f"instead of generic fallback"
+                )
 
         # When no model-specific slicer preset resolved for this printer
         # (setting_id is empty), the slot would otherwise rely on whatever the raw
