@@ -6841,7 +6841,7 @@ class Driver(BaseDriver):
                     snap[f"{ams_id}-{tray_id}"] = self._tray_snapshot(tray)
             for vt in status.get("vt_tray") or []:
                 vt_id = int(vt.get("id", 254))
-                snap[f"255-{vt_id}"] = self._tray_snapshot(vt)
+                snap[external_slot_index(vt_id)] = self._tray_snapshot(vt)
             self._pending_slot_snapshot = snap
             logger.info(
                 f"Pending snapshot captured for printer {self.printer_id}: "
@@ -7258,7 +7258,7 @@ class Driver(BaseDriver):
                         )
                         _t = asyncio.create_task(
                             self._reconfigure_slot_with_profile(
-                                255, vt_id, vt_tray_info_idx, vt
+                                255, vt_tray_id, vt_tray_info_idx, vt
                             )
                         )
                         _t.add_done_callback(self._on_task_done)
