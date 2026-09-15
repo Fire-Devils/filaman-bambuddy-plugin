@@ -6936,21 +6936,45 @@ class Driver(BaseDriver):
     def _process_slots(self, printer_status: dict) -> None:
         """AMS-Daten aus Bambuddy printer_status verarbeiten und slots_update emittieren."""
         ams_list = printer_status.get("ams", [])
+        if isinstance(ams_list, dict):
+            inner = ams_list.get("ams")
+            if isinstance(inner, list):
+                ams_list = inner
+            elif isinstance(inner, dict):
+                ams_list = [u for u in inner.values() if isinstance(u, dict)]
+            else:
+                ams_list = [ams_list] if isinstance(ams_list.get("tray"), (list, dict)) else []
         vt_tray_list = printer_status.get("vt_tray", [])
         if not ams_list and not vt_tray_list:
             return
 
         ams_units: list[dict[str, Any]] = []
         ams_slots: list[dict[str, Any]] = []
+        prev_climate = {
+            u["ams_id"]: u
+            for u in self._current_ams_units
+            if isinstance(u, dict) and "ams_id" in u
+        }
 
         for ams_unit in ams_list:
+            if not isinstance(ams_unit, dict):
+                continue
             ams_id = int(ams_unit.get("id", 0))
             trays = ams_unit.get("tray", ams_unit.get("trays", []))
+            humidity = ams_unit.get("humidity_raw")
+            if humidity in (None, ""):
+                humidity = ams_unit.get("humidity")
+            temp = ams_unit.get("temp", ams_unit.get("temperature"))
+            prev = prev_climate.get(ams_id)
+            if humidity in (None, "") and prev:
+                humidity = prev.get("humidity")
+            if temp in (None, "") and prev:
+                temp = prev.get("temp")
             ams_units.append(
                 {
                     "ams_id": ams_id,
-                    "humidity": ams_unit.get("humidity"),
-                    "temp": ams_unit.get("temp", ams_unit.get("temperature")),
+                    "humidity": humidity,
+                    "temp": temp,
                     "tray_count": len(trays),
                     "is_ams_ht": ams_unit.get("is_ams_ht", False),
                 }
@@ -7316,7 +7340,42 @@ class Driver(BaseDriver):
             return {"connected": self._printer_connected, "ams": []}
         out = dict(status)
         out.setdefault("connected", self._printer_connected)
+        # Same climate the Printers page reads from health().ams_units.
+        out["ams_units"] = [dict(u) for u in self._current_ams_units]
+        self._overlay_ams_climate(out)
         return out
+
+    def _overlay_ams_climate(self, status: dict[str, Any]) -> None:
+        """Restore humidity/temp that a thin X1C status frame omitted."""
+        climate = {
+            u["ams_id"]: u
+            for u in self._current_ams_units
+            if isinstance(u, dict) and "ams_id" in u
+        }
+        if not climate:
+            return
+        ams = status.get("ams")
+        units: list[Any]
+        if isinstance(ams, list):
+            units = ams
+        elif isinstance(ams, dict) and isinstance(ams.get("ams"), list):
+            units = ams["ams"]
+        else:
+            return
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            try:
+                ams_id = int(unit.get("ams_id", unit.get("id", 0)))
+            except (TypeError, ValueError):
+                continue
+            prev = climate.get(ams_id)
+            if not prev:
+                continue
+            if prev.get("humidity") not in (None, ""):
+                unit["humidity"] = prev["humidity"]
+            if prev.get("temp") not in (None, ""):
+                unit["temp"] = prev["temp"]
 
     def health(self) -> dict[str, Any]:
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
