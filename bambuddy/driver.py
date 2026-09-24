@@ -47,9 +47,14 @@ except ImportError:  # pragma: no cover
 from app.plugins.base import BaseDriver
 
 from .cloud_catalog import (
+    late_nfc_conflicts_with_recent_send,
+    normalize_material_family,
     pick_vendor_tray_code,
+    preset_material_fits,
     preset_name_from_catalog,
+    presets_from_saved_names,
     should_replace_catalog,
+    tray_code_matches_material,
 )
 from .external_slots import canonical_external_tray_id, external_slot_index
 
@@ -65,6 +70,8 @@ from .profile_variants import (
     infer_default_base_name,
     is_cloud_setting_id,
     parse_cloud_preset_name,
+    preset_name_fits_model,
+    preset_nozzle_fits,
     resolve_cloud_variant_detailed,
     resolve_cloud_variant_from_index,
     uniform_variant_code,
@@ -108,9 +115,19 @@ _BAMBU_BRAND_SLICER_IDS: dict[str, str] = {
     "PVA": "GFS04",  # Bambu PVA
 }
 
+# Exact AMS-code → family for builtins / Bambu-brand basics (NYLON shares GFN99).
+_TRAY_CODE_EXACT_FAMILY: dict[str, str] = {}
+for _mat, _code in _GENERIC_SLICER_IDS.items():
+    _TRAY_CODE_EXACT_FAMILY[_code] = "PA" if _mat == "NYLON" else _mat
+for _mat, _code in _BAMBU_BRAND_SLICER_IDS.items():
+    _TRAY_CODE_EXACT_FAMILY[_code] = _mat
+
 # Reverse-Lookup: Anzeigename → Slicer-Code (z.B. "Generic PLA" → "GFL99")
 # FilaMan-Dropdowns speichern den Anzeigenamen, nicht den Key aus bambu_filaments.json.
 _FILAMENTS_FILE = pathlib.Path(__file__).parent / "bambu_filaments.json"
+# PFUS/PFCN → name from the last healthy catalog. Lives next to the plugin dir
+# so it survives restarts; model checks need names while /cloud/filaments is down.
+_PRESET_NAMES_FILE = pathlib.Path(__file__).resolve().parent.parent / ".bambuddy_preset_names.json"
 _FILAMENT_IDX_TO_NAME: dict[str, str] = {}  # "GFL99" → "Generic PLA"
 _FILAMENT_NAME_TO_IDX: dict[str, str] = {}  # "Generic PLA" → "GFL99"
 if _FILAMENTS_FILE.exists():
@@ -143,6 +160,16 @@ _CUSTOM_FILAMENT_ID_RE = re.compile(r"^P[0-9a-fA-F]{7}(?:_\d+)?$")
 def _is_custom_filament_id(code: str | None) -> bool:
     """True for Studio custom-filament ids like ``Pccd0d10`` / ``Pccd0d10_06``."""
     return bool(code) and bool(_CUSTOM_FILAMENT_ID_RE.match(str(code).strip()))
+
+
+def _tray_matches_material(code: str | None, material: str | None) -> bool:
+    """True when *code* is a tray id for *material*'s family (PLA vs PETG, …)."""
+    return tray_code_matches_material(
+        code,
+        material,
+        names=_FILAMENT_IDX_TO_NAME,
+        exact=_TRAY_CODE_EXACT_FAMILY,
+    )
 
 
 def _ams_tray_code(code: str | None) -> str | None:
@@ -404,6 +431,9 @@ class Driver(BaseDriver):
     # Differential-sync cache: last payload successfully sent to Bambuddy per spool.
     # Keyed by bambuddy_url → {fm_spool_id → payload_dict}. Skips PATCH when unchanged.
     _url_last_payloads: ClassVar[dict[str, dict[int, dict]]] = {}
+    # Last per-model preset rows pushed per Bambuddy spool: url → {bb_id → rows}.
+    _url_bb_model_presets: ClassVar[dict[str, dict[int, list[tuple]]]] = {}
+    _saved_preset_names: ClassVar[dict[str, str] | None] = None
     # After any debounce-triggered sync, block further debounce syncs for this
     # long. Longer than the WS reconnect interval (~5-10 min) so each reconnect
     # burst of inventory_changed events only triggers one sync at most.
@@ -708,6 +738,8 @@ class Driver(BaseDriver):
         if self._is_sync_coordinator():
             _heal = asyncio.create_task(self._sanitize_pfus_stored_as_bambu_idx())
             _heal.add_done_callback(self._on_task_done)
+            _fam = asyncio.create_task(self._sanitize_mismatched_bambu_idx())
+            _fam.add_done_callback(self._on_task_done)
 
         # Initialen AMS-Status laden
         await self._fetch_and_emit_status()
@@ -1372,6 +1404,17 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"Could not load cloud/filaments: {e}")
 
+        # Cold start / cloud outage: rebuild PFUS entries from the last healthy
+        # catalog so model+nozzle lookup still works. Builtins above stay as-is.
+        saved_added = 0
+        if not cloud_ok:
+            for entry in presets_from_saved_names(self._load_saved_preset_names()):
+                if entry["code"] in seen:
+                    continue
+                seen.add(entry["code"])
+                merged.append(entry)
+                saved_added += 1
+
         if skipped_no_id:
             logger.warning(
                 f"Cloud preset catalog: skipped {skipped_no_id} entr(y/ies) from "
@@ -1401,7 +1444,13 @@ class Driver(BaseDriver):
             self._cloud_presets_by_code = {p["code"]: p for p in merged}
             self._cloud_presets_ts = now
             self._cloud_presets_degraded = not cloud_ok
-            if not cloud_ok:
+            if not cloud_ok and saved_added:
+                logger.warning(
+                    "Cloud preset catalog loaded without /cloud/filaments — "
+                    f"using {saved_added} presets from the last good catalog; "
+                    "retrying in 60s"
+                )
+            elif not cloud_ok:
                 logger.warning(
                     "Cloud preset catalog loaded without /cloud/filaments "
                     "(builtins only) — PFUS presets unavailable; retrying in 60s"
@@ -1418,7 +1467,100 @@ class Driver(BaseDriver):
                 f"{n_custom} custom, {n_pfus} PFUS "
                 f"(from Bambuddy {self._bambuddy_url})"
             )
+            if cloud_ok:
+                self._save_preset_names(merged)
         return self._cloud_presets
+
+    @classmethod
+    def _load_saved_preset_names(cls) -> dict[str, str]:
+        if cls._saved_preset_names is None:
+            try:
+                raw = json.loads(_PRESET_NAMES_FILE.read_text(encoding="utf-8"))
+                cls._saved_preset_names = raw if isinstance(raw, dict) else {}
+            except (OSError, ValueError):
+                cls._saved_preset_names = {}
+        return cls._saved_preset_names
+
+    @classmethod
+    def _save_preset_names(cls, presets: list[dict[str, Any]]) -> None:
+        names = dict(cls._load_saved_preset_names())
+        for p in presets:
+            code = str(p.get("code") or "").strip()
+            name = str(p.get("name") or "").strip()
+            if name and _is_cloud_setting_id(code):
+                names[code] = name
+        if names == cls._saved_preset_names:
+            return
+        cls._saved_preset_names = names
+        try:
+            _PRESET_NAMES_FILE.write_text(json.dumps(names), encoding="utf-8")
+        except OSError as e:
+            logger.debug(f"Could not save preset name cache: {e}")
+
+    async def _preset_fits_printer(
+        self, code: str | None, printer_id: int | None = None
+    ) -> bool | None:
+        """True/False when *code*'s preset model is known vs printer_id's model.
+
+        None when the preset has no parseable model or the printer model is
+        unknown — callers must not treat that as a mismatch.
+        """
+        if not code:
+            return None
+        target = self
+        if printer_id is not None and printer_id != self.printer_id:
+            target = next(
+                (d for d in self._peer_drivers() if d.printer_id == printer_id),
+                None,
+            )
+            if target is None:
+                return None
+        ctx = await target._get_bambuddy_printer_context()
+        name = await self.resolve_preset_name(code)
+        return preset_name_fits_model(name, ctx.get("model"))
+
+    async def _filament_material(
+        self, *, spool_id: int | None = None, filament_id: int | None = None
+    ) -> str:
+        try:
+            async with async_session_maker() as db:
+                if filament_id is None and spool_id:
+                    spool = await db.get(Spool, int(spool_id))
+                    filament_id = spool.filament_id if spool else None
+                if not filament_id:
+                    return ""
+                filament = await db.get(Filament, int(filament_id))
+                return ((filament.material_type if filament else "") or "").strip()
+        except Exception as e:
+            logger.debug(f"Could not read filament material: {e}")
+            return ""
+
+    async def _preset_sendable(
+        self,
+        code: str | None,
+        *,
+        nozzle_mm: float | None,
+        material: str | None,
+    ) -> bool:
+        """True when *code* may be sent to this printer.
+
+        A known wrong model, nozzle, or material is rejected. Unknown (no
+        model suffix, no nozzle in the name, unclassified material) is allowed.
+        """
+        if not code:
+            return False
+        name = await self.resolve_preset_name(code)
+        # A cloud id with no name is not in the catalog (deleted or never
+        # synced). Sending it leaves Studio with a preset it cannot open.
+        if _is_cloud_setting_id(code) and not name and not self._cloud_presets_degraded:
+            return False
+        if await self._preset_fits_printer(code) is False:
+            return False
+        if preset_nozzle_fits(name, nozzle_mm) is False:
+            return False
+        if preset_material_fits(name, material) is False:
+            return False
+        return True
 
     async def _ensure_variant_index(
         self,
@@ -1521,6 +1663,7 @@ class Driver(BaseDriver):
                 del cf[_PROFILES_BY_MODEL_KEY]
             spool.custom_fields = cf
             await db.commit()
+        self._url_bb_model_presets.pop(self._bambuddy_url, None)
 
     async def _read_filament_profiles_by_model(
         self, filament_id: int
@@ -1550,6 +1693,8 @@ class Driver(BaseDriver):
                 del cf[_PROFILES_BY_MODEL_KEY]
             filament.custom_fields = cf
             await db.commit()
+        # Spools inherit filament profiles; re-push their per-model presets.
+        self._url_bb_model_presets.pop(self._bambuddy_url, None)
 
     async def _get_unmatched_profile_fallback(self) -> str:
         """Global setting for unmatched filaments: "generic" or "bambu".
@@ -1778,6 +1923,9 @@ class Driver(BaseDriver):
         """Resolve PFUS per model and mirror to printer params."""
         variants: dict[str, str] = {}
         coverage: dict[str, dict[str, Any]] = {}
+        material = await self._filament_material(
+            spool_id=spool_id, filament_id=filament_id
+        )
         for model, entry in profiles_by_model.items():
             base = entry.get("base_name") or ""
             if not base:
@@ -1790,8 +1938,18 @@ class Driver(BaseDriver):
             )
             detail["source"] = entry.get("source") or "manual"
             coverage[model.upper()] = detail
-            if detail.get("code"):
-                variants[model.upper()] = str(detail["code"])
+            # A closest-nozzle match is a different profile. Leave it out so
+            # the stale code for this model is cleared instead of stored.
+            if detail.get("code") and not detail.get("fallback_nozzle"):
+                code = str(detail["code"])
+                name = await self.resolve_preset_name(code)
+                if preset_material_fits(name, material) is False:
+                    logger.info(
+                        f"Not storing {code!r} for {model}: preset material "
+                        f"does not match filament {material!r}"
+                    )
+                else:
+                    variants[model.upper()] = code
         if variants:
             await self._mirror_pfus_by_model(
                 variants,
@@ -2111,6 +2269,8 @@ class Driver(BaseDriver):
                         or ""
                     )
                     ctx["model"] = _canonical_printer_model_token(str(raw_model))
+                    # Exact string Bambuddy matches per-model spool presets on.
+                    ctx["bb_model"] = str(pr.get("model") or "").strip()
                     if self._debug_enabled:
                         logger.debug(
                             f"Bambuddy printer {bb_id} info JSON: {json.dumps(pr)[:2000]}"
@@ -2142,6 +2302,164 @@ class Driver(BaseDriver):
 
     def _peer_drivers(self) -> list["Driver"]:
         return list(self._url_instances.get(self._bambuddy_url, [self]))
+
+    async def _push_bambuddy_model_presets(
+        self, fm_spool_id: int, bb_spool_id: int | None
+    ) -> None:
+        """Mirror FilaMan's per-printer cloud presets into Bambuddy's per-model table.
+
+        Bambuddy configures the slot itself on every assignment POST using
+        ``resolve_spool_preset`` (per-model row, else ``spool.slicer_filament``).
+        Without matching rows its write can carry another model's preset and
+        disagree with the configure FilaMan sends right after.
+        """
+        if not self._client or not bb_spool_id:
+            return
+        try:
+            await self._push_bambuddy_model_presets_inner(fm_spool_id, int(bb_spool_id))
+        except Exception as e:
+            logger.warning(f"Per-model preset push failed for FM#{fm_spool_id}: {e}")
+
+    async def _push_linked_model_presets(self, fm_spool_id: int) -> None:
+        """Push per-model presets for a spool that already has a Bambuddy id."""
+        bb_id = await self._get_bambuddy_spool_id(int(fm_spool_id))
+        if bb_id:
+            await self._push_bambuddy_model_presets(int(fm_spool_id), bb_id)
+
+    async def _push_bambuddy_model_presets_inner(
+        self, fm_spool_id: int, bb_spool_id: int
+    ) -> None:
+        by_model: dict[str, list[tuple[str, str]]] = {}
+        peer_models: set[str] = set()
+        incomplete = False
+        for d in self._peer_drivers():
+            try:
+                ctx = await d._get_bambuddy_printer_context()
+                bb_model = (ctx.get("bb_model") or "").strip()
+                if not bb_model:
+                    continue
+                fd = await d._filament_data_for_spool(fm_spool_id)
+                code = (await d._resolve_setting_id_for_assign(fd) or "").strip()
+                # Mirror only catalog presets FilaMan itself would send. When
+                # nothing is sendable, an empty row stops Bambuddy's own write
+                # from using its single spool default (often another model's
+                # preset); it then falls back to a generic material profile,
+                # like FilaMan does. Skip that while the catalog is degraded.
+                if code and not await d.resolve_preset_name(code):
+                    code = ""
+                if code and not await d._preset_sendable(
+                    code,
+                    nozzle_mm=ctx.get("nozzle_mm"),
+                    material=fd.get("material_type"),
+                ):
+                    code = ""
+                if not code and d._cloud_presets_degraded:
+                    incomplete = True
+                    continue
+                peer_models.add(bb_model)
+            except Exception as e:
+                logger.debug(
+                    f"Per-model preset: skip printer {d.printer_id} for "
+                    f"FM#{fm_spool_id}: {e}"
+                )
+                incomplete = True
+                continue
+            nozzle = ctx.get("nozzle_mm")
+            by_model.setdefault(bb_model, []).append(
+                (f"{float(nozzle):g}" if nozzle else "", code)
+            )
+        if not peer_models:
+            return
+
+        wanted: dict[tuple[str, str], str] = {}
+        for bb_model, entries in by_model.items():
+            codes = {c for _, c in entries}
+            if len(codes) == 1:
+                wanted[(bb_model, "")] = codes.pop()
+            else:
+                for nozzle, code in entries:
+                    if nozzle:
+                        wanted[(bb_model, nozzle)] = code
+
+        cache = self._url_bb_model_presets.setdefault(self._bambuddy_url, {})
+        wanted_sig = sorted((m, n, c) for (m, n), c in wanted.items())
+        if cache.get(bb_spool_id) == wanted_sig:
+            return
+
+        path = f"/api/v1/inventory/spools/{bb_spool_id}/filament-presets"
+        try:
+            existing = await self._bb_get(path)
+        except Exception as e:
+            logger.debug(f"Per-model preset: GET {path} failed: {e}")
+            return
+        if not isinstance(existing, list):
+            return
+
+        rows: list[dict[str, str]] = []
+        for r in existing:
+            model = str(r.get("printer_model") or "").strip()
+            nozzle = str(r.get("nozzle_diameter") or "").strip()
+            sf = str(r.get("slicer_filament") or "").strip()
+            if model in by_model:
+                continue
+            if model in peer_models and sf and (
+                preset_name_fits_model(
+                    await self.resolve_preset_name(sf), model
+                )
+                is False
+            ):
+                continue
+            rows.append(
+                {
+                    "printer_model": model,
+                    "nozzle_diameter": nozzle,
+                    "slicer_filament": sf,
+                    "slicer_filament_name": str(r.get("slicer_filament_name") or ""),
+                }
+            )
+        for (model, nozzle), code in wanted.items():
+            rows.append(
+                {
+                    "printer_model": model,
+                    "nozzle_diameter": nozzle,
+                    "slicer_filament": code or None,
+                    "slicer_filament_name": (
+                        await self.resolve_preset_name(code) if code else None
+                    ),
+                }
+            )
+
+        def _sig(items: list[dict]) -> list[tuple[str, str, str]]:
+            return sorted(
+                (
+                    str(i.get("printer_model") or ""),
+                    str(i.get("nozzle_diameter") or ""),
+                    str(i.get("slicer_filament") or ""),
+                )
+                for i in items
+            )
+
+        if _sig(rows) != _sig(existing):
+            try:
+                r = await self._client.put(f"{self._bambuddy_url}{path}", json=rows)
+                r.raise_for_status()
+            except Exception as e:
+                logger.warning(
+                    f"Per-model preset push failed for BB#{bb_spool_id}: {e}"
+                )
+                return
+            logger.info(
+                f"Per-model presets for FM#{fm_spool_id}/BB#{bb_spool_id}: "
+                + ", ".join(
+                    f"{m}{'/' + n if n else ''}={c or '(none)'}"
+                    for m, n, c in wanted_sig
+                )
+            )
+        # A partial answer (catalog degraded, peer error) must be retried.
+        if incomplete:
+            cache.pop(bb_spool_id, None)
+        else:
+            cache[bb_spool_id] = wanted_sig
 
     async def _resolve_peer_variant_map(
         self,
@@ -2248,6 +2566,16 @@ class Driver(BaseDriver):
             preset_name = await self.resolve_preset_name(pfus)
             base_name = coerce_profile_base_name(preset_name, pfus)
 
+        material = (filament_data.get("material_type") or "").strip()
+        if not material and filament_id:
+            material = await self._filament_material(filament_id=filament_id)
+
+        async def _acceptable(code: str) -> bool:
+            return await self._preset_sendable(
+                code, nozzle_mm=live_nozzle, material=material
+            )
+
+        exact_code = ""
         if base_name and model:
             detail = await self._resolve_model_variant_detail(
                 base_name,
@@ -2256,52 +2584,121 @@ class Driver(BaseDriver):
                 filament_id=filament_id,
                 nozzle_mm=live_nozzle,
             )
-            if detail.get("code"):
-                resolved = str(detail["code"])
-                # When there is no per-model profile row, the default base can
-                # resolve to a *different* PFUS than the one already stored for
-                # this printer (e.g. default "PLA PLUS GEN2" vs another model's
-                # override still sitting in bambu_slicer_setting_id). Prefer the
-                # stored *custom* setting_id (PFUS/PFCN) so inventory reflect /
-                # missing map rows cannot silently swap that printer onto the
-                # default variant.
-                #
-                # Do NOT prefer stock builtin ids (GFSB01_16 "Bambu ASA", etc.):
-                # those often arrive via filament-level inheritance and make
-                # Studio show the Bambu brand name even when the spool's profile
-                # base resolves to a synced custom preset (Overture/Sunlu ASA).
-                if (
-                    used_default_base_fallback
-                    and pfus
-                    and pfus != resolved
-                    and _is_cloud_setting_id(pfus)
-                ):
-                    setting_id = pfus
-                else:
-                    setting_id = resolved
-                # Lazily persist when missing, or when replacing a non-custom
-                # leftover so the next assign / picker coverage stays correct.
-                if not pfus or (
-                    setting_id != pfus and not _is_cloud_setting_id(pfus)
-                ):
-                    await self._persist_resolved_setting_id(
-                        setting_id,
-                        base_source,
-                        spool_id=fm_spool_id,
-                        filament_id=filament_id,
+            if detail.get("fallback_nozzle"):
+                logger.info(
+                    f"No {live_nozzle} nozzle preset for {base_name!r} on {model}; "
+                    f"not sending {detail.get('code')!r}"
+                )
+            elif detail.get("code"):
+                candidate = str(detail["code"])
+                candidate_name = await self.resolve_preset_name(candidate)
+                if preset_material_fits(candidate_name, material) is False:
+                    # This model's profile row is a different material than the
+                    # filament (a reflected PETG preset on a PLA spool). Try the
+                    # spool/filament default base before leaving the slot unset.
+                    logger.info(
+                        f"Preset {candidate!r} does not match filament "
+                        f"{material!r}; not using it for {model}"
                     )
-            elif live_nozzle is not None and pfus:
-                stored_nozzle = _parse_cloud_preset_name(
-                    await self.resolve_preset_name(pfus) or pfus
-                )[2]
-                if stored_nozzle is not None and stored_nozzle != live_nozzle:
-                    logger.warning(
-                        f"No cloud variant for nozzle {live_nozzle} on {model}; "
-                        f"using stored PFUS for slot configure"
-                    )
+                    alt = ""
+                    alt_source = base_source
+                    if fm_spool_id:
+                        spool_alt = await self._read_spool_default_base_name(fm_spool_id)
+                        if spool_alt and spool_alt != base_name:
+                            alt, alt_source = spool_alt, "spool"
+                    if not alt and filament_id:
+                        filament_alt = await self._read_filament_default_base_name(
+                            filament_id
+                        )
+                        if filament_alt and filament_alt != base_name:
+                            alt, alt_source = filament_alt, "filament"
+                    if alt:
+                        alt_detail = await self._resolve_model_variant_detail(
+                            alt,
+                            model,
+                            spool_id=fm_spool_id,
+                            filament_id=filament_id,
+                            nozzle_mm=live_nozzle,
+                        )
+                        if (
+                            alt_detail.get("code")
+                            and not alt_detail.get("fallback_nozzle")
+                            and await _acceptable(str(alt_detail["code"]))
+                        ):
+                            exact_code = str(alt_detail["code"])
+                            base_source = alt_source
+                            used_default_base_fallback = False
+                elif await _acceptable(candidate):
+                    exact_code = candidate
+
+        # A stored custom preset wins over the default-base variant only when
+        # it actually fits this printer. A wrong-model or wrong-nozzle code
+        # must not replace the variant just resolved, and must not be sent.
+        stored_fits = bool(pfus) and await _acceptable(pfus)
+        # The spool's own default outranks a preset inherited from the
+        # filament. Keep the stored code only when it was set on this spool
+        # for this printer, or when the default itself came from the filament.
+        stored_is_own = base_source == "filament" or (
+            bool(fm_spool_id)
+            and await self._spool_has_own_setting_id(int(fm_spool_id))
+        )
+        if (
+            used_default_base_fallback
+            and stored_fits
+            and stored_is_own
+            and pfus != exact_code
+            and _is_cloud_setting_id(pfus)
+        ):
+            setting_id = pfus
+        elif exact_code:
+            setting_id = exact_code
+        elif stored_fits:
+            setting_id = pfus
+        else:
+            if pfus:
+                logger.info(
+                    f"Not sending stored setting_id {pfus!r} on {model or 'unknown'}: "
+                    f"preset model, nozzle, or material does not match"
+                )
+            setting_id = ""
+
+        if setting_id and (
+            not pfus
+            or (
+                setting_id != pfus
+                and (
+                    not _is_cloud_setting_id(pfus)
+                    or await self._preset_fits_printer(pfus) is False
+                )
+            )
+        ):
+            await self._persist_resolved_setting_id(
+                setting_id,
+                base_source,
+                spool_id=fm_spool_id,
+                filament_id=filament_id,
+            )
         if not setting_id:
-            return filament_data.get("bambu_setting_id") or ""
+            fallback = (filament_data.get("bambu_setting_id") or "").strip()
+            if fallback and fallback != pfus and await _acceptable(fallback):
+                return fallback
+            return ""
         return setting_id
+
+    async def _spool_has_own_setting_id(self, spool_id: int) -> bool:
+        try:
+            async with async_session_maker() as db:
+                res = await db.execute(
+                    select(SpoolPrinterParam.param_value).where(
+                        SpoolPrinterParam.spool_id == spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == "bambu_slicer_setting_id",
+                    )
+                )
+                return bool((res.scalar_one_or_none() or "").strip())
+        except Exception as e:
+            logger.debug(f"Could not read spool setting_id for {spool_id}: {e}")
+            return False
 
     async def _persist_resolved_setting_id(
         self,
@@ -2373,7 +2770,8 @@ class Driver(BaseDriver):
         entry = self._cloud_presets_by_code.get(code)
         if entry:
             return entry.get("name") or entry.get("displayName")
-        return None
+        # 3. Names saved from the last healthy catalog (degraded cloud / restart)
+        return self._load_saved_preset_names().get(code)
 
     async def resolve_preset_label(self, code: str | None = None) -> dict[str, Any]:
         """Public action: resolves a stored code to its display name for the UI.
@@ -2840,6 +3238,70 @@ class Driver(BaseDriver):
         except Exception as e:
             logger.warning(f"bambu_idx PFUS sanitize failed: {e}")
 
+    async def _sanitize_mismatched_bambu_idx(self) -> None:
+        """Drop learned AMS codes whose family does not match the filament.
+
+        A PLA record converted to PETG keeps SUN20xxx until this runs. Assign
+        would otherwise trust that code and Studio would show the PLA SKU.
+        """
+        try:
+            peers = self._peer_printer_ids()
+            removed = 0
+            async with async_session_maker() as db:
+                fil_rows = await db.execute(
+                    select(FilamentPrinterParam, Filament.material_type)
+                    .join(
+                        Filament,
+                        Filament.id == FilamentPrinterParam.filament_id,
+                    )
+                    .where(
+                        FilamentPrinterParam.printer_id.in_(peers),
+                        FilamentPrinterParam.param_key == "bambu_idx",
+                    )
+                )
+                for row, material in fil_rows.all():
+                    if _tray_matches_material(row.param_value, material):
+                        continue
+                    logger.info(
+                        f"Removing mismatched bambu_idx {row.param_value!r} "
+                        f"from filament {row.filament_id} "
+                        f"(material {material!r}, printer {row.printer_id})"
+                    )
+                    await db.delete(row)
+                    removed += 1
+
+                spool_rows = await db.execute(
+                    select(
+                        SpoolPrinterParam,
+                        Filament.material_type,
+                    )
+                    .join(Spool, Spool.id == SpoolPrinterParam.spool_id)
+                    .join(Filament, Filament.id == Spool.filament_id)
+                    .where(
+                        SpoolPrinterParam.printer_id.in_(peers),
+                        SpoolPrinterParam.param_key == "bambu_idx",
+                    )
+                )
+                for row, material in spool_rows.all():
+                    if _tray_matches_material(row.param_value, material):
+                        continue
+                    logger.info(
+                        f"Removing mismatched bambu_idx {row.param_value!r} "
+                        f"from spool {row.spool_id} "
+                        f"(material {material!r}, printer {row.printer_id})"
+                    )
+                    await db.delete(row)
+                    removed += 1
+
+                if removed:
+                    await db.commit()
+                    logger.info(
+                        f"Removed {removed} bambu_idx row(s) whose AMS family "
+                        f"did not match the filament material"
+                    )
+        except Exception as e:
+            logger.warning(f"bambu_idx family sanitize failed: {e}")
+
     async def _upsert_spool_bambu_idx(
         self, filaman_spool_id: int, code: str | dict[int, str]
     ) -> bool:
@@ -2854,6 +3316,11 @@ class Driver(BaseDriver):
             mapping = dict(code)
         changed = False
         async with async_session_maker() as db:
+            spool_row = await db.get(Spool, filaman_spool_id)
+            filament_mat = None
+            if spool_row and spool_row.filament_id:
+                fil_row = await db.get(Filament, spool_row.filament_id)
+                filament_mat = fil_row.material_type if fil_row else None
             result = await db.execute(
                 select(SpoolPrinterParam).where(
                     SpoolPrinterParam.spool_id == filaman_spool_id,
@@ -2872,6 +3339,13 @@ class Driver(BaseDriver):
                             f"bambu_idx for spool {filaman_spool_id} "
                             f"(printer {pid}) — use bambu_slicer_setting_id"
                         )
+                    continue
+                if not _tray_matches_material(val, filament_mat):
+                    logger.warning(
+                        f"Refusing to store AMS code {val!r} as bambu_idx "
+                        f"for spool {filaman_spool_id} "
+                        f"(material {filament_mat!r}, printer {pid})"
+                    )
                     continue
                 existing = existing_by_pid.get(pid)
                 if existing:
@@ -2892,6 +3366,21 @@ class Driver(BaseDriver):
                 await db.commit()
         return changed
 
+    async def _drop_wrong_model_presets(
+        self, mapping: dict[int, str], owner: str
+    ) -> dict[int, str]:
+        """Remove entries whose preset is bound to a different printer model."""
+        kept: dict[int, str] = {}
+        for pid, pfus in mapping.items():
+            if pfus and await self._preset_fits_printer(pfus, pid) is False:
+                logger.warning(
+                    f"Refusing to store preset {pfus!r} for {owner} on printer "
+                    f"{pid}: preset is for a different printer model"
+                )
+                continue
+            kept[pid] = pfus
+        return kept
+
     async def _upsert_spool_bambu_slicer_setting_id(
         self, filaman_spool_id: int, code: str | dict[int, str]
     ) -> bool:
@@ -2905,6 +3394,9 @@ class Driver(BaseDriver):
             mapping = {pid: code for pid in self._peer_printer_ids()}
         else:
             mapping = dict(code)
+        mapping = await self._drop_wrong_model_presets(
+            mapping, f"spool {filaman_spool_id}"
+        )
 
         changed = False
         async with async_session_maker() as db:
@@ -2936,6 +3428,8 @@ class Driver(BaseDriver):
                     changed = True
             if changed:
                 await db.commit()
+        if changed:
+            self._url_bb_model_presets.pop(self._bambuddy_url, None)
         return changed
 
     async def _upsert_spool_profile_base_name(
@@ -3293,6 +3787,7 @@ class Driver(BaseDriver):
         rep_code = await self._sync_spool_inventory_display(
             int(spool_id), variants_by_model
         )
+        await self._push_linked_model_presets(int(spool_id))
 
         return {
             "spool_id": int(spool_id),
@@ -3581,6 +4076,7 @@ class Driver(BaseDriver):
                         await self._sync_spool_inventory_display(
                             sid, variants_by_model
                         )
+                    await self._push_linked_model_presets(sid)
                     applied += 1
                 except Exception as e:
                     logger.warning(
@@ -3652,6 +4148,7 @@ class Driver(BaseDriver):
                 spool_id=int(spool_id),
                 filament_id=filament_id,
             )
+            await self._push_linked_model_presets(int(spool_id))
             return {
                 "spool_id": int(spool_id),
                 "model": model_key,
@@ -3713,6 +4210,7 @@ class Driver(BaseDriver):
         await self._mirror_spool_generic_indices_from_variants(
             int(spool_id), variants_by_model
         )
+        await self._push_linked_model_presets(int(spool_id))
         await self._debounced_sync()
 
         return {
@@ -3850,6 +4348,7 @@ class Driver(BaseDriver):
                         await self._sync_spool_inventory_display(
                             sid, variants_by_model
                         )
+                    await self._push_linked_model_presets(sid)
                     applied += 1
                 except Exception as e:
                     logger.warning(
@@ -4038,6 +4537,15 @@ class Driver(BaseDriver):
                 )
             return False
         tray_info_idx = tray_info_idx_clean
+        filament = await db.get(Filament, filament_id)
+        if filament and not _tray_matches_material(
+            tray_info_idx, filament.material_type
+        ):
+            logger.warning(
+                f"Refusing to store AMS code {tray_info_idx!r} as bambu_idx "
+                f"for filament {filament_id} (material {filament.material_type!r})"
+            )
+            return False
         printer_ids = self._peer_printer_ids()
         result = await db.execute(
             select(FilamentPrinterParam).where(
@@ -4078,6 +4586,9 @@ class Driver(BaseDriver):
             mapping = {pid: code for pid in self._peer_printer_ids()}
         else:
             mapping = dict(code)
+        mapping = await self._drop_wrong_model_presets(
+            mapping, f"filament {filament_id}"
+        )
 
         printer_ids = self._peer_printer_ids()
         result = await db.execute(
@@ -4107,6 +4618,8 @@ class Driver(BaseDriver):
                     )
                 )
                 changed = True
+        if changed:
+            self._url_bb_model_presets.pop(self._bambuddy_url, None)
         return changed
 
     async def _persist_filament_bambu_idx(
@@ -4169,6 +4682,16 @@ class Driver(BaseDriver):
             async with async_session_maker() as db:
                 spool = await db.get(Spool, filaman_spool_id)
                 if not spool or not spool.filament_id:
+                    return
+                filament = await db.get(Filament, spool.filament_id)
+                if filament and not _tray_matches_material(
+                    tray_info_idx, filament.material_type
+                ):
+                    logger.info(
+                        f"Skip learning AMS profile {tray_info_idx!r} for "
+                        f"filament {spool.filament_id} "
+                        f"(material {filament.material_type!r})"
+                    )
                     return
 
                 wrote = await self._upsert_filament_bambu_idx(
@@ -4483,6 +5006,8 @@ class Driver(BaseDriver):
                 fm_id = fm_spool.id
                 note_key = f"filaman:{fm_id}"
                 existing = note_index.get(note_key)
+                bb_id_for_presets: int | None = None
+                payload_changed = existing is None
                 payload = self._map_spool(
                     fm_spool,
                     existing_slicer=(existing or {}).get("slicer_filament"),
@@ -4497,6 +5022,7 @@ class Driver(BaseDriver):
                             self._bambuddy_url, {}
                         ).get(fm_id)
                         if payload != last_payload:
+                            payload_changed = True
                             await self._bb_patch(
                                 f"/api/v1/inventory/spools/{bb_id}", payload
                             )
@@ -4522,6 +5048,7 @@ class Driver(BaseDriver):
                         await asyncio.sleep(0.05)
                     # Must add unconditionally — orphan-deletion uses this set.
                     synced_fm_ids.add(fm_id)
+                    bb_id_for_presets = int(bb_id)
                 except Exception as e:
                     logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
 
@@ -4530,6 +5057,15 @@ class Driver(BaseDriver):
                     await self._reflect_spool_profile(
                         fm_id, existing.get("slicer_filament")
                     )
+                # Resolving per model is not free (DB + catalog per peer), so
+                # only on first sight after a restart or when the spool changed.
+                # Filament-level profile edits clear this cache.
+                if bb_id_for_presets and (
+                    payload_changed
+                    or bb_id_for_presets
+                    not in self._url_bb_model_presets.get(self._bambuddy_url, {})
+                ):
+                    await self._push_bambuddy_model_presets(fm_id, bb_id_for_presets)
 
                 # Effektives Profil (Bambuddy-Wert oder vererbtes bambu_idx) in die
                 # Spool-custom_fields spiegeln, damit Bambuddys Spoolman-Sync den
@@ -4633,6 +5169,13 @@ class Driver(BaseDriver):
             if self._per_printer_profiles:
                 preset_name = await self.resolve_preset_name(existing_slicer)
                 base_name = coerce_profile_base_name(preset_name, existing_slicer)
+                material = await self._filament_material(spool_id=filaman_spool_id)
+                if preset_material_fits(preset_name, material) is False:
+                    logger.info(
+                        f"Reflect skip FM#{filaman_spool_id}: preset "
+                        f"{existing_slicer!r} does not match filament {material!r}"
+                    )
+                    return
                 _, parsed_model, _ = _parse_cloud_preset_name(preset_name or "")
                 by_model = await self._model_printer_map()
                 peers = self._peer_printer_ids()
@@ -5317,6 +5860,10 @@ class Driver(BaseDriver):
             # Inventory-Assignment (best-effort): registriert Bambuddy-interne Verknüpfung,
             # steuert aber NICHT zuverlässig tray_info_idx — deshalb immer _send_assignment danach.
             if bambuddy_spool_id and self._client and self._sync_enabled:
+                if filaman_spool_id:
+                    await self._push_bambuddy_model_presets(
+                        filaman_spool_id, bambuddy_spool_id
+                    )
                 try:
                     response = await self._bb_post(
                         "/api/v1/inventory/assignments",
@@ -5524,13 +6071,40 @@ class Driver(BaseDriver):
         # params / slot cache when resolve returns empty so Studio keeps the
         # custom ABS/ASA profile instead of falling back to tray_info_idx alone.
         cached_slot = self._slot_params_cache.get(slot_key, {})
-        prior_setting = (
-            (filament_data.get("bambu_slicer_setting_id") or "").strip()
-            or (filament_data.get("bambu_setting_id") or "").strip()
-            or (cached_slot.get("bambu_slicer_setting_id") or "").strip()
-            or (cached_slot.get("bambu_setting_id") or "").strip()
-        )
+        prior_setting = ""
+        for cand in (
+            filament_data.get("bambu_slicer_setting_id"),
+            filament_data.get("bambu_setting_id"),
+            cached_slot.get("bambu_slicer_setting_id"),
+            cached_slot.get("bambu_setting_id"),
+        ):
+            cand = (cand or "").strip()
+            if not cand:
+                continue
+            if not await self._preset_sendable(
+                cand,
+                nozzle_mm=(await self._get_bambuddy_printer_context()).get("nozzle_mm"),
+                material=filament_data.get("material_type"),
+            ):
+                logger.info(
+                    f"Ignoring stored setting_id {cand!r} for slot "
+                    f"{ams_id}/{tray_id}: preset model, nozzle, or material "
+                    f"does not match"
+                )
+                continue
+            prior_setting = cand
+            break
         setting_id = await self._resolve_setting_id_for_assign(filament_data)
+        if setting_id and not await self._preset_sendable(
+            setting_id,
+            nozzle_mm=(await self._get_bambuddy_printer_context()).get("nozzle_mm"),
+            material=filament_data.get("material_type"),
+        ):
+            logger.warning(
+                f"Resolved setting_id {setting_id!r} does not match this "
+                f"printer; not sending it to slot {ams_id}/{tray_id}"
+            )
+            setting_id = ""
         if not setting_id and _is_cloud_setting_id(prior_setting):
             setting_id = prior_setting
             logger.info(
@@ -5553,17 +6127,45 @@ class Driver(BaseDriver):
             if not setting_id:
                 setting_id = str(raw_idx)
             bambu_idx_hint = None
+        if bambu_idx_hint and not _tray_matches_material(bambu_idx_hint, material):
+            logger.info(
+                f"Ignoring bambu_idx {bambu_idx_hint!r}: material family does not "
+                f"match filament {material!r} for slot {ams_id}/{tray_id}"
+            )
+            bambu_idx_hint = None
+
+        # The tray code must describe the preset actually being sent. A stored
+        # bambu_idx can belong to an inherited or older profile (PLA PLUS vs
+        # PLA PLUS 2.0), and Studio would then show that one instead.
+        if setting_id and (
+            _is_cloud_setting_id(setting_id) or setting_id in self._cloud_presets_by_code
+        ):
+            from_setting = await self._resolve_cloud_preset(setting_id)
+            if from_setting and _tray_matches_material(from_setting, material):
+                if bambu_idx_hint and bambu_idx_hint != from_setting:
+                    logger.info(
+                        f"Using {from_setting!r} from setting_id {setting_id!r} "
+                        f"instead of stored bambu_idx {bambu_idx_hint!r} for slot "
+                        f"{ams_id}/{tray_id}"
+                    )
+                bambu_idx_hint = from_setting
 
         # Priority 2: full cloud preset (bambu_slicer_setting_id, the variant just
         # resolved for this model, or custom_fields) → generic AMS code (e.g.
         # "SUN20012").
         if not bambu_idx_hint:
             fm_spool_id = _int_or_none(filament_data.get("id"))
-            preset_id = filament_data.get("bambu_slicer_setting_id") or setting_id
+            preset_id = setting_id or filament_data.get("bambu_slicer_setting_id")
             if not preset_id and fm_spool_id:
                 preset_id = await self._spool_cloud_preset(fm_spool_id)
             if preset_id:
                 resolved = await self._resolve_cloud_preset(str(preset_id))
+                if resolved and not _tray_matches_material(resolved, material):
+                    logger.info(
+                        f"Cloud preset {preset_id!r} resolved to {resolved!r} "
+                        f"which does not match filament {material!r}; ignoring"
+                    )
+                    resolved = None
                 if resolved:
                     bambu_idx_hint = resolved
                     if fm_spool_id:
@@ -5584,6 +6186,15 @@ class Driver(BaseDriver):
                     preset = bb_spool.get("slicer_filament") or None
                     if preset:
                         resolved = await self._resolve_cloud_preset(str(preset))
+                        if resolved and not _tray_matches_material(
+                            resolved, material
+                        ):
+                            logger.info(
+                                f"Bambuddy spool {bb_spool_id} preset {preset!r} "
+                                f"resolved to {resolved!r} which does not match "
+                                f"filament {material!r}; ignoring"
+                            )
+                            resolved = None
                         if resolved:
                             bambu_idx_hint = resolved
                             fm_spool_id = _int_or_none(filament_data.get("id"))
@@ -5616,7 +6227,11 @@ class Driver(BaseDriver):
             reuse = pick_vendor_tray_code(
                 (raw_idx, last_code), _GENERIC_SLICER_ID_SET
             )
-            if reuse and _is_known_ams_slicer_code(reuse):
+            if (
+                reuse
+                and _is_known_ams_slicer_code(reuse)
+                and _tray_matches_material(reuse, material)
+            ):
                 bambu_idx_hint = reuse
                 logger.info(
                     f"Cloud lookup for {setting_id!r} unavailable; reusing "
@@ -5650,6 +6265,14 @@ class Driver(BaseDriver):
                 bambu_idx_hint = fallback_code
 
         slicer_filament = _resolve_slicer_id(bambu_idx_hint, material)
+        if slicer_filament and not _tray_matches_material(slicer_filament, material):
+            fallback = _GENERIC_SLICER_IDS.get(material.upper(), "GFL99")
+            logger.info(
+                f"Resolved tray_info_idx {slicer_filament!r} does not match "
+                f"filament {material!r}; using {fallback!r} for slot "
+                f"{ams_id}/{tray_id}"
+            )
+            slicer_filament = fallback
         # Belt-and-suspenders: never send PFUS as tray_info_idx.
         if _is_cloud_setting_id(slicer_filament):
             bad_tray = slicer_filament
@@ -5680,7 +6303,9 @@ class Driver(BaseDriver):
         # display.
         await self._get_cloud_idmap_reverse()
         tray_sub_brands = ""
-        if _is_cloud_setting_id(setting_id):
+        if setting_id and (
+            _is_cloud_setting_id(setting_id) or setting_id in self._cloud_presets_by_code
+        ):
             preset_name = await self.resolve_preset_name(setting_id)
             if preset_name:
                 tray_sub_brands = _extract_profile_base_name(preset_name)
@@ -5719,6 +6344,32 @@ class Driver(BaseDriver):
         nozzle_temp_max = _int_or_none(
             filament_data.get("bambu_nozzle_temp_max")
         ) or _int_or_none(filament_data.get("nozzle_temp_max"))
+        if nozzle_temp_min is None or nozzle_temp_max is None:
+            live_slot = next(
+                (
+                    s
+                    for s in self._current_slots
+                    if s.get("slot_index") == slot_key
+                ),
+                None,
+            )
+            # Only reuse temps the tray already has for this material family.
+            # After a swap the AMS can still report the previous spool's temps.
+            if live_slot and (
+                normalize_material_family(live_slot.get("tray_type"))
+                != normalize_material_family(material)
+            ):
+                live_slot = None
+            if live_slot:
+                if nozzle_temp_min is None:
+                    nozzle_temp_min = _int_or_none(live_slot.get("nozzle_temp_min"))
+                if nozzle_temp_max is None:
+                    nozzle_temp_max = _int_or_none(live_slot.get("nozzle_temp_max"))
+            if nozzle_temp_min is not None or nozzle_temp_max is not None:
+                logger.info(
+                    f"Keeping live nozzle temps {nozzle_temp_min}-{nozzle_temp_max} "
+                    f"for slot {ams_id}/{tray_id} (FilaMan has none stored)"
+                )
 
         # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
         k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
@@ -6225,19 +6876,16 @@ class Driver(BaseDriver):
             )
             return
 
-        # Empty-path reassert: if the tray is occupied again after settle, a
-        # swap is in progress — do not re-POST the previous occupant.
+        # Empty tray: FilaMan keeps ownership in memory, but no Bambuddy POST.
+        # Bambuddy stores an assignment made on an empty tray as "configure on
+        # insert" and would push this spool onto whatever goes in next. The link
+        # is re-posted by the configure=True path once a matching spool returns.
         if not configure:
-            cur = next(
-                (s for s in self._current_slots if s["slot_index"] == slot_key),
-                None,
+            logger.info(
+                f"Sticky AMS {ams_id}/{tray_id}: tray empty, keeping FilaMan "
+                f"owner without re-posting the Bambuddy assignment"
             )
-            if cur and cur.get("present"):
-                logger.info(
-                    f"Skip sticky empty-reassert AMS {ams_id}/{tray_id}: "
-                    f"slot occupied again during settle (swap in progress)"
-                )
-                return
+            return
 
         now = time.monotonic()
         last = self._sticky_reassert_ts.get(slot_key, 0.0)
@@ -6286,6 +6934,7 @@ class Driver(BaseDriver):
 
         if bb_spool_id and self._client and self._sync_enabled:
             try:
+                await self._push_bambuddy_model_presets(fm_id, bb_spool_id)
                 response = await self._bb_post(
                     "/api/v1/inventory/assignments",
                     {
@@ -6778,11 +7427,17 @@ class Driver(BaseDriver):
                 except (KeyError, TypeError, ValueError):
                     continue
 
+        live_by_slot = {s.get("slot_index"): s for s in self._current_slots}
         posted = 0
         for fm_id, bb_spool_id, ams_id, tray_id in targets:
             if (ams_id, tray_id) in have:
                 continue
+            live = live_by_slot.get(f"{ams_id}-{tray_id}")
+            if live is not None and not live.get("present"):
+                # Posting onto an empty tray arms Bambuddy's configure-on-insert.
+                continue
             try:
+                await self._push_bambuddy_model_presets(fm_id, bb_spool_id)
                 await self._bb_post(
                     "/api/v1/inventory/assignments",
                     {
@@ -7213,6 +7868,21 @@ class Driver(BaseDriver):
                                 f"{prev_idx!r} → {tray_info_idx!r}, "
                                 f"skip reconfigure (assign in flight)"
                             )
+                        elif late_nfc_conflicts_with_recent_send(
+                            self._slot_last_sent.get(slot_index),
+                            tray_info_idx,
+                            tray_color,
+                            now=time.monotonic(),
+                            window=self._SENT_CONVERGE_WINDOW,
+                            generic_codes=_GENERIC_SLICER_ID_SET,
+                        ):
+                            sent = self._slot_last_sent.get(slot_index) or {}
+                            logger.info(
+                                f"Late NFC read on slot {slot_index}: "
+                                f"{prev_idx!r} → {tray_info_idx!r} still shows the "
+                                f"previous tray ({tray_color!r}); keeping configure "
+                                f"just sent ({sent.get('code')!r} / {sent.get('color')!r})"
+                            )
                         else:
                             logger.info(
                                 f"Late NFC read on slot {slot_index}: "
@@ -7348,6 +8018,21 @@ class Driver(BaseDriver):
                             f"Late NFC read on external tray {vt_idx}: "
                             f"{prev_vt_idx!r} → {vt_tray_info_idx!r}, "
                             f"skip reconfigure (assign in flight)"
+                        )
+                    elif late_nfc_conflicts_with_recent_send(
+                        self._slot_last_sent.get(vt_idx),
+                        vt_tray_info_idx,
+                        vt_color,
+                        now=time.monotonic(),
+                        window=self._SENT_CONVERGE_WINDOW,
+                        generic_codes=_GENERIC_SLICER_ID_SET,
+                    ):
+                        sent = self._slot_last_sent.get(vt_idx) or {}
+                        logger.info(
+                            f"Late NFC read on external tray {vt_idx}: "
+                            f"{prev_vt_idx!r} → {vt_tray_info_idx!r} still shows "
+                            f"the previous tray ({vt_color!r}); keeping configure "
+                            f"just sent ({sent.get('code')!r} / {sent.get('color')!r})"
                         )
                     else:
                         logger.info(

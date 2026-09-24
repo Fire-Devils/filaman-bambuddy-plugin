@@ -173,6 +173,36 @@ def canonical_printer_model_token(raw: str | None) -> str:
     return upper if upper in known else ""
 
 
+def preset_name_fits_model(name: str | None, printer_model: str | None) -> bool | None:
+    """Whether a preset named *name* is bound to *printer_model*.
+
+    Returns None when either side is unknown (unnamed preset, name without a
+    model suffix, printer model not reported) so callers can tell "wrong
+    model" apart from "cannot tell".
+    """
+    model = canonical_printer_model_token(printer_model)
+    if not name or not model:
+        return None
+    _, preset_model, _ = parse_cloud_preset_name(name)
+    if not preset_model:
+        return None
+    return preset_model.upper() == model.upper()
+
+
+def preset_nozzle_fits(name: str | None, nozzle_mm: float | None) -> bool | None:
+    """Whether a preset named *name* is for *nozzle_mm*.
+
+    Returns None when the preset name has no nozzle or the printer nozzle is
+    unknown. A different nozzle is False — callers must not send that preset.
+    """
+    if not name or nozzle_mm is None:
+        return None
+    _, _, preset_nozzle = parse_cloud_preset_name(name)
+    if preset_nozzle is None:
+        return None
+    return abs(preset_nozzle - float(nozzle_mm)) < 0.05
+
+
 def parse_cloud_preset_name(name: str) -> tuple[str, str, float | None]:
     """Parse cloud preset names with ``@BBL`` or ``@Bambu Lab`` model suffixes."""
     base = extract_profile_base_name(name)
