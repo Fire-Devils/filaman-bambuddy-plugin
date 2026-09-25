@@ -2375,11 +2375,13 @@ class Driver(BaseDriver):
         for bb_model, entries in by_model.items():
             codes = {c for _, c in entries}
             if len(codes) == 1:
-                wanted[(bb_model, "")] = codes.pop()
-            else:
-                for nozzle, code in entries:
-                    if nozzle:
-                        wanted[(bb_model, nozzle)] = code
+                wanted[(bb_model, "")] = next(iter(codes))
+            # Always pin the fitted nozzle too: Bambuddy resolves an exact
+            # (model, nozzle) row before the model default, so a per-nozzle
+            # row set in Bambuddy (e.g. "Auto-match") must not outrank ours.
+            for nozzle, code in entries:
+                if nozzle:
+                    wanted[(bb_model, nozzle)] = code
 
         cache = self._url_bb_model_presets.setdefault(self._bambuddy_url, {})
         wanted_sig = sorted((m, n, c) for (m, n), c in wanted.items())
@@ -2400,7 +2402,10 @@ class Driver(BaseDriver):
             model = str(r.get("printer_model") or "").strip()
             nozzle = str(r.get("nozzle_diameter") or "").strip()
             sf = str(r.get("slicer_filament") or "").strip()
-            if model in by_model:
+            # Only replace the rows we compute; keep per-nozzle rows for
+            # nozzle sizes not fitted right now (set in Bambuddy by hand or
+            # via "Auto-match") instead of wiping them on every sync.
+            if model in by_model and (not nozzle or (model, nozzle) in wanted):
                 continue
             if model in peer_models and sf and (
                 preset_name_fits_model(
