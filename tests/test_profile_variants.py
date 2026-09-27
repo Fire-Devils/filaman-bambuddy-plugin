@@ -19,6 +19,8 @@ from profile_variants import (
     normalize_profiles_for_filament_copy,
     parse_cloud_preset_name,
     preset_applies_to_model,
+    preset_name_fits_model,
+    preset_nozzle_fits,
     resolve_cloud_variant_detailed,
     resolve_cloud_variant_from_index,
     standard_nozzle_availability,
@@ -561,3 +563,23 @@ def test_compute_profile_backfill_diff_already_matches() -> None:
     )
     assert diff["filament_already_matches"] is True
     assert diff["model_changes"] == []
+
+
+def test_preset_name_fits_model():
+    p2s = "SUNLU PLA MATTE GEN2 @Bambu Lab P2S 0.4 nozzle"
+    h2c = "SUNLU PLA MATTE GEN2 @Bambu Lab H2C 0.4 nozzle"
+    assert preset_name_fits_model(h2c, "H2C") is True
+    assert preset_name_fits_model(p2s, "H2C") is False
+    assert preset_name_fits_model(p2s, "Bambu Lab P2S") is True
+    assert preset_name_fits_model("Generic PLA", "H2C") is None
+    assert preset_name_fits_model(None, "H2C") is None
+    assert preset_name_fits_model(h2c, "") is None
+
+
+def test_preset_nozzle_fits():
+    h2c_04 = "SUNLU PLA MATTE GEN2 @Bambu Lab H2C 0.4 nozzle"
+    h2c_06 = "Sunlu ASA @BBL H2C 0.6 nozzle"
+    assert preset_nozzle_fits(h2c_04, 0.4) is True
+    assert preset_nozzle_fits(h2c_06, 0.4) is False
+    assert preset_nozzle_fits("Bambu ASA @BBL H2C", 0.4) is None
+    assert preset_nozzle_fits(h2c_04, None) is None
