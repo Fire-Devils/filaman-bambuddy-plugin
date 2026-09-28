@@ -54,8 +54,10 @@ from .cloud_catalog import (
     preset_name_from_catalog,
     presets_from_saved_names,
     should_replace_catalog,
+    slot_preset_record,
     tray_code_matches_material,
 )
+from .display_feed import queue_display_fields
 from .external_slots import canonical_external_tray_id, external_slot_index
 
 from .profile_variants import (
@@ -487,6 +489,9 @@ class Driver(BaseDriver):
         self._printer_connected: bool = False  # Bambu-Drucker↔Bambuddy Verbindung
         # Last Bambuddy printer status (WS printer_status or /status) for the Display API.
         self._last_bambuddy_status: dict[str, Any] = {}
+        # Queue list for the display feed, (monotonic time, items). The status
+        # frame has no queue, so this is fetched and reused for a few seconds.
+        self._display_queue_cache: tuple[float, list[Any]] | None = None
 
         # -- Status-Cache --
         self._current_slots: list[dict[str, Any]] = []
@@ -6455,6 +6460,9 @@ class Driver(BaseDriver):
                 f"(material={material}, slicer_filament={slicer_filament}, "
                 f"setting_id={setting_id!r})"
             )
+            await self._record_sent_slot_preset(
+                ams_id, tray_id, setting_id, expected_gen=expected_gen
+            )
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"Bambuddy configure error for slot {ams_id}-{tray_id}: "
@@ -6462,6 +6470,66 @@ class Driver(BaseDriver):
             )
         except Exception as e:
             logger.error(f"Failed to configure Bambuddy slot {ams_id}/{tray_id}: {e}")
+
+    async def _record_sent_slot_preset(
+        self,
+        ams_id: int,
+        tray_id: int,
+        setting_id: str,
+        *,
+        expected_gen: int | None,
+    ) -> None:
+        """Label the slot with the preset this configure sent.
+
+        ``POST /inventory/assignments`` runs first and stores
+        ``spool.slicer_filament_name`` on the slot. That name is one profile
+        for every printer, so an H2D slot keeps the H2C label. The configure
+        call sends the per-model setting_id and does not update that row.
+        """
+        if expected_gen is None or not self._client:
+            return
+        slot_key = f"{ams_id}-{tray_id}"
+        if not self._slot_configure_gen_matches(slot_key, expected_gen):
+            logger.info(
+                f"Skip slot-preset label for AMS {ams_id}/{tray_id}: "
+                f"configure was superseded"
+            )
+            return
+        try:
+            name = (await self.resolve_preset_name(setting_id) or "").strip()
+            if not self._slot_configure_gen_matches(slot_key, expected_gen):
+                logger.info(
+                    f"Skip slot-preset label for AMS {ams_id}/{tray_id}: "
+                    f"configure was superseded"
+                )
+                return
+            params = slot_preset_record(setting_id, name)
+            if not params:
+                if _is_cloud_setting_id(setting_id):
+                    logger.warning(
+                        f"AMS {ams_id}/{tray_id} was configured with {setting_id!r} "
+                        f"but its preset name is unknown; slot label left unchanged"
+                    )
+                return
+            path = (
+                f"/api/v1/printers/{self._bambuddy_printer_id}"
+                f"/slot-presets/{ams_id}/{tray_id}"
+            )
+            r = await self._client.put(
+                f"{self._bambuddy_url}{path}",
+                params=params,
+            )
+            r.raise_for_status()
+            self.log_debug("out", f"PUT {path}", params)
+            logger.info(
+                f"Slot {ams_id}/{tray_id} preset label set to "
+                f"{params['preset_id']!r} ({params['preset_name']})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Configured AMS {ams_id}/{tray_id} with setting_id "
+                f"{setting_id!r} but could not update the slot preset label: {e}"
+            )
 
     @staticmethod
     def _to_hex_tag(raw: str) -> str:
@@ -8101,13 +8169,52 @@ class Driver(BaseDriver):
         """
         status = self._last_bambuddy_status
         if not status:
-            return {"connected": self._printer_connected, "ams": []}
-        out = dict(status)
-        out.setdefault("connected", self._printer_connected)
-        # Same climate the Printers page reads from health().ams_units.
-        out["ams_units"] = [dict(u) for u in self._current_ams_units]
-        self._overlay_ams_climate(out)
+            out = {"connected": self._printer_connected, "ams": []}
+        else:
+            out = dict(status)
+            out.setdefault("connected", self._printer_connected)
+            # Same climate the Printers page reads from health().ams_units.
+            out["ams_units"] = [dict(u) for u in self._current_ams_units]
+            self._overlay_ams_climate(out)
+        await self._attach_display_queue(out)
         return out
+
+    async def _attach_display_queue(self, status: dict[str, Any]) -> None:
+        """Add queue depth, the next job, and the current job's elapsed/filament.
+
+        A failure leaves the status frame as it was. The board still draws.
+        """
+        printer_id = self._bambuddy_printer_id
+        if not printer_id or self._client is None:
+            return
+        now_mono = time.monotonic()
+        cached = self._display_queue_cache
+        items: list[Any] | None
+        if cached is not None and now_mono - cached[0] < 15:
+            items = cached[1]
+        else:
+            try:
+                fetched = await self._bb_get(f"/api/v1/queue/?printer_id={printer_id}")
+            except Exception:
+                logger.debug(
+                    "Display queue lookup failed for printer %s",
+                    self.printer_id,
+                    exc_info=True,
+                )
+                fetched = None
+            if isinstance(fetched, list):
+                items = fetched
+                self._display_queue_cache = (now_mono, items)
+            elif cached is not None:
+                items = cached[1]
+            else:
+                return
+        extras = queue_display_fields(items, int(printer_id))
+        status["queue"] = extras["queue"]
+        if extras["elapsed_seconds"] is not None:
+            status["elapsed_seconds"] = extras["elapsed_seconds"]
+        if extras["filament_grams"] is not None:
+            status["filament_grams"] = extras["filament_grams"]
 
     def _overlay_ams_climate(self, status: dict[str, Any]) -> None:
         """Restore humidity/temp that a thin X1C status frame omitted."""

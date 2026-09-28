@@ -9,6 +9,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 should_replace_catalog = _MODULE.should_replace_catalog
+slot_preset_record = _MODULE.slot_preset_record
 preset_name_from_catalog = _MODULE.preset_name_from_catalog
 pick_vendor_tray_code = _MODULE.pick_vendor_tray_code
 catalog_has_cloud_presets = _MODULE.catalog_has_cloud_presets
@@ -192,3 +193,24 @@ def test_presets_from_saved_names_keeps_cloud_ids_only():
     )
     assert [e["code"] for e in entries] == ["PFUS4007809f1aa7a"]
     assert entries[0]["name"].endswith("H2C 0.4 nozzle")
+
+
+def test_slot_preset_record_uses_the_sent_cloud_preset():
+    h2d = "SUNLU PETG BASIC GEN2 @Bambu Lab H2D 0.4 nozzle"
+    assert slot_preset_record("PFUS7b88bfb7f44983", h2d) == {
+        "preset_id": "PFUS7b88bfb7f44983",
+        "preset_name": h2d,
+        "preset_source": "cloud",
+    }
+    assert slot_preset_record("  PFCNabc  ", f"  {h2d}  ")["preset_id"] == "PFCNabc"
+
+
+def test_slot_preset_record_rejects_tray_code_and_missing_name():
+    # The assignment path stores SUN22001 plus the shared H2C name. That pair
+    # must not be written back as the slot label.
+    h2c = "SUNLU PETG BASIC GEN2 @Bambu Lab H2C 0.4 nozzle"
+    assert slot_preset_record("SUN22001", h2c) is None
+    assert slot_preset_record("GFL99", h2c) is None
+    assert slot_preset_record("", h2c) is None
+    assert slot_preset_record("PFUS7b88bfb7f44983", "") is None
+    assert slot_preset_record("PFUS7b88bfb7f44983", "   ") is None
