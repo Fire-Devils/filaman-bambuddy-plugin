@@ -18,6 +18,28 @@ def is_cloud_setting_id(code: str | None) -> bool:
     return str(code).strip().upper().startswith(("PFUS", "PFCN"))
 
 
+def slot_preset_record(
+    setting_id: str | None, preset_name: str | None
+) -> dict[str, str] | None:
+    """Query params for Bambuddy's slot-preset PUT, or None to leave the row.
+
+    Inventory assignment labels the slot from the spool's single
+    ``slicer_filament_name``. That field is shared by every printer, so an
+    H2D slot is often labeled with the H2C preset and the tray code
+    (``SUN22001``) instead of the PFUS configure just sent. Only a cloud
+    setting id with its own display name may replace that row.
+    """
+    code = (setting_id or "").strip()
+    name = (preset_name or "").strip()
+    if not is_cloud_setting_id(code) or not name:
+        return None
+    return {
+        "preset_id": code,
+        "preset_name": name,
+        "preset_source": "cloud",
+    }
+
+
 def catalog_has_cloud_presets(presets: Iterable[dict[str, Any]]) -> bool:
     """True when the catalog contains at least one cloud (PFUS/PFCN) preset."""
     return any(is_cloud_setting_id(p.get("code")) for p in presets)
