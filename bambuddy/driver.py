@@ -6022,6 +6022,29 @@ class Driver(BaseDriver):
 
     # -- Direkter configure-Call (Fallback) ----------------------------------
 
+    async def _fill_spool_basics(self, filament_data: dict) -> dict:
+        """Add material/colour from the FilaMan spool when a caller left them out.
+
+        Without material_type, _send_assignment assumes PLA; a PETG/ASA/ABS tray
+        code then fails the material check and the slot is configured Generic.
+        Values the caller did pass are kept.
+        """
+        if filament_data.get("material_type") and filament_data.get("color"):
+            return filament_data
+        fm_id = _int_or_none(filament_data.get("id"))
+        if not fm_id:
+            return filament_data
+        try:
+            spool_data = await self._filament_data_for_spool(fm_id)
+        except Exception as e:
+            logger.warning(f"Could not load spool {fm_id} material/colour: {e}")
+            return filament_data
+        merged = dict(filament_data)
+        for key in ("material_type", "material_subgroup", "color"):
+            if not merged.get(key) and spool_data.get(key):
+                merged[key] = spool_data[key]
+        return merged
+
     async def _send_assignment(
         self,
         ams_id: int,
@@ -6064,6 +6087,8 @@ class Driver(BaseDriver):
                 f"expected={expected_gen})"
             )
             return
+
+        filament_data = await self._fill_spool_basics(filament_data)
 
         # -- Farbe normalisieren: Bambuddy erwartet 8-stelliges RRGGBBAA --
         color = filament_data.get("color", "FFFFFFFF")
@@ -7042,11 +7067,10 @@ class Driver(BaseDriver):
             return
 
         try:
-            from app.plugins.manager import plugin_manager
-
-            filament_data = await plugin_manager.enrich_filament_data(
-                fm_id, self.printer_id, {"id": fm_id}
-            )
+            # Full spool data (material/colour + printer params). Printer params
+            # alone left material_type unset, so _send_assignment assumed PLA and
+            # demoted every PETG/ASA/ABS tray code to Generic.
+            filament_data = await self._filament_data_for_spool(int(fm_id))
             if not self._slot_configure_gen_matches(slot_key, expected_gen):
                 return
             await self._send_assignment(
@@ -7195,10 +7219,15 @@ class Driver(BaseDriver):
                 filament_data["id"] = int(fm_id)
                 if spool_data.get("filament_id") is not None:
                     filament_data["filament_id"] = spool_data["filament_id"]
-                if tray.get("tray_color"):
-                    filament_data["color"] = tray["tray_color"]
-                if tray.get("tray_type"):
-                    filament_data["material_type"] = tray["tray_type"]
+                # Partial status frames omit tray_type/tray_color. Fall back to
+                # the spool rather than the PLA/white defaults, which fail the
+                # material check and demote the tray code to Generic.
+                filament_data["color"] = tray.get("tray_color") or spool_data.get(
+                    "color", "FFFFFFFF"
+                )
+                filament_data["material_type"] = tray.get(
+                    "tray_type"
+                ) or spool_data.get("material_type", "PLA")
                 filament_data["bambu_idx"] = tray_info_idx
             except Exception as e:
                 logger.warning(
