@@ -8206,7 +8206,104 @@ class Driver(BaseDriver):
             out["ams_units"] = [dict(u) for u in self._current_ams_units]
             self._overlay_ams_climate(out)
         await self._attach_display_queue(out)
+        await self._overlay_assignment_identity(out)
         return out
+
+    async def _overlay_assignment_identity(self, status: dict[str, Any]) -> None:
+        """Fill tray brand and color name from Bambuddy inventory assignments.
+
+        The printer often leaves ``tray_id_name`` blank. AMS View and the
+        Display API then have no manufacturer color name. Assignments already
+        carry ``spool.brand`` and ``spool.color_name``; copy those onto the
+        tray when the printer did not.
+        """
+        if not self._client or not self._bambuddy_printer_id:
+            return
+        now_mono = time.monotonic()
+        cached = getattr(self, "_display_assignment_cache", None)
+        assignments: list[Any] | None
+        if cached is not None and now_mono - cached[0] < 15:
+            assignments = cached[1]
+        else:
+            try:
+                fetched = await self._bb_get(
+                    "/api/v1/inventory/assignments",
+                    params={"printer_id": self._bambuddy_printer_id},
+                )
+            except Exception:
+                logger.debug(
+                    "Display assignment lookup failed for printer %s",
+                    self.printer_id,
+                    exc_info=True,
+                )
+                return
+            if not isinstance(fetched, list):
+                return
+            assignments = fetched
+            self._display_assignment_cache = (now_mono, assignments)
+
+        by_slot: dict[tuple[int, int], dict[str, Any]] = {}
+        for assignment in assignments or []:
+            if not isinstance(assignment, dict):
+                continue
+            spool = assignment.get("spool")
+            if not isinstance(spool, dict):
+                continue
+            try:
+                by_slot[(int(assignment["ams_id"]), int(assignment["tray_id"]))] = spool
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not by_slot:
+            return
+
+        def paint(tray: dict[str, Any], ams_id: int, tray_id: int) -> None:
+            spool = by_slot.get((ams_id, tray_id))
+            if spool is None:
+                return
+            color_name = str(spool.get("color_name") or "").strip()
+            brand = str(spool.get("brand") or spool.get("manufacturer") or "").strip()
+            if color_name and not str(tray.get("tray_id_name") or tray.get("color_name") or "").strip():
+                tray["tray_id_name"] = color_name
+            if brand and not str(tray.get("brand") or tray.get("manufacturer") or "").strip():
+                tray["brand"] = brand
+
+        ams = status.get("ams")
+        units = ams if isinstance(ams, list) else []
+        if isinstance(ams, dict) and isinstance(ams.get("ams"), list):
+            units = ams["ams"]
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            try:
+                ams_id = int(unit.get("id", unit.get("ams_id", 0)))
+            except (TypeError, ValueError):
+                continue
+            trays = unit.get("tray")
+            if not isinstance(trays, list):
+                trays = unit.get("trays")
+            if not isinstance(trays, list):
+                continue
+            for tray in trays:
+                if not isinstance(tray, dict):
+                    continue
+                try:
+                    tray_id = int(tray.get("id", tray.get("tray_id", 0)))
+                except (TypeError, ValueError):
+                    continue
+                paint(tray, ams_id, tray_id)
+
+        for vt in status.get("vt_tray") or []:
+            if not isinstance(vt, dict):
+                continue
+            try:
+                vt_id = int(vt.get("id", vt.get("tray_id", 254)))
+            except (TypeError, ValueError):
+                continue
+            # Bambuddy stores both virtual trays under ams 255, tray 0 and 1.
+            if vt_id == 255:
+                paint(vt, 255, 1)
+            else:
+                paint(vt, 255, 0)
 
     async def _attach_display_queue(self, status: dict[str, Any]) -> None:
         """Add queue depth, the next job, and the current job's elapsed/filament.
