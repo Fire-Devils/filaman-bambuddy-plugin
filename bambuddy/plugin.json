@@ -1,4 +1,5 @@
 {
+  "icon": "icon.svg",
   "plugin_key": "bambuddy",
   "name": "Bambuddy",
   "driver_key": "bambuddy",
