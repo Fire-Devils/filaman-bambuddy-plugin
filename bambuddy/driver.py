@@ -5593,6 +5593,12 @@ class Driver(BaseDriver):
                     self._ws_connected = True
                     connected_at = time.monotonic()
                     if self._sync_enabled and not self._slot_cache_restored:
+                        # Same order as start(): learn which trays are loaded
+                        # before restoring owners. Otherwise the first status
+                        # sees known owners on unseen trays, treats every tray
+                        # as freshly inserted and re-configures all of them.
+                        if not self._current_slots:
+                            await self._fetch_and_emit_status()
                         await self._recover_slot_links()
                         if self._slot_cache_restored:
                             # Re-emit so the recovered owners reach the DB.
