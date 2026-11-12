@@ -5174,10 +5174,16 @@ class Driver(BaseDriver):
 
             # Failed updates still belong to active spools.
             active_fm_ids = {spool.id for spool in fm_spools}
+            # An empty FilaMan response must not wipe the Bambuddy inventory.
+            if not active_fm_ids and note_index:
+                logger.warning(
+                    "Inventory sync: FilaMan returned no active spools; "
+                    f"skipping orphan cleanup of {len(note_index)} Bambuddy spools"
+                )
             for note_key, bb_spool in note_index.items():
                 try:
                     fm_id = int(note_key.removeprefix("filaman:"))
-                    if fm_id not in active_fm_ids:
+                    if active_fm_ids and fm_id not in active_fm_ids:
                         await self._bb_delete(
                             f"/api/v1/inventory/spools/{bb_spool['id']}"
                         )
