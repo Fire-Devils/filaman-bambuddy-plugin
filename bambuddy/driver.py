@@ -524,6 +524,13 @@ class Driver(BaseDriver):
         self._unmatched_fallback_ts: float = 0.0
         # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
         self._slot_to_filaman_spool: dict[str, int] = {}
+        # False until the map above was rebuilt from Bambuddy. While False the
+        # map is empty for lack of data, not because the slots are unlinked.
+        self._slot_cache_restored: bool = False
+        # Emit the next slot snapshot even if unchanged. Unlike clearing
+        # _current_slots, this keeps was_present intact, so no slot looks
+        # freshly inserted and no reassert/configure fires.
+        self._force_slots_emit: bool = False
         # Sticky AMS: throttle reassert POSTs after empty trays / unscanned reinserts.
         self._sticky_reassert_ts: dict[str, float] = {}
         self._STICKY_REASSERT_COOLDOWN: float = 5.0
@@ -766,12 +773,7 @@ class Driver(BaseDriver):
             # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
             await self._sync_all_spools()
             # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
-            await self._restore_slot_cache_from_assignments()
-            # Drop sticky owners whose FilaMan location was cleared while we were down.
-            await self._reconcile_sticky_slot_map()
-            # Re-POST any FilaMan AMS locations missing from Bambuddy (recovery after
-            # Bambuddy fingerprint auto-unlink / Spoolman mode wipes).
-            await self._backfill_missing_ams_assignments()
+            await self._recover_slot_links()
             if self._per_printer_profiles and self._is_sync_coordinator():
                 _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
                 _lf.add_done_callback(self._on_task_done)
@@ -5656,6 +5658,18 @@ class Driver(BaseDriver):
                 ) as ws:
                     self._ws_connected = True
                     connected_at = time.monotonic()
+                    if self._sync_enabled and not self._slot_cache_restored:
+                        # Same order as start(): learn which trays are loaded
+                        # before restoring owners. Otherwise the first status
+                        # sees known owners on unseen trays, treats every tray
+                        # as freshly inserted and re-configures all of them.
+                        if not self._current_slots:
+                            await self._fetch_and_emit_status()
+                        await self._recover_slot_links()
+                        if self._slot_cache_restored:
+                            # Re-emit so the recovered owners reach the DB.
+                            self._force_slots_emit = True
+                            await self._fetch_and_emit_status()
                     self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
@@ -7441,6 +7455,18 @@ class Driver(BaseDriver):
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
+    async def _recover_slot_links(self) -> None:
+        """Rebuild slot ownership from Bambuddy; run at start and again on the
+        first connect if Bambuddy was down at start."""
+        await self._restore_slot_cache_from_assignments()
+        if not self._slot_cache_restored:
+            return
+        # Drop sticky owners whose FilaMan location was cleared while we were down.
+        await self._reconcile_sticky_slot_map()
+        # Re-POST any FilaMan AMS locations missing from Bambuddy (recovery after
+        # Bambuddy fingerprint auto-unlink / Spoolman mode wipes).
+        await self._backfill_missing_ams_assignments()
+
     async def _restore_slot_cache_from_assignments(self) -> None:
         """Stellt _slot_to_filaman_spool und _spool_original_location beim Start wieder her.
 
@@ -7461,6 +7487,7 @@ class Driver(BaseDriver):
             return
 
         if not assignments:
+            self._slot_cache_restored = True
             return
 
         # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup aufbauen
@@ -7493,6 +7520,7 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
             return
 
+        self._slot_cache_restored = True
         recovered = 0
         for assignment in assignments:
             bb_spool_id = assignment.get("spool_id")
@@ -8224,14 +8252,20 @@ class Driver(BaseDriver):
         self._current_ams_units = ams_units
         has_external = len(ext_slots) > 0
         slots = ams_slots + ext_slots
+        if self._sync_enabled and not self._slot_cache_restored:
+            # Bambuddy was unreachable at start, so slot ownership is unknown.
+            # Leaving spool_id out keeps the stored links instead of nulling them.
+            for slot in slots:
+                slot.pop("spool_id", None)
 
         # Prüfe ob Slots sich geändert haben (skip emit wenn unverändert)
         # ABER: Beim ersten Start IMMER emittieren (self._current_slots ist [])
         slots_changed = slots != self._current_slots
         is_first_status = len(self._current_slots) == 0 and len(slots) > 0
 
-        if not slots_changed and not is_first_status:
+        if not slots_changed and not is_first_status and not self._force_slots_emit:
             return
+        self._force_slots_emit = False
 
         self._current_slots = slots
 
