@@ -23,6 +23,7 @@ import pathlib
 import re
 import time
 from datetime import datetime, timezone
+from functools import cached_property
 from typing import Any, Callable, ClassVar
 
 import httpx
@@ -45,6 +46,7 @@ except ImportError:  # pragma: no cover
     websockets = None  # type: ignore[assignment]
 
 from app.plugins.base import BaseDriver
+from app.plugins.manager import plugin_manager
 
 from .cloud_catalog import (
     late_nfc_conflicts_with_recent_send,
@@ -84,6 +86,8 @@ from .profile_variants import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_NOZZLE_TEMPERATURES = {"nozzle_temp_min": 190, "nozzle_temp_max": 230}
 
 # Generische Bambu-Slicer-IDs für gängige Materialien (Fallback wenn kein bambu_idx gesetzt)
 _GENERIC_SLICER_IDS: dict[str, str] = {
@@ -324,6 +328,15 @@ def _float_or_none(v: Any) -> float | None:
         return None
 
 
+def _nozzle_temperature(v: Any) -> int | None:
+    try:
+        temperature = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # Bambuddy inventory uses signed 32-bit integers on PostgreSQL.
+    return round(temperature) if 0 <= temperature <= 2**31 - 1 else None
+
+
 # Aliases for in-driver use (pure logic lives in profile_variants.py).
 _extract_profile_base_name = extract_profile_base_name
 _canonical_printer_model_token = canonical_printer_model_token
@@ -511,6 +524,13 @@ class Driver(BaseDriver):
         self._unmatched_fallback_ts: float = 0.0
         # Slot-Key ("ams_id-tray_id") → FilaMan-Spool-ID (für Verbrauchsmeldungen)
         self._slot_to_filaman_spool: dict[str, int] = {}
+        # False until the map above was rebuilt from Bambuddy. While False the
+        # map is empty for lack of data, not because the slots are unlinked.
+        self._slot_cache_restored: bool = False
+        # Emit the next slot snapshot even if unchanged. Unlike clearing
+        # _current_slots, this keeps was_present intact, so no slot looks
+        # freshly inserted and no reassert/configure fires.
+        self._force_slots_emit: bool = False
         # Sticky AMS: throttle reassert POSTs after empty trays / unscanned reinserts.
         self._sticky_reassert_ts: dict[str, float] = {}
         self._STICKY_REASSERT_COOLDOWN: float = 5.0
@@ -753,12 +773,7 @@ class Driver(BaseDriver):
             # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
             await self._sync_all_spools()
             # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
-            await self._restore_slot_cache_from_assignments()
-            # Drop sticky owners whose FilaMan location was cleared while we were down.
-            await self._reconcile_sticky_slot_map()
-            # Re-POST any FilaMan AMS locations missing from Bambuddy (recovery after
-            # Bambuddy fingerprint auto-unlink / Spoolman mode wipes).
-            await self._backfill_missing_ams_assignments()
+            await self._recover_slot_links()
             if self._per_printer_profiles and self._is_sync_coordinator():
                 _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
                 _lf.add_done_callback(self._on_task_done)
@@ -1003,21 +1018,22 @@ class Driver(BaseDriver):
 
     async def _fetch_fm_spools(self) -> list[Spool]:
         """Holt alle nicht-archivierten FilaMan-Spulen aus der DB."""
+        filament = selectinload(Spool.filament)
+        options = (
+            filament.selectinload(Filament.manufacturer),
+            filament.selectinload(Filament.filament_colors).selectinload(FilamentColor.color),
+            filament.selectinload(Filament.printer_params),
+            selectinload(Spool.printer_params),
+        )
+        if hasattr(Filament, "printer_initializations"):
+            options += (filament.selectinload(Filament.printer_initializations),)
+
         async with async_session_maker() as db:
             result = await db.execute(
                 select(Spool)
                 .join(SpoolStatus)
                 .where(SpoolStatus.key != "archived")
-                .options(
-                    selectinload(Spool.filament).selectinload(Filament.manufacturer),
-                    selectinload(Spool.filament)
-                    .selectinload(Filament.filament_colors)
-                    .selectinload(FilamentColor.color),
-                    selectinload(Spool.filament).selectinload(
-                        Filament.printer_params
-                    ),
-                    selectinload(Spool.printer_params),
-                )
+                .options(*options)
             )
             return list(result.scalars().all())
 
@@ -2804,8 +2820,6 @@ class Driver(BaseDriver):
 
     async def _filament_data_for_spool(self, spool_id: int) -> dict[str, Any]:
         """Build assignment filament_data (color/material + printer params) for a spool."""
-        from app.plugins.manager import plugin_manager
-
         base: dict[str, Any] = {"id": spool_id}
         async with async_session_maker() as db:
             result = await db.execute(
@@ -4816,11 +4830,18 @@ class Driver(BaseDriver):
 
     # -- Inventory Sync (FilaMan → Bambuddy) ---------------------------------
 
+    @cached_property
+    def _native_nozzle_keys(self) -> set[str]:
+        declared = plugin_manager._bambu_parameter_keys(self.driver_key) or set()
+        return declared & {f"bambu_{key}" for key in _DEFAULT_NOZZLE_TEMPERATURES}
+
     def _map_spool(
         self,
         spool: Spool,
         existing_slicer: str | None = None,
         existing_name: str | None = None,
+        *,
+        existing_temperatures: dict[str, Any] | None = None,
     ) -> dict:
         """FilaMan Spool (ORM) → Bambuddy SpoolCreate/Update-Payload.
 
@@ -4837,9 +4858,9 @@ class Driver(BaseDriver):
           printer_params bambu_nozzle_*             → nozzle_temp_min/max
 
         Multi-peer URLs: each driver builds the payload from ``self.printer_id`` params.
-        The shared Bambuddy inventory ``slicer_filament`` is last-writer-wins across peer
-        drivers; per-printer ``bambu_slicer_setting_id`` params and ``_send_assignment``
-        are authoritative for each printer.
+        Bambuddy inventory fields are shared across peer drivers. Per-printer
+        ``bambu_slicer_setting_id`` params and ``_send_assignment`` are authoritative
+        for each printer.
         """
         fil = spool.filament
         manufacturer_name = fil.manufacturer.name if fil and fil.manufacturer else None
@@ -4945,11 +4966,53 @@ class Driver(BaseDriver):
                 if name:
                     payload["slicer_filament_name"] = name
 
-        if (nozzle_min := _int_or_none(pp.get("bambu_nozzle_temp_min"))) is not None:
-            payload["nozzle_temp_min"] = nozzle_min
+        # A stored spool value, including a blank, takes precedence by key.
+        calibrated = fpp | pp
+        initialized = False
+        native = {}
+        if fil and hasattr(Filament, "printer_initializations") and self._native_nozzle_keys:
+            initialized = any(
+                init.printer_id == self.printer_id for init in fil.printer_initializations
+            )
+            native = plugin_manager._native_bambu_temperature_params(
+                fil, self._native_nozzle_keys
+            )
+            if not initialized:
+                # Invalid overrides mask their own bound without blocking the opposite fallback.
+                compatible_calibration = {
+                    key: value if _nozzle_temperature(value) is not None else None
+                    for key, value in calibrated.items()
+                    if key in ("bambu_nozzle_temp_min", "bambu_nozzle_temp_max")
+                }
+                calibrated = (
+                    plugin_manager._bambu_temperature_fallbacks(native, compatible_calibration)
+                    | calibrated
+                )
 
-        if (nozzle_max := _int_or_none(pp.get("bambu_nozzle_temp_max"))) is not None:
-            payload["nozzle_temp_max"] = nozzle_max
+        temperatures: dict[str, int | None] = {}
+        for key in _DEFAULT_NOZZLE_TEMPERATURES:
+            param = f"bambu_{key}"
+            raw = calibrated.get(param)
+            if (temperature := _nozzle_temperature(raw)) is not None:
+                temperatures[key] = temperature
+            elif existing_temperatures is not None and raw in (None, "") and (
+                param in calibrated
+                or (initialized and _nozzle_temperature(native.get(param)) is not None)
+            ):
+                # Initialization can come from bed temperatures alone.
+                # PATCH needs null to clear an owned nozzle bound.
+                temperatures[key] = None
+
+        # Preserve a remote-only endpoint when it conflicts with a partial update.
+        remote = existing_temperatures or {}
+        minimum = temperatures.get(
+            "nozzle_temp_min", _nozzle_temperature(remote.get("nozzle_temp_min"))
+        )
+        maximum = temperatures.get(
+            "nozzle_temp_max", _nozzle_temperature(remote.get("nozzle_temp_max"))
+        )
+        if minimum is None or maximum is None or minimum <= maximum:
+            payload.update(temperatures)
 
         return payload
 
@@ -5010,7 +5073,7 @@ class Driver(BaseDriver):
                 and s["note"].removeprefix("filaman:").isdigit()
             }
 
-            synced_fm_ids: set[int] = set()
+            synced_count = 0
 
             for fm_spool in fm_spools:
                 fm_id = fm_spool.id
@@ -5022,16 +5085,21 @@ class Driver(BaseDriver):
                     fm_spool,
                     existing_slicer=(existing or {}).get("slicer_filament"),
                     existing_name=(existing or {}).get("slicer_filament_name"),
+                    existing_temperatures=existing,
                 )
 
                 try:
                     if existing is not None:
                         bb_id = existing["id"]
-                        # Differential sync: only PATCH when payload actually changed.
                         last_payload = self._url_last_payloads.get(
                             self._bambuddy_url, {}
                         ).get(fm_id)
-                        if payload != last_payload:
+                        # A remote edit can change a bound that FilaMan still owns.
+                        temperatures_changed = any(
+                            key in payload and payload[key] != existing.get(key)
+                            for key in _DEFAULT_NOZZLE_TEMPERATURES
+                        )
+                        if payload != last_payload or temperatures_changed:
                             payload_changed = True
                             await self._bb_patch(
                                 f"/api/v1/inventory/spools/{bb_id}", payload
@@ -5056,8 +5124,7 @@ class Driver(BaseDriver):
                             f"Created Bambuddy spool {bb_id} for FilaMan spool {fm_id}"
                         )
                         await asyncio.sleep(0.05)
-                    # Must add unconditionally — orphan-deletion uses this set.
-                    synced_fm_ids.add(fm_id)
+                    synced_count += 1
                     bb_id_for_presets = int(bb_id)
                 except Exception as e:
                     logger.warning(f"Failed to sync FilaMan spool {fm_id}: {e}")
@@ -5105,11 +5172,12 @@ class Driver(BaseDriver):
                     fm_id, payload.get("color_name")
                 )
 
-            # 4. Veraltete Bambuddy-Spulen entfernen
+            # Failed updates still belong to active spools.
+            active_fm_ids = {spool.id for spool in fm_spools}
             for note_key, bb_spool in note_index.items():
                 try:
                     fm_id = int(note_key.removeprefix("filaman:"))
-                    if fm_id not in synced_fm_ids:
+                    if fm_id not in active_fm_ids:
                         await self._bb_delete(
                             f"/api/v1/inventory/spools/{bb_spool['id']}"
                         )
@@ -5120,10 +5188,10 @@ class Driver(BaseDriver):
                 except Exception as e:
                     logger.warning(f"Failed to delete orphaned Bambuddy spool: {e}")
 
-            self._last_sync_count = len(synced_fm_ids)
+            self._last_sync_count = synced_count
             self._last_sync_error = None
             logger.info(
-                f"Inventory sync complete: {len(synced_fm_ids)} spools synced "
+                f"Inventory sync complete: {synced_count} spools synced "
                 f"to Bambuddy printer {self._bambuddy_printer_id}"
             )
 
@@ -5590,6 +5658,18 @@ class Driver(BaseDriver):
                 ) as ws:
                     self._ws_connected = True
                     connected_at = time.monotonic()
+                    if self._sync_enabled and not self._slot_cache_restored:
+                        # Same order as start(): learn which trays are loaded
+                        # before restoring owners. Otherwise the first status
+                        # sees known owners on unseen trays, treats every tray
+                        # as freshly inserted and re-configures all of them.
+                        if not self._current_slots:
+                            await self._fetch_and_emit_status()
+                        await self._recover_slot_links()
+                        if self._slot_cache_restored:
+                            # Re-emit so the recovered owners reach the DB.
+                            self._force_slots_emit = True
+                            await self._fetch_and_emit_status()
                     self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
@@ -6372,39 +6452,38 @@ class Driver(BaseDriver):
                 or material_raw
             )
 
-        # -- Temperaturen --
-        nozzle_temp_min = _int_or_none(
-            filament_data.get("bambu_nozzle_temp_min")
-        ) or _int_or_none(filament_data.get("nozzle_temp_min"))
-        nozzle_temp_max = _int_or_none(
-            filament_data.get("bambu_nozzle_temp_max")
-        ) or _int_or_none(filament_data.get("nozzle_temp_max"))
-        if nozzle_temp_min is None or nozzle_temp_max is None:
-            live_slot = next(
-                (
-                    s
-                    for s in self._current_slots
-                    if s.get("slot_index") == slot_key
-                ),
-                None,
-            )
-            # Only reuse temps the tray already has for this material family.
-            # After a swap the AMS can still report the previous spool's temps.
-            if live_slot and (
-                normalize_material_family(live_slot.get("tray_type"))
-                != normalize_material_family(material)
-            ):
-                live_slot = None
-            if live_slot:
-                if nozzle_temp_min is None:
-                    nozzle_temp_min = _int_or_none(live_slot.get("nozzle_temp_min"))
-                if nozzle_temp_max is None:
-                    nozzle_temp_max = _int_or_none(live_slot.get("nozzle_temp_max"))
-            if nozzle_temp_min is not None or nozzle_temp_max is not None:
-                logger.info(
-                    f"Keeping live nozzle temps {nozzle_temp_min}-{nozzle_temp_max} "
-                    f"for slot {ams_id}/{tray_id} (FilaMan has none stored)"
-                )
+        # Reuse live temperatures only from the same material family.
+        live_slot = next(
+            (slot for slot in self._current_slots if slot.get("slot_index") == slot_key),
+            {},
+        )
+        if normalize_material_family(live_slot.get("tray_type")) != normalize_material_family(
+            material
+        ):
+            live_slot = {}
+        printer_temperatures = {}
+        fallback_temperatures = {}
+        for key in _DEFAULT_NOZZLE_TEMPERATURES:
+            if value := _nozzle_temperature(filament_data.get(f"bambu_{key}")):
+                printer_temperatures[key] = value
+            fallback = _nozzle_temperature(filament_data.get(key))
+            if fallback is None:
+                fallback = _nozzle_temperature(live_slot.get(key))
+            if fallback is not None:
+                fallback_temperatures[key] = fallback
+
+        for temperatures in (
+            fallback_temperatures | printer_temperatures,
+            fallback_temperatures,
+            {},
+        ):
+            # The configure endpoint uses its required default for a zero bound.
+            wire_temperatures = {
+                key: temperatures.get(key) or default
+                for key, default in _DEFAULT_NOZZLE_TEMPERATURES.items()
+            }
+            if wire_temperatures["nozzle_temp_min"] <= wire_temperatures["nozzle_temp_max"]:
+                break
 
         # k_value für configure-Endpoint — 0.0 = skip (kein K-Profil setzen)
         k_value = _float_or_none(filament_data.get("bambu_k_value")) or 0.0
@@ -6419,8 +6498,7 @@ class Driver(BaseDriver):
             "tray_type": material,
             "tray_sub_brands": tray_sub_brands,
             "tray_color": color,  # 8-stellig RRGGBBAA
-            "nozzle_temp_min": nozzle_temp_min or 190,  # REQUIRED — Fallback 190°C
-            "nozzle_temp_max": nozzle_temp_max or 230,  # REQUIRED — Fallback 230°C
+            **wire_temperatures,
             "cali_idx": cali_idx,
             "setting_id": setting_id,
             "kprofile_filament_id": slicer_filament,
@@ -6456,8 +6534,8 @@ class Driver(BaseDriver):
             # only temps (empty setting_id) — avoids later late-NFC wipes.
             cached_setting = setting_id or prior_setting or None
             self._slot_params_cache[f"{ams_id}-{tray_id}"] = {
-                "nozzle_temp_min": nozzle_temp_min,
-                "nozzle_temp_max": nozzle_temp_max,
+                "nozzle_temp_min": temperatures.get("nozzle_temp_min"),
+                "nozzle_temp_max": temperatures.get("nozzle_temp_max"),
                 "bambu_setting_id": cached_setting or setting_id,
                 "bambu_slicer_setting_id": (
                     filament_data.get("bambu_slicer_setting_id")
@@ -7377,6 +7455,18 @@ class Driver(BaseDriver):
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
+    async def _recover_slot_links(self) -> None:
+        """Rebuild slot ownership from Bambuddy; run at start and again on the
+        first connect if Bambuddy was down at start."""
+        await self._restore_slot_cache_from_assignments()
+        if not self._slot_cache_restored:
+            return
+        # Drop sticky owners whose FilaMan location was cleared while we were down.
+        await self._reconcile_sticky_slot_map()
+        # Re-POST any FilaMan AMS locations missing from Bambuddy (recovery after
+        # Bambuddy fingerprint auto-unlink / Spoolman mode wipes).
+        await self._backfill_missing_ams_assignments()
+
     async def _restore_slot_cache_from_assignments(self) -> None:
         """Stellt _slot_to_filaman_spool und _spool_original_location beim Start wieder her.
 
@@ -7397,6 +7487,7 @@ class Driver(BaseDriver):
             return
 
         if not assignments:
+            self._slot_cache_restored = True
             return
 
         # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup aufbauen
@@ -7429,6 +7520,7 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
             return
 
+        self._slot_cache_restored = True
         recovered = 0
         for assignment in assignments:
             bb_spool_id = assignment.get("spool_id")
@@ -8160,14 +8252,20 @@ class Driver(BaseDriver):
         self._current_ams_units = ams_units
         has_external = len(ext_slots) > 0
         slots = ams_slots + ext_slots
+        if self._sync_enabled and not self._slot_cache_restored:
+            # Bambuddy was unreachable at start, so slot ownership is unknown.
+            # Leaving spool_id out keeps the stored links instead of nulling them.
+            for slot in slots:
+                slot.pop("spool_id", None)
 
         # Prüfe ob Slots sich geändert haben (skip emit wenn unverändert)
         # ABER: Beim ersten Start IMMER emittieren (self._current_slots ist [])
         slots_changed = slots != self._current_slots
         is_first_status = len(self._current_slots) == 0 and len(slots) > 0
 
-        if not slots_changed and not is_first_status:
+        if not slots_changed and not is_first_status and not self._force_slots_emit:
             return
+        self._force_slots_emit = False
 
         self._current_slots = slots
 
