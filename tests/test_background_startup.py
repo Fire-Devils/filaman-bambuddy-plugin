@@ -7,6 +7,7 @@ later printers were cancelled and left without a driver.
 
 import asyncio
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -379,4 +380,140 @@ async def test_recover_slot_links_if_needed_swallows_errors_and_missing_printer_
     await d_err._recover_slot_links_if_needed()
     assert d_err._slot_cache_restored is False
     Driver._url_startup_locks.pop("http://bb-err", None)
+
+
+@pytest.mark.asyncio
+async def test_commit_listener_ignores_other_event_loops():
+    d = Driver(
+        printer_id=962,
+        config={"bambuddy_url": "http://bb-loop", "api_key": "k", "sync_enabled": "enabled"},
+        emitter=lambda _p: None,
+    )
+    d._running = True
+    # start() has not recorded a loop yet, so nothing is scheduled.
+    d._on_session_commit(None)  # type: ignore[arg-type]
+    assert d._sticky_reconcile_task is None
+
+    d._loop = asyncio.get_running_loop()
+    d._on_session_commit(None)  # type: ignore[arg-type]
+    same_loop = d._sticky_reconcile_task
+    assert same_loop is not None
+    same_loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await same_loop
+    d._sticky_reconcile_task = None
+
+    def other_loop() -> None:
+        foreign = asyncio.new_event_loop()
+        try:
+            foreign.run_until_complete(d._fire_commit_listener())
+        finally:
+            foreign.close()
+
+    async def _fire() -> None:
+        d._on_session_commit(None)  # type: ignore[arg-type]
+
+    d._fire_commit_listener = _fire  # type: ignore[attr-defined]
+    thread = threading.Thread(target=other_loop)
+    thread.start()
+    thread.join()
+    assert d._sticky_reconcile_task is None
+
+
+@pytest.mark.asyncio
+async def test_late_slot_recovery_does_not_block_its_caller():
+    d = Driver(
+        printer_id=963,
+        config={"bambuddy_url": "http://bb-late", "api_key": "k", "sync_enabled": "enabled"},
+        emitter=lambda _p: None,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow() -> None:
+        started.set()
+        await release.wait()
+
+    d._recover_slot_links_if_needed = slow  # type: ignore[method-assign]
+    d._schedule_late_slot_recovery()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    first = d._late_recovery_task
+    assert first is not None and not first.done()
+    d._schedule_late_slot_recovery()
+    assert d._late_recovery_task is first
+    release.set()
+    await first
+
+
+@pytest.mark.asyncio
+async def test_restore_slot_cache_ignores_other_printers_sharing_a_digit(monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.models import Base, Filament, Location, Manufacturer, Printer, Spool, SpoolPrinterParam, SpoolStatus
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(driver_mod, "async_session_maker", session_maker)
+
+    async with session_maker() as db:
+        active = SpoolStatus(key="new", label="New", sort_order=1)
+        mfg = Manufacturer(name="Maker")
+        db.add_all([active, mfg])
+        await db.flush()
+        fil = Filament(manufacturer_id=mfg.id, designation="PLA", material_type="PLA", diameter_mm=1.75)
+        own_loc = Location(name="P1 slot", identifier="bambuddy_1_0_0", custom_fields={"managed_by": "bambuddy_plugin"})
+        foreign_loc = Location(name="P13 slot", identifier="bambuddy_13_0_0", custom_fields={"managed_by": "bambuddy_plugin"})
+        db.add_all([
+            fil,
+            Printer(id=1, name="P1", driver_key="bambuddy"),
+            Printer(id=13, name="P13", driver_key="bambuddy"),
+            own_loc,
+            foreign_loc,
+        ])
+        await db.flush()
+        own = Spool(filament_id=fil.id, status_id=active.id, location_id=own_loc.id)
+        db.add(own)
+        await db.flush()
+        foreign = Spool(filament_id=fil.id, status_id=active.id, location_id=foreign_loc.id)
+        db.add(foreign)
+        await db.flush()
+        db.add_all([
+            # Both params are stored for printer 1, the way a shared Bambuddy
+            # inventory records every peer. Only the location id may differ.
+            SpoolPrinterParam(spool_id=own.id, printer_id=1, param_key="bambuddy_spool_id", param_value="11"),
+            SpoolPrinterParam(spool_id=foreign.id, printer_id=1, param_key="bambuddy_spool_id", param_value="99"),
+        ])
+        await db.commit()
+        own_id = own.id
+
+    d = Driver(
+        printer_id=1,
+        config={"bambuddy_url": "http://bb-like", "api_key": "k", "printer_id": 1, "sync_enabled": "enabled"},
+        emitter=lambda _p: None,
+    )
+    d._client = _FakeClient()  # type: ignore[assignment]
+    d._bb_get = AsyncMock(return_value=[])
+    d._bb_post = AsyncMock(return_value={"id": 1})
+    d._push_bambuddy_model_presets = AsyncMock()
+    try:
+        await d._recover_slot_links()
+        # Printer 1's LIKE prefix used to match printer 13, and the higher spool
+        # id then won the slot. The slot must stay with printer 1's own spool.
+        assert d._slot_to_filaman_spool == {"0-0": own_id}
+        posted = [
+            call.args[1]["spool_id"]
+            for call in d._bb_post.await_args_list
+            if str(call.args[0]).endswith("/assignments")
+        ]
+        assert posted == [11]
+    finally:
+        await engine.dispose()
+        Driver._url_startup_locks.pop("http://bb-like", None)
 

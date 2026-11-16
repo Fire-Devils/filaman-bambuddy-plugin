@@ -499,7 +499,11 @@ class Driver(BaseDriver):
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
+        self._late_recovery_task: asyncio.Task | None = None
         self._sync_task: asyncio.Task | None = None
+        # Loop that owns this driver's tasks and HTTP client. Commits from any
+        # other loop (another plugin's thread) must not schedule work on it.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # -- Verbindungs-Status --
         self._ws_connected: bool = False  # WebSocket-Verbindung zu Bambuddy-Server
@@ -698,6 +702,7 @@ class Driver(BaseDriver):
     # -- Lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
 
@@ -855,6 +860,7 @@ class Driver(BaseDriver):
             self._cancel_sticky_task(slot_key)
         for task in (
             self._startup_task,
+            self._late_recovery_task,
             self._ws_task,
             self._sync_task,
             self._debounce_task,
@@ -866,7 +872,8 @@ class Driver(BaseDriver):
                     await task
                 except asyncio.CancelledError:
                     pass
-        self._startup_task = self._ws_task = self._sync_task = None
+        self._startup_task = self._late_recovery_task = None
+        self._ws_task = self._sync_task = None
         self._debounce_task = self._sticky_reconcile_task = None
         self._ws_connected = False
         self._printer_connected = False
@@ -906,6 +913,14 @@ class Driver(BaseDriver):
         the inventory debounce sync.
         """
         if not self._running or not self._sync_enabled:
+            return
+        # after_commit runs on whichever thread committed. Another plugin keeps
+        # its own event loop, and scheduling this driver's HTTP client there
+        # fails with "bound to a different event loop" and aborts the sync.
+        try:
+            if asyncio.get_running_loop() is not self._loop:
+                return
+        except RuntimeError:
             return
 
         # Sticky map reconcile (all peer drivers — not only the coordinator).
@@ -5258,7 +5273,9 @@ class Driver(BaseDriver):
 
         except Exception as e:
             self._last_sync_error = str(e)
-            logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
+            logger.exception(
+                f"Inventory sync failed for printer {self.printer_id}: {e}"
+            )
         finally:
             self._syncing = False
 
@@ -5717,7 +5734,10 @@ class Driver(BaseDriver):
                     self._ws_connected = True
                     connected_at = time.monotonic()
                     if self._sync_enabled and not self._slot_cache_restored:
-                        await self._recover_slot_links_if_needed()
+                        # Don't wait here. Recovery takes the per-URL startup
+                        # lock, and another printer may hold that for a full
+                        # inventory sync. The socket has to be read meanwhile.
+                        self._schedule_late_slot_recovery()
                     self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
@@ -7503,6 +7523,37 @@ class Driver(BaseDriver):
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
+    def _schedule_late_slot_recovery(self) -> None:
+        """Start slot recovery without blocking the WebSocket read loop."""
+        task = self._late_recovery_task
+        if task is not None and not task.done():
+            return
+        self._late_recovery_task = asyncio.create_task(
+            self._recover_slot_links_if_needed()
+        )
+        self._late_recovery_task.add_done_callback(self._on_task_done)
+
+    @staticmethod
+    def _literal_like_prefix(prefix: str) -> str:
+        """Escape LIKE wildcards. '_' in ``bambuddy_1_`` would also match printer 13."""
+        return (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+
+    def _own_ams_slot(self, identifier: str | None) -> tuple[int, int] | None:
+        """Return ``(ams, tray)`` when identifier is this printer's AMS slot.
+
+        Format is ``bambuddy_{printer_id}_{ams}_{tray}``. The printer id has to
+        be compared exactly: a SQL LIKE prefix treats '_' as one character.
+        """
+        parts = (identifier or "").split("_")
+        if len(parts) != 4 or parts[0] != "bambuddy" or parts[1] != str(self.printer_id):
+            return None
+        try:
+            return int(parts[2]), int(parts[3])
+        except ValueError:
+            return None
+
     async def _recover_slot_links_if_needed(self) -> None:
         """Serialize late/retry slot recovery per Bambuddy URL and isolate errors
         so a recovery hiccup never drops an open WebSocket connection."""
@@ -7622,23 +7673,28 @@ class Driver(BaseDriver):
                         .join(SpoolStatus, Spool.status_id == SpoolStatus.id)
                         .where(
                             SpoolStatus.key != "archived",
-                            Location.identifier.like(f"{prefix}%"),
+                            Location.identifier.like(
+                                f"{self._literal_like_prefix(prefix)}%", escape="\\"
+                            ),
                         )
                         .order_by(Spool.id)
                     )
                 ).all()
                 for spool_id, ident in loc_rows:
-                    if not ident:
+                    slot = self._own_ams_slot(ident)
+                    if slot is None:
                         continue
                     spool_to_ident[spool_id] = ident
-                    parts = ident.split("_")
-                    if len(parts) != 4 or parts[0] != "bambuddy":
-                        continue
-                    try:
-                        ams_id, tray_id = int(parts[2]), int(parts[3])
-                    except ValueError:
-                        continue
-                    db_slot_owners[f"{ams_id}-{tray_id}"] = spool_id
+                    ams_id, tray_id = slot
+                    slot_key = f"{ams_id}-{tray_id}"
+                    previous = db_slot_owners.get(slot_key)
+                    if previous is not None and previous != spool_id:
+                        logger.warning(
+                            f"Printer {self.printer_id} slot {slot_key} has more "
+                            f"than one active spool (FM#{previous} and FM#{spool_id}); "
+                            f"keeping FM#{spool_id}"
+                        )
+                    db_slot_owners[slot_key] = spool_id
         except Exception as e:
             logger.warning(f"Failed to load FilaMan DB state for cache recovery: {e}")
             return
@@ -7663,7 +7719,14 @@ class Driver(BaseDriver):
             filaman_spool_id = bb_to_filaman.get(bb_spool_int)
             if not filaman_spool_id:
                 continue
-            if spool_to_ident.get(filaman_spool_id) != f"{prefix}{ams_int}_{tray_int}":
+            expected = f"{prefix}{ams_int}_{tray_int}"
+            actual = spool_to_ident.get(filaman_spool_id)
+            if actual != expected:
+                logger.info(
+                    f"Skip Bambuddy assignment FM#{filaman_spool_id} on "
+                    f"AMS {ams_int}/{tray_int}: FilaMan location is {actual!r}, "
+                    f"expected {expected!r}"
+                )
                 continue
 
             slot_key = f"{ams_int}-{tray_int}"
@@ -7720,7 +7783,9 @@ class Driver(BaseDriver):
                     )
                     .where(
                         SpoolStatus.key != "archived",
-                        Location.identifier.like(f"{prefix}%"),
+                        Location.identifier.like(
+                            f"{self._literal_like_prefix(prefix)}%", escape="\\"
+                        ),
                     )
                 )
                 rows = result.all()
@@ -7733,15 +7798,14 @@ class Driver(BaseDriver):
 
         targets: list[tuple[int, int, int, int]] = []  # fm_id, bb_id, ams, tray
         for spool, loc, param in rows:
-            ident = loc.identifier or ""
-            parts = ident.split("_")
-            if len(parts) != 4 or parts[0] != "bambuddy":
+            slot = self._own_ams_slot(loc.identifier)
+            if slot is None:
                 continue
             try:
-                ams_id, tray_id = int(parts[2]), int(parts[3])
                 bb_spool_id = int(param.param_value)
             except (TypeError, ValueError):
                 continue
+            ams_id, tray_id = slot
             targets.append((spool.id, bb_spool_id, ams_id, tray_id))
 
         if not targets:
