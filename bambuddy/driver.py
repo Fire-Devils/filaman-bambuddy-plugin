@@ -798,6 +798,11 @@ class Driver(BaseDriver):
                 await self._sync_all_spools()
                 # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
                 await self._recover_slot_links()
+                if self._slot_cache_restored and self._last_bambuddy_status:
+                    # Re-emit cached status so recovered slot owners reach FilaMan DB
+                    # immediately without waiting for the next WS status frame.
+                    self._force_slots_emit = True
+                    self._process_slots(self._last_bambuddy_status)
                 if self._per_printer_profiles and self._is_sync_coordinator():
                     _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
                     _lf.add_done_callback(self._on_task_done)
@@ -5470,6 +5475,15 @@ class Driver(BaseDriver):
             if self._running:
                 try:
                     await self._sync_all_spools()
+                    for peer in list(
+                        self._url_instances.get(self._bambuddy_url, [self])
+                    ):
+                        if (
+                            peer._running
+                            and peer._sync_enabled
+                            and not peer._slot_cache_restored
+                        ):
+                            await peer._recover_slot_links_if_needed()
                     # Reset restart counter bei erfolgreichem Durchlauf
                     if self._sync_restart_count > 0:
                         logger.info(
@@ -5703,17 +5717,7 @@ class Driver(BaseDriver):
                     self._ws_connected = True
                     connected_at = time.monotonic()
                     if self._sync_enabled and not self._slot_cache_restored:
-                        # Same order as start(): learn which trays are loaded
-                        # before restoring owners. Otherwise the first status
-                        # sees known owners on unseen trays, treats every tray
-                        # as freshly inserted and re-configures all of them.
-                        if not self._current_slots:
-                            await self._fetch_and_emit_status()
-                        await self._recover_slot_links()
-                        if self._slot_cache_restored:
-                            # Re-emit so the recovered owners reach the DB.
-                            self._force_slots_emit = True
-                            await self._fetch_and_emit_status()
+                        await self._recover_slot_links_if_needed()
                     self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
@@ -7499,9 +7503,42 @@ class Driver(BaseDriver):
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
+    async def _recover_slot_links_if_needed(self) -> None:
+        """Serialize late/retry slot recovery per Bambuddy URL and isolate errors
+        so a recovery hiccup never drops an open WebSocket connection."""
+        if not self._running or not self._sync_enabled or self._slot_cache_restored:
+            return
+        lock = self._url_startup_locks.setdefault(self._bambuddy_url, asyncio.Lock())
+        try:
+            async with lock:
+                if (
+                    not self._running
+                    or not self._sync_enabled
+                    or self._slot_cache_restored
+                ):
+                    return
+                # Same order as start(): learn which trays are loaded before
+                # restoring owners. Otherwise the first status sees known owners
+                # on unseen trays, treats every tray as freshly inserted and
+                # re-configures all of them.
+                if not self._current_slots:
+                    await self._fetch_and_emit_status()
+                await self._recover_slot_links()
+                if self._slot_cache_restored:
+                    # Re-emit so the recovered owners reach the DB.
+                    self._force_slots_emit = True
+                    if self._last_bambuddy_status:
+                        self._process_slots(self._last_bambuddy_status)
+                    else:
+                        await self._fetch_and_emit_status()
+        except Exception as e:
+            logger.warning(
+                f"Late slot recovery failed for printer {self.printer_id}: {e}"
+            )
+
     async def _recover_slot_links(self) -> None:
         """Rebuild slot ownership from Bambuddy; run at start and again on the
-        first connect if Bambuddy was down at start."""
+        first connect or periodic sync if Bambuddy was down at start."""
         await self._restore_slot_cache_from_assignments()
         if not self._slot_cache_restored:
             return
@@ -7514,11 +7551,15 @@ class Driver(BaseDriver):
     async def _restore_slot_cache_from_assignments(self) -> None:
         """Stellt _slot_to_filaman_spool und _spool_original_location beim Start wieder her.
 
-        Nutzt Bambuddys GET /api/v1/inventory/assignments um zu erfahren, welche
-        Spulen aktuell welchen AMS-Slots zugewiesen sind. Über SpoolPrinterParam
-        wird die bambuddy_spool_id auf die filaman_spool_id zurückgemappt.
+        Nutzt Bambuddys GET /api/v1/inventory/assignments und ergänzt aktive
+        FilaMan-AMS-Standorte aus der DB, damit fehlende/gelöschte Bambuddy-
+        Assignments (oder fehlgeschlagene Backfill-POSTs) bestehende Slot-Links
+        nicht mit ``spool_id: None`` überschreiben.
         """
-        if not self._client or not self._bambuddy_printer_id:
+        if not self._client:
+            return
+        if not self._bambuddy_printer_id:
+            self._slot_cache_restored = True
             return
 
         try:
@@ -7530,23 +7571,33 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to fetch assignments for cache recovery: {e}")
             return
 
-        if not assignments:
-            self._slot_cache_restored = True
+        if not isinstance(assignments, list):
+            logger.warning(
+                f"Unexpected assignments payload for cache recovery: {type(assignments).__name__}"
+            )
             return
 
-        # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup aufbauen
+        prefix = f"bambuddy_{self.printer_id}_"
+        bb_to_filaman: dict[int, int] = {}
+        orig_locs: dict[int, int | None] = {}
+        db_slot_owners: dict[str, int] = {}
+        spool_to_ident: dict[int, str] = {}
+
+        # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup & FilaMan-AMS-Locations laden
         try:
             async with async_session_maker() as db:
-                result = await db.execute(
-                    select(SpoolPrinterParam).where(
-                        SpoolPrinterParam.printer_id == self.printer_id,
-                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                if assignments:
+                    result = await db.execute(
+                        select(SpoolPrinterParam).where(
+                            SpoolPrinterParam.printer_id == self.printer_id,
+                            SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                        )
                     )
-                )
-                bb_params = result.scalars().all()
-                bb_to_filaman: dict[int, int] = {
-                    int(p.param_value): p.spool_id for p in bb_params
-                }
+                    for p in result.scalars().all():
+                        try:
+                            bb_to_filaman[int(p.param_value)] = p.spool_id
+                        except (TypeError, ValueError):
+                            continue
 
                 # Original-Location-Einträge laden
                 result = await db.execute(
@@ -7555,18 +7606,47 @@ class Driver(BaseDriver):
                         SpoolPrinterParam.param_key == "original_location_id",
                     )
                 )
-                loc_params = result.scalars().all()
-                orig_locs: dict[int, int | None] = {
-                    p.spool_id: (None if p.param_value in ("0", "null", "") else int(p.param_value))
-                    for p in loc_params
-                }
+                for p in result.scalars().all():
+                    if p.param_value in ("0", "null", "", None):
+                        orig_locs[p.spool_id] = None
+                    else:
+                        try:
+                            orig_locs[p.spool_id] = int(p.param_value)
+                        except (TypeError, ValueError):
+                            continue
+
+                loc_rows = (
+                    await db.execute(
+                        select(Spool.id, Location.identifier)
+                        .join(Location, Spool.location_id == Location.id)
+                        .join(SpoolStatus, Spool.status_id == SpoolStatus.id)
+                        .where(
+                            SpoolStatus.key != "archived",
+                            Location.identifier.like(f"{prefix}%"),
+                        )
+                        .order_by(Spool.id)
+                    )
+                ).all()
+                for spool_id, ident in loc_rows:
+                    if not ident:
+                        continue
+                    spool_to_ident[spool_id] = ident
+                    parts = ident.split("_")
+                    if len(parts) != 4 or parts[0] != "bambuddy":
+                        continue
+                    try:
+                        ams_id, tray_id = int(parts[2]), int(parts[3])
+                    except ValueError:
+                        continue
+                    db_slot_owners[f"{ams_id}-{tray_id}"] = spool_id
         except Exception as e:
-            logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
+            logger.warning(f"Failed to load FilaMan DB state for cache recovery: {e}")
             return
 
-        self._slot_cache_restored = True
         recovered = 0
         for assignment in assignments:
+            if not isinstance(assignment, dict):
+                continue
             bb_spool_id = assignment.get("spool_id")
             ams_id = assignment.get("ams_id")
             tray_id = assignment.get("tray_id")
@@ -7574,14 +7654,21 @@ class Driver(BaseDriver):
             if bb_spool_id is None or ams_id is None or tray_id is None:
                 continue
 
-            filaman_spool_id = bb_to_filaman.get(bb_spool_id)
-            if not filaman_spool_id:
+            try:
+                bb_spool_int = int(bb_spool_id)
+                ams_int, tray_int = int(ams_id), int(tray_id)
+            except (TypeError, ValueError):
                 continue
 
-            slot_key = f"{ams_id}-{tray_id}"
+            filaman_spool_id = bb_to_filaman.get(bb_spool_int)
+            if not filaman_spool_id:
+                continue
+            if spool_to_ident.get(filaman_spool_id) != f"{prefix}{ams_int}_{tray_int}":
+                continue
+
+            slot_key = f"{ams_int}-{tray_int}"
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
-            # Original-Location aus DB wiederherstellen
             if filaman_spool_id in orig_locs:
                 self._spool_original_location[filaman_spool_id] = orig_locs[
                     filaman_spool_id
@@ -7589,9 +7676,21 @@ class Driver(BaseDriver):
 
             recovered += 1
 
-        if recovered:
+        # Preserve slots whose FilaMan location still names this AMS tray even if
+        # Bambuddy returned [] or an unmapped spool_id, or backfill later skips/fails.
+        db_seeded = 0
+        for slot_key, fm_id in db_slot_owners.items():
+            if slot_key not in self._slot_to_filaman_spool:
+                self._slot_to_filaman_spool[slot_key] = fm_id
+                if fm_id in orig_locs:
+                    self._spool_original_location.setdefault(fm_id, orig_locs[fm_id])
+                db_seeded += 1
+
+        self._slot_cache_restored = True
+        if recovered or db_seeded:
             logger.info(
-                f"Recovered {recovered} slot-to-spool assignments from Bambuddy API"
+                f"Recovered slot-to-spool cache for printer {self.printer_id} "
+                f"(bambuddy={recovered}, filaman_db={db_seeded})"
             )
 
     async def _backfill_missing_ams_assignments(self) -> None:
@@ -8520,6 +8619,9 @@ class Driver(BaseDriver):
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
 
         # Task-Liveness prüfen
+        startup_task_alive = (
+            self._startup_task is not None and not self._startup_task.done()
+        )
         ws_task_alive = self._ws_task is not None and not self._ws_task.done()
         sync_task_alive = (
             (self._sync_task is not None and not self._sync_task.done())
@@ -8529,16 +8631,21 @@ class Driver(BaseDriver):
 
         # Task-Status Details
         task_status = {
+            "starting": startup_task_alive,
             "ws_task_alive": ws_task_alive,
             "ws_restart_count": self._ws_restart_count,
             "sync_task_alive": sync_task_alive,
             "sync_restart_count": self._sync_restart_count,
         }
 
-        # Overall health: critical tasks müssen leben
-        tasks_healthy = ws_task_alive
-        if sync_task_alive is not None:  # Nur wenn dieser Driver Sync-Coordinator ist
-            tasks_healthy = tasks_healthy and sync_task_alive
+        # Overall health: critical tasks müssen leben (während des gekapselten
+        # Hintergrund-Starts warten WS/Sync noch auf die URL-Queue).
+        if startup_task_alive:
+            tasks_healthy = True
+        else:
+            tasks_healthy = ws_task_alive
+            if sync_task_alive is not None:  # Nur wenn dieser Driver Sync-Coordinator ist
+                tasks_healthy = tasks_healthy and sync_task_alive
 
         return {
             "driver_key": self.driver_key,
