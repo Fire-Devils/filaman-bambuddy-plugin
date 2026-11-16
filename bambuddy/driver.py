@@ -441,6 +441,9 @@ class Driver(BaseDriver):
     # Verhindert mehrfache Syncs wenn mehrere Drucker dieselbe Bambuddy-Instanz nutzen.
     # Pro eindeutige bambuddy_url läuft maximal ein Sync gleichzeitig.
     _url_sync_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    # Serialises the background part of start() per URL. Not popped on
+    # unregister: a later driver may already be queued on it.
+    _url_startup_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     _url_instances: ClassVar[dict[str, list["Driver"]]] = {}
     _url_last_sync: ClassVar[dict[str, float]] = {}
     # Differential-sync cache: last payload successfully sent to Bambuddy per spool.
@@ -495,6 +498,7 @@ class Driver(BaseDriver):
 
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
         self._sync_task: asyncio.Task | None = None
 
         # -- Verbindungs-Status --
@@ -708,6 +712,30 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to load printer name: {e}")
             self._printer_name = f"Printer {self.printer_id}"
 
+        # Always register for URL peer discovery. Per-model profile UI
+        # (connected-models / profile-coverage) needs every Bambuddy driver on
+        # this URL, even when inventory sync is disabled. Registering here keeps
+        # the coordinator the first driver started, as before.
+        self._register()
+
+        # The rest talks to Bambuddy and can take well over FilaMan's driver
+        # start timeout (10s since 2.2.2) when several printers share one
+        # Bambuddy. Run it in the background in the same order; the WebSocket
+        # loop already redoes status + slot recovery if this part fails.
+        self._startup_task = asyncio.create_task(self._finish_start())
+        self._startup_task.add_done_callback(self._on_task_done)
+
+    async def _finish_start(self) -> None:
+        # FilaMan used to await each start() in turn, so one printer's sync and
+        # slot recovery were done before the next printer began. Peers running
+        # them at once would skip the locked sync and recover slots mid-sync,
+        # so queue up per URL in start order instead.
+        lock = self._url_startup_locks.setdefault(self._bambuddy_url, asyncio.Lock())
+        async with lock:
+            if self._running:
+                await self._run_startup()
+
+    async def _run_startup(self) -> None:
         # -- Spoolman-Settings cachen --
         try:
             resp = await self._client.get(
@@ -754,11 +782,6 @@ class Driver(BaseDriver):
             except Exception as e:
                 logger.warning(f"Failed to cleanup old bambuddy_spool_id entries: {e}")
 
-        # Always register for URL peer discovery. Per-model profile UI
-        # (connected-models / profile-coverage) needs every Bambuddy driver on
-        # this URL, even when inventory sync is disabled.
-        self._register()
-
         # Heal PFUS wrongly stored as bambu_idx (pre-hardening / reflect bugs).
         if self._is_sync_coordinator():
             _heal = asyncio.create_task(self._sanitize_pfus_stored_as_bambu_idx())
@@ -766,25 +789,39 @@ class Driver(BaseDriver):
             _fam = asyncio.create_task(self._sanitize_mismatched_bambu_idx())
             _fam.add_done_callback(self._on_task_done)
 
-        # Initialen AMS-Status laden
-        await self._fetch_and_emit_status()
+        try:
+            # Initialen AMS-Status laden
+            await self._fetch_and_emit_status()
 
-        if self._sync_enabled:
-            # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
-            await self._sync_all_spools()
-            # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
-            await self._recover_slot_links()
-            if self._per_printer_profiles and self._is_sync_coordinator():
-                _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
-                _lf.add_done_callback(self._on_task_done)
+            if self._sync_enabled:
+                # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
+                await self._sync_all_spools()
+                # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
+                await self._recover_slot_links()
+                if self._per_printer_profiles and self._is_sync_coordinator():
+                    _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
+                    _lf.add_done_callback(self._on_task_done)
+        except Exception:
+            # Used to fail start() outright. Now the WebSocket still comes up
+            # and recovers the slot links on its first connect.
+            logger.exception(
+                f"Startup sync failed for printer {self.printer_id}; "
+                "continuing with WebSocket"
+            )
+
+        if not self._running:
+            return
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._ws_task.add_done_callback(self._on_task_done)
 
         if self._sync_enabled:
-            # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
-            if self._is_sync_coordinator():
+            # Periodischer Sync nur vom Koordinator (erster Driver pro URL).
+            # A stopping coordinator may already have handed us the loop.
+            if self._is_sync_coordinator() and (
+                not self._sync_task or self._sync_task.done()
+            ):
                 self._sync_task = asyncio.create_task(self._sync_inventory_loop())
                 self._sync_task.add_done_callback(self._on_task_done)
                 logger.debug(
@@ -812,6 +849,7 @@ class Driver(BaseDriver):
         for slot_key in list(self._sticky_tasks.keys()):
             self._cancel_sticky_task(slot_key)
         for task in (
+            self._startup_task,
             self._ws_task,
             self._sync_task,
             self._debounce_task,
@@ -823,7 +861,7 @@ class Driver(BaseDriver):
                     await task
                 except asyncio.CancelledError:
                     pass
-        self._ws_task = self._sync_task = None
+        self._startup_task = self._ws_task = self._sync_task = None
         self._debounce_task = self._sticky_reconcile_task = None
         self._ws_connected = False
         self._printer_connected = False
