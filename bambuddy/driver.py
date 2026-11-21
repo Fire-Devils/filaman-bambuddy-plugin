@@ -441,6 +441,9 @@ class Driver(BaseDriver):
     # Verhindert mehrfache Syncs wenn mehrere Drucker dieselbe Bambuddy-Instanz nutzen.
     # Pro eindeutige bambuddy_url läuft maximal ein Sync gleichzeitig.
     _url_sync_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    # Serialises the background part of start() per URL. Not popped on
+    # unregister: a later driver may already be queued on it.
+    _url_startup_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     _url_instances: ClassVar[dict[str, list["Driver"]]] = {}
     _url_last_sync: ClassVar[dict[str, float]] = {}
     # Differential-sync cache: last payload successfully sent to Bambuddy per spool.
@@ -495,7 +498,12 @@ class Driver(BaseDriver):
 
         # -- Background Tasks --
         self._ws_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._late_recovery_task: asyncio.Task | None = None
         self._sync_task: asyncio.Task | None = None
+        # Loop that owns this driver's tasks and HTTP client. Commits from any
+        # other loop (another plugin's thread) must not schedule work on it.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # -- Verbindungs-Status --
         self._ws_connected: bool = False  # WebSocket-Verbindung zu Bambuddy-Server
@@ -694,6 +702,7 @@ class Driver(BaseDriver):
     # -- Lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._running = True
         self._client = httpx.AsyncClient(headers=self._headers, timeout=15.0)
 
@@ -708,6 +717,30 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to load printer name: {e}")
             self._printer_name = f"Printer {self.printer_id}"
 
+        # Always register for URL peer discovery. Per-model profile UI
+        # (connected-models / profile-coverage) needs every Bambuddy driver on
+        # this URL, even when inventory sync is disabled. Registering here keeps
+        # the coordinator the first driver started, as before.
+        self._register()
+
+        # The rest talks to Bambuddy and can take well over FilaMan's driver
+        # start timeout (10s since 2.2.2) when several printers share one
+        # Bambuddy. Run it in the background in the same order; the WebSocket
+        # loop already redoes status + slot recovery if this part fails.
+        self._startup_task = asyncio.create_task(self._finish_start())
+        self._startup_task.add_done_callback(self._on_task_done)
+
+    async def _finish_start(self) -> None:
+        # FilaMan used to await each start() in turn, so one printer's sync and
+        # slot recovery were done before the next printer began. Peers running
+        # them at once would skip the locked sync and recover slots mid-sync,
+        # so queue up per URL in start order instead.
+        lock = self._url_startup_locks.setdefault(self._bambuddy_url, asyncio.Lock())
+        async with lock:
+            if self._running:
+                await self._run_startup()
+
+    async def _run_startup(self) -> None:
         # -- Spoolman-Settings cachen --
         try:
             resp = await self._client.get(
@@ -754,11 +787,6 @@ class Driver(BaseDriver):
             except Exception as e:
                 logger.warning(f"Failed to cleanup old bambuddy_spool_id entries: {e}")
 
-        # Always register for URL peer discovery. Per-model profile UI
-        # (connected-models / profile-coverage) needs every Bambuddy driver on
-        # this URL, even when inventory sync is disabled.
-        self._register()
-
         # Heal PFUS wrongly stored as bambu_idx (pre-hardening / reflect bugs).
         if self._is_sync_coordinator():
             _heal = asyncio.create_task(self._sanitize_pfus_stored_as_bambu_idx())
@@ -766,25 +794,44 @@ class Driver(BaseDriver):
             _fam = asyncio.create_task(self._sanitize_mismatched_bambu_idx())
             _fam.add_done_callback(self._on_task_done)
 
-        # Initialen AMS-Status laden
-        await self._fetch_and_emit_status()
+        try:
+            # Initialen AMS-Status laden
+            await self._fetch_and_emit_status()
 
-        if self._sync_enabled:
-            # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
-            await self._sync_all_spools()
-            # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
-            await self._recover_slot_links()
-            if self._per_printer_profiles and self._is_sync_coordinator():
-                _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
-                _lf.add_done_callback(self._on_task_done)
+            if self._sync_enabled:
+                # Inventory-Sync: FilaMan → Bambuddy (URL-Lock verhindert Duplikate)
+                await self._sync_all_spools()
+                # Slot-Cache aus Bambuddy-Assignments wiederherstellen (überlebt Neustarts)
+                await self._recover_slot_links()
+                if self._slot_cache_restored and self._last_bambuddy_status:
+                    # Re-emit cached status so recovered slot owners reach FilaMan DB
+                    # immediately without waiting for the next WS status frame.
+                    self._force_slots_emit = True
+                    self._process_slots(self._last_bambuddy_status)
+                if self._per_printer_profiles and self._is_sync_coordinator():
+                    _lf = asyncio.create_task(self._legacy_fanout_mirrored_profiles())
+                    _lf.add_done_callback(self._on_task_done)
+        except Exception:
+            # Used to fail start() outright. Now the WebSocket still comes up
+            # and recovers the slot links on its first connect.
+            logger.exception(
+                f"Startup sync failed for printer {self.printer_id}; "
+                "continuing with WebSocket"
+            )
+
+        if not self._running:
+            return
 
         # Background-Tasks starten
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._ws_task.add_done_callback(self._on_task_done)
 
         if self._sync_enabled:
-            # Periodischer Sync nur vom Koordinator (erster Driver pro URL)
-            if self._is_sync_coordinator():
+            # Periodischer Sync nur vom Koordinator (erster Driver pro URL).
+            # A stopping coordinator may already have handed us the loop.
+            if self._is_sync_coordinator() and (
+                not self._sync_task or self._sync_task.done()
+            ):
                 self._sync_task = asyncio.create_task(self._sync_inventory_loop())
                 self._sync_task.add_done_callback(self._on_task_done)
                 logger.debug(
@@ -812,6 +859,8 @@ class Driver(BaseDriver):
         for slot_key in list(self._sticky_tasks.keys()):
             self._cancel_sticky_task(slot_key)
         for task in (
+            self._startup_task,
+            self._late_recovery_task,
             self._ws_task,
             self._sync_task,
             self._debounce_task,
@@ -823,6 +872,7 @@ class Driver(BaseDriver):
                     await task
                 except asyncio.CancelledError:
                     pass
+        self._startup_task = self._late_recovery_task = None
         self._ws_task = self._sync_task = None
         self._debounce_task = self._sticky_reconcile_task = None
         self._ws_connected = False
@@ -863,6 +913,14 @@ class Driver(BaseDriver):
         the inventory debounce sync.
         """
         if not self._running or not self._sync_enabled:
+            return
+        # after_commit runs on whichever thread committed. Another plugin keeps
+        # its own event loop, and scheduling this driver's HTTP client there
+        # fails with "bound to a different event loop" and aborts the sync.
+        try:
+            if asyncio.get_running_loop() is not self._loop:
+                return
+        except RuntimeError:
             return
 
         # Sticky map reconcile (all peer drivers — not only the coordinator).
@@ -5215,7 +5273,9 @@ class Driver(BaseDriver):
 
         except Exception as e:
             self._last_sync_error = str(e)
-            logger.error(f"Inventory sync failed for printer {self.printer_id}: {e}")
+            logger.exception(
+                f"Inventory sync failed for printer {self.printer_id}: {e}"
+            )
         finally:
             self._syncing = False
 
@@ -5432,6 +5492,15 @@ class Driver(BaseDriver):
             if self._running:
                 try:
                     await self._sync_all_spools()
+                    for peer in list(
+                        self._url_instances.get(self._bambuddy_url, [self])
+                    ):
+                        if (
+                            peer._running
+                            and peer._sync_enabled
+                            and not peer._slot_cache_restored
+                        ):
+                            await peer._recover_slot_links_if_needed()
                     # Reset restart counter bei erfolgreichem Durchlauf
                     if self._sync_restart_count > 0:
                         logger.info(
@@ -5665,17 +5734,10 @@ class Driver(BaseDriver):
                     self._ws_connected = True
                     connected_at = time.monotonic()
                     if self._sync_enabled and not self._slot_cache_restored:
-                        # Same order as start(): learn which trays are loaded
-                        # before restoring owners. Otherwise the first status
-                        # sees known owners on unseen trays, treats every tray
-                        # as freshly inserted and re-configures all of them.
-                        if not self._current_slots:
-                            await self._fetch_and_emit_status()
-                        await self._recover_slot_links()
-                        if self._slot_cache_restored:
-                            # Re-emit so the recovered owners reach the DB.
-                            self._force_slots_emit = True
-                            await self._fetch_and_emit_status()
+                        # Don't wait here. Recovery takes the per-URL startup
+                        # lock, and another printer may hold that for a full
+                        # inventory sync. The socket has to be read meanwhile.
+                        self._schedule_late_slot_recovery()
                     self._ws_last_connected_at = connected_at
                     logger.info(f"WebSocket connected: {uri}")
 
@@ -7461,9 +7523,73 @@ class Driver(BaseDriver):
 
     # -- Initialer Status-Fetch -----------------------------------------------
 
+    def _schedule_late_slot_recovery(self) -> None:
+        """Start slot recovery without blocking the WebSocket read loop."""
+        task = self._late_recovery_task
+        if task is not None and not task.done():
+            return
+        self._late_recovery_task = asyncio.create_task(
+            self._recover_slot_links_if_needed()
+        )
+        self._late_recovery_task.add_done_callback(self._on_task_done)
+
+    @staticmethod
+    def _literal_like_prefix(prefix: str) -> str:
+        """Escape LIKE wildcards. '_' in ``bambuddy_1_`` would also match printer 13."""
+        return (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+
+    def _own_ams_slot(self, identifier: str | None) -> tuple[int, int] | None:
+        """Return ``(ams, tray)`` when identifier is this printer's AMS slot.
+
+        Format is ``bambuddy_{printer_id}_{ams}_{tray}``. The printer id has to
+        be compared exactly: a SQL LIKE prefix treats '_' as one character.
+        """
+        parts = (identifier or "").split("_")
+        if len(parts) != 4 or parts[0] != "bambuddy" or parts[1] != str(self.printer_id):
+            return None
+        try:
+            return int(parts[2]), int(parts[3])
+        except ValueError:
+            return None
+
+    async def _recover_slot_links_if_needed(self) -> None:
+        """Serialize late/retry slot recovery per Bambuddy URL and isolate errors
+        so a recovery hiccup never drops an open WebSocket connection."""
+        if not self._running or not self._sync_enabled or self._slot_cache_restored:
+            return
+        lock = self._url_startup_locks.setdefault(self._bambuddy_url, asyncio.Lock())
+        try:
+            async with lock:
+                if (
+                    not self._running
+                    or not self._sync_enabled
+                    or self._slot_cache_restored
+                ):
+                    return
+                # Same order as start(): learn which trays are loaded before
+                # restoring owners. Otherwise the first status sees known owners
+                # on unseen trays, treats every tray as freshly inserted and
+                # re-configures all of them.
+                if not self._current_slots:
+                    await self._fetch_and_emit_status()
+                await self._recover_slot_links()
+                if self._slot_cache_restored:
+                    # Re-emit so the recovered owners reach the DB.
+                    self._force_slots_emit = True
+                    if self._last_bambuddy_status:
+                        self._process_slots(self._last_bambuddy_status)
+                    else:
+                        await self._fetch_and_emit_status()
+        except Exception as e:
+            logger.warning(
+                f"Late slot recovery failed for printer {self.printer_id}: {e}"
+            )
+
     async def _recover_slot_links(self) -> None:
         """Rebuild slot ownership from Bambuddy; run at start and again on the
-        first connect if Bambuddy was down at start."""
+        first connect or periodic sync if Bambuddy was down at start."""
         await self._restore_slot_cache_from_assignments()
         if not self._slot_cache_restored:
             return
@@ -7476,11 +7602,15 @@ class Driver(BaseDriver):
     async def _restore_slot_cache_from_assignments(self) -> None:
         """Stellt _slot_to_filaman_spool und _spool_original_location beim Start wieder her.
 
-        Nutzt Bambuddys GET /api/v1/inventory/assignments um zu erfahren, welche
-        Spulen aktuell welchen AMS-Slots zugewiesen sind. Über SpoolPrinterParam
-        wird die bambuddy_spool_id auf die filaman_spool_id zurückgemappt.
+        Nutzt Bambuddys GET /api/v1/inventory/assignments und ergänzt aktive
+        FilaMan-AMS-Standorte aus der DB, damit fehlende/gelöschte Bambuddy-
+        Assignments (oder fehlgeschlagene Backfill-POSTs) bestehende Slot-Links
+        nicht mit ``spool_id: None`` überschreiben.
         """
-        if not self._client or not self._bambuddy_printer_id:
+        if not self._client:
+            return
+        if not self._bambuddy_printer_id:
+            self._slot_cache_restored = True
             return
 
         try:
@@ -7492,23 +7622,33 @@ class Driver(BaseDriver):
             logger.warning(f"Failed to fetch assignments for cache recovery: {e}")
             return
 
-        if not assignments:
-            self._slot_cache_restored = True
+        if not isinstance(assignments, list):
+            logger.warning(
+                f"Unexpected assignments payload for cache recovery: {type(assignments).__name__}"
+            )
             return
 
-        # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup aufbauen
+        prefix = f"bambuddy_{self.printer_id}_"
+        bb_to_filaman: dict[int, int] = {}
+        orig_locs: dict[int, int | None] = {}
+        db_slot_owners: dict[str, int] = {}
+        spool_to_ident: dict[int, str] = {}
+
+        # Bambuddy-Spool-ID → FilaMan-Spool-ID Reverse-Lookup & FilaMan-AMS-Locations laden
         try:
             async with async_session_maker() as db:
-                result = await db.execute(
-                    select(SpoolPrinterParam).where(
-                        SpoolPrinterParam.printer_id == self.printer_id,
-                        SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                if assignments:
+                    result = await db.execute(
+                        select(SpoolPrinterParam).where(
+                            SpoolPrinterParam.printer_id == self.printer_id,
+                            SpoolPrinterParam.param_key == "bambuddy_spool_id",
+                        )
                     )
-                )
-                bb_params = result.scalars().all()
-                bb_to_filaman: dict[int, int] = {
-                    int(p.param_value): p.spool_id for p in bb_params
-                }
+                    for p in result.scalars().all():
+                        try:
+                            bb_to_filaman[int(p.param_value)] = p.spool_id
+                        except (TypeError, ValueError):
+                            continue
 
                 # Original-Location-Einträge laden
                 result = await db.execute(
@@ -7517,18 +7657,52 @@ class Driver(BaseDriver):
                         SpoolPrinterParam.param_key == "original_location_id",
                     )
                 )
-                loc_params = result.scalars().all()
-                orig_locs: dict[int, int | None] = {
-                    p.spool_id: (None if p.param_value in ("0", "null", "") else int(p.param_value))
-                    for p in loc_params
-                }
+                for p in result.scalars().all():
+                    if p.param_value in ("0", "null", "", None):
+                        orig_locs[p.spool_id] = None
+                    else:
+                        try:
+                            orig_locs[p.spool_id] = int(p.param_value)
+                        except (TypeError, ValueError):
+                            continue
+
+                loc_rows = (
+                    await db.execute(
+                        select(Spool.id, Location.identifier)
+                        .join(Location, Spool.location_id == Location.id)
+                        .join(SpoolStatus, Spool.status_id == SpoolStatus.id)
+                        .where(
+                            SpoolStatus.key != "archived",
+                            Location.identifier.like(
+                                f"{self._literal_like_prefix(prefix)}%", escape="\\"
+                            ),
+                        )
+                        .order_by(Spool.id)
+                    )
+                ).all()
+                for spool_id, ident in loc_rows:
+                    slot = self._own_ams_slot(ident)
+                    if slot is None:
+                        continue
+                    spool_to_ident[spool_id] = ident
+                    ams_id, tray_id = slot
+                    slot_key = f"{ams_id}-{tray_id}"
+                    previous = db_slot_owners.get(slot_key)
+                    if previous is not None and previous != spool_id:
+                        logger.warning(
+                            f"Printer {self.printer_id} slot {slot_key} has more "
+                            f"than one active spool (FM#{previous} and FM#{spool_id}); "
+                            f"keeping FM#{spool_id}"
+                        )
+                    db_slot_owners[slot_key] = spool_id
         except Exception as e:
-            logger.warning(f"Failed to load SpoolPrinterParams for cache recovery: {e}")
+            logger.warning(f"Failed to load FilaMan DB state for cache recovery: {e}")
             return
 
-        self._slot_cache_restored = True
         recovered = 0
         for assignment in assignments:
+            if not isinstance(assignment, dict):
+                continue
             bb_spool_id = assignment.get("spool_id")
             ams_id = assignment.get("ams_id")
             tray_id = assignment.get("tray_id")
@@ -7536,14 +7710,28 @@ class Driver(BaseDriver):
             if bb_spool_id is None or ams_id is None or tray_id is None:
                 continue
 
-            filaman_spool_id = bb_to_filaman.get(bb_spool_id)
-            if not filaman_spool_id:
+            try:
+                bb_spool_int = int(bb_spool_id)
+                ams_int, tray_int = int(ams_id), int(tray_id)
+            except (TypeError, ValueError):
                 continue
 
-            slot_key = f"{ams_id}-{tray_id}"
+            filaman_spool_id = bb_to_filaman.get(bb_spool_int)
+            if not filaman_spool_id:
+                continue
+            expected = f"{prefix}{ams_int}_{tray_int}"
+            actual = spool_to_ident.get(filaman_spool_id)
+            if actual != expected:
+                logger.info(
+                    f"Skip Bambuddy assignment FM#{filaman_spool_id} on "
+                    f"AMS {ams_int}/{tray_int}: FilaMan location is {actual!r}, "
+                    f"expected {expected!r}"
+                )
+                continue
+
+            slot_key = f"{ams_int}-{tray_int}"
             self._slot_to_filaman_spool[slot_key] = filaman_spool_id
 
-            # Original-Location aus DB wiederherstellen
             if filaman_spool_id in orig_locs:
                 self._spool_original_location[filaman_spool_id] = orig_locs[
                     filaman_spool_id
@@ -7551,9 +7739,21 @@ class Driver(BaseDriver):
 
             recovered += 1
 
-        if recovered:
+        # Preserve slots whose FilaMan location still names this AMS tray even if
+        # Bambuddy returned [] or an unmapped spool_id, or backfill later skips/fails.
+        db_seeded = 0
+        for slot_key, fm_id in db_slot_owners.items():
+            if slot_key not in self._slot_to_filaman_spool:
+                self._slot_to_filaman_spool[slot_key] = fm_id
+                if fm_id in orig_locs:
+                    self._spool_original_location.setdefault(fm_id, orig_locs[fm_id])
+                db_seeded += 1
+
+        self._slot_cache_restored = True
+        if recovered or db_seeded:
             logger.info(
-                f"Recovered {recovered} slot-to-spool assignments from Bambuddy API"
+                f"Recovered slot-to-spool cache for printer {self.printer_id} "
+                f"(bambuddy={recovered}, filaman_db={db_seeded})"
             )
 
     async def _backfill_missing_ams_assignments(self) -> None:
@@ -7583,7 +7783,9 @@ class Driver(BaseDriver):
                     )
                     .where(
                         SpoolStatus.key != "archived",
-                        Location.identifier.like(f"{prefix}%"),
+                        Location.identifier.like(
+                            f"{self._literal_like_prefix(prefix)}%", escape="\\"
+                        ),
                     )
                 )
                 rows = result.all()
@@ -7596,15 +7798,14 @@ class Driver(BaseDriver):
 
         targets: list[tuple[int, int, int, int]] = []  # fm_id, bb_id, ams, tray
         for spool, loc, param in rows:
-            ident = loc.identifier or ""
-            parts = ident.split("_")
-            if len(parts) != 4 or parts[0] != "bambuddy":
+            slot = self._own_ams_slot(loc.identifier)
+            if slot is None:
                 continue
             try:
-                ams_id, tray_id = int(parts[2]), int(parts[3])
                 bb_spool_id = int(param.param_value)
             except (TypeError, ValueError):
                 continue
+            ams_id, tray_id = slot
             targets.append((spool.id, bb_spool_id, ams_id, tray_id))
 
         if not targets:
@@ -8482,6 +8683,9 @@ class Driver(BaseDriver):
         total_slots = sum(u.get("tray_count", 0) for u in self._current_ams_units)
 
         # Task-Liveness prüfen
+        startup_task_alive = (
+            self._startup_task is not None and not self._startup_task.done()
+        )
         ws_task_alive = self._ws_task is not None and not self._ws_task.done()
         sync_task_alive = (
             (self._sync_task is not None and not self._sync_task.done())
@@ -8491,16 +8695,21 @@ class Driver(BaseDriver):
 
         # Task-Status Details
         task_status = {
+            "starting": startup_task_alive,
             "ws_task_alive": ws_task_alive,
             "ws_restart_count": self._ws_restart_count,
             "sync_task_alive": sync_task_alive,
             "sync_restart_count": self._sync_restart_count,
         }
 
-        # Overall health: critical tasks müssen leben
-        tasks_healthy = ws_task_alive
-        if sync_task_alive is not None:  # Nur wenn dieser Driver Sync-Coordinator ist
-            tasks_healthy = tasks_healthy and sync_task_alive
+        # Overall health: critical tasks müssen leben (während des gekapselten
+        # Hintergrund-Starts warten WS/Sync noch auf die URL-Queue).
+        if startup_task_alive:
+            tasks_healthy = True
+        else:
+            tasks_healthy = ws_task_alive
+            if sync_task_alive is not None:  # Nur wenn dieser Driver Sync-Coordinator ist
+                tasks_healthy = tasks_healthy and sync_task_alive
 
         return {
             "driver_key": self.driver_key,
