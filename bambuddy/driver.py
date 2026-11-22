@@ -586,6 +586,9 @@ class Driver(BaseDriver):
         self._pending_rfid_hex: str | None = None
         self._pending_slot_snapshot: dict[str, dict[str, Any]] | None = None
         self._pending_timer: asyncio.Task | None = None
+        # Shared with the other printers armed by the same weigh; the first
+        # insert that calls it wins the spool.
+        self._pending_claim: Callable[[], bool] | None = None
         self._pending_poll_task: asyncio.Task | None = None
 
         # -- Task Restart Management --
@@ -5567,6 +5570,7 @@ class Driver(BaseDriver):
         filament_data: dict,
         slot_index: str | None = None,
         timeout_seconds: int | None = None,
+        claim: Callable[[], bool] | None = None,
     ) -> None:
         """Mark a spool as pending for the next AMS tray insertion.
 
@@ -5600,6 +5604,7 @@ class Driver(BaseDriver):
         self._pending_spool_id = spool_id
         self._pending_filament_data = {**filament_data, "id": spool_id}
         self._pending_rfid_hex = rfid_hex
+        self._pending_claim = claim
         await self._capture_pending_snapshot()
 
         effective_timeout = timeout_seconds if timeout_seconds is not None else 300
@@ -5646,6 +5651,7 @@ class Driver(BaseDriver):
         self._pending_spool_id = None
         self._pending_filament_data = None
         self._pending_rfid_hex = None
+        self._pending_claim = None
         self._pending_slot_snapshot = None
         self._pending_timer = None
         if self._pending_poll_task and not self._pending_poll_task.done():
@@ -5661,6 +5667,7 @@ class Driver(BaseDriver):
         self._pending_spool_id = None
         self._pending_filament_data = None
         self._pending_rfid_hex = None
+        self._pending_claim = None
         self._pending_slot_snapshot = None
         self._pending_timer = None
         self._pending_poll_task = None
@@ -7991,6 +7998,34 @@ class Driver(BaseDriver):
             }
 
     def _try_match_pending_tray(
+        self, slot_index: str, tray: dict
+    ) -> tuple[bool, str]:
+        """Match an inserted tray to the pending spool and claim it.
+
+        One weigh can arm several printers. Only the first insert gets the
+        claim; if another printer already took the spool, drop our pending
+        state instead of configuring this tray with it.
+        """
+        matched, reason = self._pending_tray_inserted(slot_index, tray)
+        if not matched or self._pending_claim is None:
+            return matched, reason
+        try:
+            won = bool(self._pending_claim())
+        except Exception as e:
+            logger.warning(f"Auto-assign claim check failed: {e}")
+            won = True
+        if won:
+            self._pending_claim = None
+            return matched, reason
+        logger.info(
+            f"Pending spool {self._pending_spool_id} already claimed by "
+            f"another printer; ignoring insert at {slot_index} on printer "
+            f"{self.printer_id}"
+        )
+        self._clear_pending()
+        return False, ""
+
+    def _pending_tray_inserted(
         self, slot_index: str, tray: dict
     ) -> tuple[bool, str]:
         """Return (matched, reason) if this tray was inserted since scan."""
