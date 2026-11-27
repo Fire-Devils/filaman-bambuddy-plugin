@@ -17,7 +17,17 @@
         "title": "Inventar-Synchronisation",
         "description": "Wenn aktiviert, werden FilaMan-Spulen automatisch ins Bambuddy-Inventar synchronisiert. Bei Deaktivierung nutzt Bambuddy die Spoolman API.",
         "enum": ["enabled", "disabled"],
-        "default": "enabled"
+        "default": "enabled",
+        "x-i18n": {
+          "de": {
+            "title": "Inventar-Synchronisation",
+            "description": "Wenn aktiviert, werden FilaMan-Spulen automatisch ins Bambuddy-Inventar synchronisiert. Bei Deaktivierung nutzt Bambuddy die Spoolman API."
+          },
+          "fr": {
+            "title": "Synchronisation de l’inventaire",
+            "description": "Si activée, les bobines FilaMan sont synchronisées automatiquement avec l’inventaire de Bambuddy. Si désactivée, Bambuddy utilise l’API Spoolman."
+          }
+        }
       },
       "printer_write_mode": {
         "type": "string",
@@ -30,22 +40,70 @@
           "ru": ["Полный режим", "Только инвентарь"],
           "uk": ["Повний режим", "Лише інвентар"]
         },
-        "default": "full"
+        "default": "full",
+        "x-i18n": {
+          "de": {
+            "title": "Drucker-Schreibmodus",
+            "description": "Vollständig übernimmt Filament- und Kalibrierungseinstellungen im Drucker; Nur Inventar führt lediglich Bambuddy-Inventar und Zuweisungsstatus, ohne Material in den Drucker zu schreiben.",
+            "enumNames": [
+              "Vollständig",
+              "Nur Inventar"
+            ]
+          },
+          "fr": {
+            "title": "Mode d’écriture de l’imprimante",
+            "description": "Complet applique les réglages de filament et d’étalonnage à l’imprimante ; Inventaire uniquement ne conserve que l’inventaire Bambuddy et l’état d’attribution, sans écrire de matériau dans l’imprimante.",
+            "enumNames": [
+              "Complet",
+              "Inventaire uniquement"
+            ]
+          }
+        }
       },
       "bambuddy_url": {
         "type": "string",
         "title": "Bambuddy URL",
-        "description": "Base URL of your Bambuddy instance, e.g. http://192.168.1.50:8080"
+        "description": "Base URL of your Bambuddy instance, e.g. http://192.168.1.50:8080",
+        "x-i18n": {
+          "de": {
+            "title": "Bambuddy-URL",
+            "description": "Basis-URL Ihrer Bambuddy-Instanz, z. B. http://192.168.1.50:8080"
+          },
+          "fr": {
+            "title": "URL de Bambuddy",
+            "description": "URL de base de votre instance Bambuddy, p. ex. http://192.168.1.50:8080"
+          }
+        }
       },
       "api_key": {
         "type": "string",
         "title": "API Key",
-        "description": "Bambuddy API key (create in Bambuddy under Settings → API Keys)"
+        "description": "Bambuddy API key (create in Bambuddy under Settings → API Keys)",
+        "x-i18n": {
+          "de": {
+            "title": "API-Schlüssel",
+            "description": "Bambuddy-API-Schlüssel (in Bambuddy unter Einstellungen → API-Schlüssel erstellen)"
+          },
+          "fr": {
+            "title": "Clé API",
+            "description": "Clé API Bambuddy (à créer dans Bambuddy sous Paramètres → Clés API)"
+          }
+        }
       },
       "printer_id": {
         "type": "integer",
         "title": "Bambuddy Printer ID",
-        "description": "Internal ID of the printer in Bambuddy"
+        "description": "Internal ID of the printer in Bambuddy",
+        "x-i18n": {
+          "de": {
+            "title": "Bambuddy-Drucker-ID",
+            "description": "Interne ID des Druckers in Bambuddy"
+          },
+          "fr": {
+            "title": "ID d’imprimante Bambuddy",
+            "description": "ID interne de l’imprimante dans Bambuddy"
+          }
+        }
       },
       "reconnect_interval_seconds": {
         "type": "integer",
@@ -53,7 +111,17 @@
         "description": "How long to wait before reconnecting after a WebSocket disconnect",
         "default": 30,
         "minimum": 5,
-        "maximum": 300
+        "maximum": 300,
+        "x-i18n": {
+          "de": {
+            "title": "WebSocket-Wiederverbindungsintervall (Sekunden)",
+            "description": "Wartezeit bis zur Wiederverbindung nach einer WebSocket-Trennung"
+          },
+          "fr": {
+            "title": "Intervalle de reconnexion WebSocket (secondes)",
+            "description": "Délai d’attente avant la reconnexion après une déconnexion WebSocket"
+          }
+        }
       },
       "sync_interval_seconds": {
         "type": "integer",
@@ -61,21 +129,51 @@
         "description": "Wie oft FilaMan-Spulen mit Bambuddy abgeglichen werden",
         "default": 3600,
         "minimum": 60,
-        "maximum": 86400
+        "maximum": 86400,
+        "x-i18n": {
+          "de": {
+            "title": "Sync-Intervall (Sekunden)",
+            "description": "Wie oft FilaMan-Spulen mit Bambuddy abgeglichen werden"
+          },
+          "fr": {
+            "title": "Intervalle de synchronisation (secondes)",
+            "description": "Fréquence de rapprochement des bobines FilaMan avec Bambuddy"
+          }
+        }
       },
       "per_model_profiles": {
         "type": "string",
         "title": "Per-Model Slicer Profiles",
         "description": "When enabled, cloud profiles are stored per printer model (P2S, H2C, etc.) with automatic nozzle resolution. Disable to fall back to single-profile behavior.",
         "enum": ["enabled", "disabled"],
-        "default": "enabled"
+        "default": "enabled",
+        "x-i18n": {
+          "de": {
+            "title": "Slicer-Profile je Modell",
+            "description": "Wenn aktiviert, werden Cloud-Profile je Druckermodell (P2S, H2C usw.) mit automatischer Düsenauflösung gespeichert. Deaktivieren, um zum Einzelprofil-Verhalten zurückzukehren."
+          },
+          "fr": {
+            "title": "Profils slicer par modèle",
+            "description": "Si activée, les profils cloud sont enregistrés par modèle d’imprimante (P2S, H2C, etc.) avec résolution automatique de la buse. Désactivez pour revenir au comportement à profil unique."
+          }
+        }
       },
       "per_printer_profiles": {
         "type": "string",
         "title": "Per-Printer Slicer Profiles (legacy alias)",
         "description": "Deprecated alias for per_model_profiles. When enabled, picking a cloud profile resolves and stores a separate printer/nozzle-specific variant (PFUS) per printer model, and the AMS configure call sends the correct profile as setting_id.",
         "enum": ["enabled", "disabled"],
-        "default": "enabled"
+        "default": "enabled",
+        "x-i18n": {
+          "de": {
+            "title": "Slicer-Profile je Drucker (veralteter Alias)",
+            "description": "Veralteter Alias für per_model_profiles. Wenn aktiviert, wird bei der Auswahl eines Cloud-Profils je Druckermodell eine eigene drucker-/düsenspezifische Variante (PFUS) aufgelöst und gespeichert, und der AMS-Konfigurationsaufruf sendet das passende Profil als setting_id."
+          },
+          "fr": {
+            "title": "Profils slicer par imprimante (alias hérité)",
+            "description": "Alias obsolète de per_model_profiles. Si activée, le choix d’un profil cloud résout et enregistre une variante distincte propre à l’imprimante et à la buse (PFUS) par modèle d’imprimante, et l’appel de configuration AMS envoie le bon profil comme setting_id."
+          }
+        }
       }
     },
     "required": ["bambuddy_url", "api_key", "printer_id"]
